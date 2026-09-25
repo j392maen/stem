@@ -36,16 +36,23 @@ def iso(dt: datetime | None) -> str | None:
     return dt.isoformat()
 
 
-def preset_codes(session: Session) -> dict[int, str]:
-    return {p.preset_id: p.code for p in session.scalars(select(SeparationPreset))}
+def preset_codes(session: Session) -> dict[int, SeparationPreset]:
+    """preset_id → 分割プリセット（ジョブの JSON にコード・名前・実験かどうかを入れるため）。"""
+    return {p.preset_id: p for p in session.scalars(select(SeparationPreset))}
 
 
-def job_to_dict(job: SeparationJob, presets: dict[int, str]) -> dict[str, Any]:
+def job_to_dict(job: SeparationJob, presets: dict[int, SeparationPreset]) -> dict[str, Any]:
+    preset = presets.get(job.preset_id) if job.preset_id is not None else None
     return {
         "job_id": job.job_id,
         "track_id": job.track_id,
         "job_kind": job.job_kind,
-        "preset": presets.get(job.preset_id) if job.preset_id is not None else None,
+        "preset": preset.code if preset is not None else None,
+        "preset_name": preset.display_name if preset is not None else None,
+        "preset_experimental": bool(preset.is_experimental) if preset is not None else False,
+        # 聴き比べの参考（分割時に記録。T12 より前のジョブは null）
+        "residual_rms_db": job.residual_rms_db,
+        "mixture_rms_db": job.mixture_rms_db,
         "status": job.status,
         "progress": job.progress,
         "stage": job.stage,
