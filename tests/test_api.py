@@ -551,8 +551,19 @@ def test_multiple_jobs_per_track_and_delete_job(
     res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_resid_vocals"})
     assert res.status_code == 201 and res.json()["created"] is True
     exp_job = res.json()["job"]["job_id"]
+    # 一覧: 分割待ちのジョブを active_job で返す（latest_job は新しいもの）
+    two = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_kara_mix"}).json()
+    summary = next(t for t in client.get("/api/tracks").json()["tracks"]
+                   if t["track_id"] == track_id)
+    assert summary["latest_job"]["job_id"] == two["job"]["job_id"]
+    assert summary["active_job"]["job_id"] == exp_job  # 次に分割される古い方
+    assert summary["active_count"] == 2
+    client.post(f"/api/jobs/{two['job']['job_id']}/cancel")
+    summary = client.get(f"/api/tracks/{track_id}").json()
+    assert summary["latest_job"]["status"] == "canceled"
+    assert summary["active_job"]["job_id"] == exp_job and summary["active_count"] == 1
     assert res.json()["job"]["preset_experimental"] is True
-    assert res.json()["job"]["preset_name"] == "残差をボーカルへ"
+    assert res.json()["job"]["preset_name"] == "ボーカル＝元の曲−楽器"
     # 分割待ちは消せない
     busy = client.delete(f"/api/jobs/{exp_job}")
     assert busy.status_code == 409 and "キャンセル" in busy.json()["detail"]
@@ -564,7 +575,8 @@ def test_multiple_jobs_per_track_and_delete_job(
 
     track = client.get(f"/api/tracks/{track_id}").json()
     assert track["playable_job_id"] == fast_job  # 実験のジョブは既定にしない
-    jobs = {j["job_id"]: j for j in track["jobs"]}
+    assert track["active_job"] is None and track["active_count"] == 0
+    jobs = {j["job_id"]: j for j in track["jobs"] if j["status"] == "done"}
     assert set(jobs) == {fast_job, exp_job}
     for j in jobs.values():
         assert j["status"] == "done"
@@ -582,7 +594,7 @@ def test_multiple_jobs_per_track_and_delete_job(
     assert (settings.stems_dir / str(fast_job)).is_dir()
     track = client.get(f"/api/tracks/{track_id}").json()
     assert track["playable_job_id"] == fast_job
-    assert [j["job_id"] for j in track["jobs"]] == [fast_job]
+    assert exp_job not in [j["job_id"] for j in track["jobs"]]
     # 実験のジョブしか無ければそれを再生する
     assert client.delete(f"/api/jobs/{fast_job}").status_code == 200
     res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_kara_mix"})
