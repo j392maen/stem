@@ -18,6 +18,8 @@ from stemapp.config import Settings, get_settings
 from stemapp.doctor import CheckResult, Status, exit_code, run_checks
 
 if TYPE_CHECKING:
+    from stemapp.ingest import ImportResult
+    from stemapp.ingest.url import YtDlpRunner
     from stemapp.separation.base import Separator
     from stemapp.separation.bench import BenchReport
     from stemapp.separation.pipeline import SeparateResult
@@ -140,9 +142,63 @@ def render_separate_result(result: SeparateResult, console: Console | None = Non
     console.print(table)
 
 
+def make_ytdlp_runner(settings: Settings) -> YtDlpRunner:
+    """yt-dlp の実行器（exe があれば exe 版）。テストでは差し替える。"""
+    from stemapp.ingest.url import choose_runner
+
+    return choose_runner(settings)
+
+
+def _import_target(
+    session: Session, settings: Settings, target: str, console: Console
+) -> ImportResult:
+    """ファイルか URL を取り込む。失敗したら理由を表示して終了コード 1。"""
+    from stemapp.ingest import import_file
+    from stemapp.ingest.url import UrlImportError, fetch_url, is_url
+
+    try:
+        if is_url(target):
+            console.print(f"URL から取得しています: {target}")
+            return fetch_url(session, settings, target, make_ytdlp_runner(settings))
+        return import_file(session, settings, Path(target))
+    except UrlImportError as e:
+        console.print(f"[bold red]{e.message}[/bold red]（理由コード: {e.code}）")
+        if e.detail:
+            console.print(f"詳細:\n{e.detail}", markup=False)
+        raise typer.Exit(1) from e
+    except Exception as e:  # 正規化の失敗など
+        console.print(f"[bold red]取り込みに失敗しました: {e}[/bold red]")
+        raise typer.Exit(1) from e
+
+
+def render_import_result(result: ImportResult, console: Console) -> None:
+    kind = "新規" if result.is_new else "既存"
+    console.print(f"track_id: {result.track_id}")
+    console.print(f"登録: {kind}")
+    console.print(f"タイトル: {result.title}", markup=False)
+    if result.has_done_full_job:
+        console.print("この曲は分割済みです。")
+
+
+@app.command("import")
+def import_cmd(
+    target: Annotated[str, typer.Argument(help="音声ファイルのパス、または URL（http/https）")],
+) -> None:
+    """曲を取り込む（分割はしない）。同じ音の曲が登録済みなら新しく作らない。"""
+    _setup_logging()
+    settings = _settings()
+    console = Console()
+    with _db_session(settings) as session:
+        result = _import_target(session, settings, target, console)
+    render_import_result(result, console)
+
+
 @app.command()
 def separate(
-    file: Annotated[Path, typer.Argument(help="分割する音声ファイル（mp3/m4a/flac/wav など）")],
+    target: Annotated[
+        str,
+        typer.Argument(help="分割する音声ファイル（mp3/m4a/flac/wav など）または URL"),
+    ],
     preset: Annotated[
         str | None,
         typer.Option("--preset", help="品質プリセット fast / standard / best（省略時は既定）"),
@@ -150,29 +206,39 @@ def separate(
     force: Annotated[bool, typer.Option("--force", help="分割済みでも分割し直す")] = False,
     cpu: Annotated[bool, typer.Option("--cpu", help="GPU を使わず CPU で実行する")] = False,
 ) -> None:
-    """1曲を stem に分割して保存する。"""
+    """1曲を取り込み、stem に分割して保存する。"""
+    import time
+
     from stemapp.separation.base import DEVICE_CPU, DEVICE_CUDA
-    from stemapp.separation.pipeline import SeparationError, separate_file
+    from stemapp.separation.pipeline import SeparationError, load_plan, separate_track
 
     _setup_logging()
     settings = _settings()
     console = Console()
+    t0 = time.perf_counter()
     with _db_session(settings) as session:
         try:
-            result = separate_file(
+            load_plan(session, preset)  # プリセットの誤りは取り込む前に知らせる
+        except SeparationError as e:
+            console.print(f"[bold red]{e}[/bold red]")
+            raise typer.Exit(1) from e
+        imported = _import_target(session, settings, target, console)
+        try:
+            result = separate_track(
                 session,
                 settings,
-                file,
+                imported.track_id,
                 make_separator(settings),
                 preset_code=preset,
                 force=force,
                 device=DEVICE_CPU if cpu else DEVICE_CUDA,
                 progress=lambda p, stage: console.print(f"[{p * 100:5.1f}%] {stage}"),
+                started=t0,
             )
         except SeparationError as e:
             console.print(f"[bold red]{e}[/bold red]")
             raise typer.Exit(1) from e
-        except Exception as e:  # 正規化の失敗など
+        except Exception as e:
             console.print(f"[bold red]失敗しました: {e}[/bold red]")
             raise typer.Exit(1) from e
         if result.skipped:
@@ -181,6 +247,25 @@ def separate(
             )
         render_separate_result(result, console)
         console.print(f"所要時間: {result.seconds:.1f} 秒")
+
+
+@app.command("ytdlp-update")
+def ytdlp_update() -> None:
+    """yt-dlp.exe を更新する（yt-dlp.exe -U）。"""
+    from stemapp.ingest import url as url_mod
+
+    settings = _settings()
+    res = url_mod.update_ytdlp(settings)
+    label = {
+        url_mod.UPDATE_UPDATED: "更新しました",
+        url_mod.UPDATE_LATEST: "最新です",
+        url_mod.UPDATE_FAILED: "更新に失敗しました",
+    }[res.status]
+    typer.echo(f"yt-dlp: {label}")
+    if res.detail:
+        typer.echo(res.detail)
+    if res.status == url_mod.UPDATE_FAILED:
+        raise typer.Exit(1)
 
 
 def render_bench(report: BenchReport, console: Console | None = None) -> None:
