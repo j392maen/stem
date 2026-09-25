@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+from stemapp.proc import run_bound
 
 SAMPLE_RATE = 44100
 CHANNELS = 2
@@ -36,13 +37,11 @@ def run_ffmpeg(args: Sequence[str]) -> None:
     exe = shutil.which("ffmpeg")
     if exe is None:
         raise AudioError("ffmpeg が見つかりません。インストールして PATH に追加してください。")
-    proc = subprocess.run(
+    proc = run_bound(
         [exe, "-hide_banner", "-loglevel", "error", *args],
-        capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip().splitlines()

@@ -22,17 +22,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from stemapp.audio import FfmpegRunner, normalize_audio
 from stemapp.config import Settings
 from stemapp.library import data_relative, find_done_job, resolve_data_path
 from stemapp.models import InputSource, Track
+from stemapp.proc import run_bound
 
 log = logging.getLogger(__name__)
 
 SOURCE_FILE = "file"
 SOURCE_URL = "url"
+# INPUT_SOURCE.fetch_status: queued → fetching → done / failed
+FETCH_QUEUED = "queued"
+FETCH_FETCHING = "fetching"
 FETCH_DONE = "done"
 FETCH_FAILED = "failed"
 
@@ -75,18 +80,16 @@ def read_tags_ffprobe(path: Path) -> dict[str, str]:
     if exe is None:
         return {}
     try:
-        proc = subprocess.run(
+        proc = run_bound(
             [
                 exe, "-v", "error",
                 "-show_entries", "format_tags:stream_tags",
                 "-of", "json",
                 str(path),
             ],
-            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -141,11 +144,15 @@ def import_file(
     artist: str | None = None,
     ffmpeg_runner: FfmpegRunner | None = None,
     tag_reader: TagReader | None = None,
+    source_id: int | None = None,
 ) -> ImportResult:
     """音声ファイルを取り込む（commit まで行う）。
 
     title / artist を渡すとタグより優先する（URL 取得でページのタイトルを使うため）。
+    source_id を渡すと、INPUT_SOURCE を新しく作らず、その行（先に作っておいたもの）を
+    done にして曲と結びつける。
     正規化に失敗したら AudioError（DB は変更しない）。
+    同じ音の曲が同時に取り込まれて一意制約違反になったときは、探し直して既存の曲として扱う。
     """
     path = Path(path)
     name = original_name or path.name
@@ -164,7 +171,18 @@ def import_file(
                 audio_hash=norm.audio_hash,
             )
             session.add(track)
-            session.flush()
+            try:
+                session.flush()
+            except IntegrityError:
+                # 同じ音を別の取り込みが先に登録した（audio_hash の一意制約違反）
+                session.rollback()
+                track = session.scalars(
+                    select(Track).where(Track.audio_hash == norm.audio_hash)
+                ).first()
+                if track is None:
+                    raise
+                is_new = False
+                log.info("同時に取り込まれた曲を既存として扱います（track %d）。", track.track_id)
 
         existing_file = (
             resolve_data_path(settings, track.normalized_path) if track.normalized_path else None
@@ -179,15 +197,20 @@ def import_file(
                 placed_dir = track_dir
             track.normalized_path = data_relative(settings, normalized_path)
 
-        source = InputSource(
-            track_id=track.track_id,
-            source_type=source_type,
-            original_name=original_name if source_type != SOURCE_FILE else name,
-            url=url,
-            fetch_status=FETCH_DONE,
-            fetched_at=fetched_at or _utcnow(),
-        )
-        session.add(source)
+        source = session.get(InputSource, source_id) if source_id is not None else None
+        if source is None:
+            if source_id is not None:
+                raise RuntimeError(f"INPUT_SOURCE {source_id} が見つかりません。")
+            source = InputSource(source_type=source_type)
+            session.add(source)
+        source.track_id = track.track_id
+        source.source_type = source_type
+        source.original_name = original_name if source_type != SOURCE_FILE else name
+        source.url = url
+        source.fetch_status = FETCH_DONE
+        source.error_code = None
+        source.error_detail = None
+        source.fetched_at = fetched_at or _utcnow()
         session.flush()
         has_done = False if is_new else find_done_job(session, track.track_id) is not None
         result = ImportResult(
@@ -210,3 +233,20 @@ def import_file(
         raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+INTERRUPTED_IMPORT_DETAIL = "中断されました（アプリの再起動）"
+
+
+def recover_interrupted_imports(session: Session) -> list[int]:
+    """queued / fetching のまま残った取り込みを failed にする（サーバー起動時）。"""
+    rows = session.scalars(
+        select(InputSource).where(InputSource.fetch_status.in_((FETCH_QUEUED, FETCH_FETCHING)))
+    ).all()
+    for src in rows:
+        src.fetch_status = FETCH_FAILED
+        src.error_code = "unknown"
+        src.error_detail = INTERRUPTED_IMPORT_DETAIL
+        src.fetched_at = src.fetched_at or _utcnow()
+    session.commit()
+    return [s.source_id for s in rows]
