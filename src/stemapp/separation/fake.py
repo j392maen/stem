@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ class FakeSeparator:
     - oom_times: device=cuda の呼び出しで、最初の N 回だけメモリ不足を起こす。
     - fail_models: この名前のモデルを呼ぶと例外を出す。
     - peak_mb: peak_memory_mb が返す値。
+    - delay_sec: 1回の呼び出しごとに待つ秒数（キャンセルのテスト用）。
     """
 
     def __init__(
@@ -57,6 +59,7 @@ class FakeSeparator:
         oom_times: int = 0,
         fail_models: Iterable[str] = (),
         peak_mb: float | None = None,
+        delay_sec: float = 0.0,
     ) -> None:
         self.multistem_coefs = dict(multistem_coefs or DEFAULT_MULTISTEM_COEFS)
         self.model_coefs = dict(model_coefs or {})
@@ -64,6 +67,7 @@ class FakeSeparator:
         self.oom_times = oom_times
         self.fail_models = set(fail_models)
         self.peak_mb = peak_mb
+        self.delay_sec = delay_sec
         self.calls: list[FakeCall] = []
 
     def separate(
@@ -75,6 +79,8 @@ class FakeSeparator:
         role: str,
     ) -> dict[str, np.ndarray]:
         self.calls.append(FakeCall(model_filename, role, device, dict(options)))
+        if self.delay_sec > 0:
+            time.sleep(self.delay_sec)
         if model_filename in self.fail_models:
             raise RuntimeError(f"fake failure in {model_filename}")
         if device == DEVICE_CUDA and self.oom_times > 0:

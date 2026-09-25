@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     port: int = 8000
     passcode: str | None = None
     ytdlp_path: Path = DEFAULT_YTDLP_PATH
+    # 分離モデルの置き場所（省略時は data_dir/models）
+    model_dir: Path | None = None
+    # アップロードできるファイルの大きさの上限（MB）
+    max_upload_mb: int = 1024
 
     @property
     def data_root(self) -> Path:
@@ -59,7 +63,7 @@ class Settings(BaseSettings):
 
     @property
     def models_dir(self) -> Path:
-        return _ensure_dir(self.data_dir / "models")
+        return _ensure_dir(self.model_dir or self.data_dir / "models")
 
 
 @lru_cache

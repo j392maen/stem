@@ -18,6 +18,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -159,6 +160,14 @@ class SeparationJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+    # キャンセルの依頼（running のジョブ。ワーカーが検知して子プロセスを終了させる）
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0")
+    )
+    # 保存前に全 stem にかけた倍率（dB）。±1 を超えないよう下げたときだけ負の値
+    output_gain_db: Mapped[float] = mapped_column(
+        Float, default=0.0, server_default=text("0.0")
+    )
 
 
 class Stem(Base):
