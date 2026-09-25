@@ -234,3 +234,20 @@ def import_file(
         raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+INTERRUPTED_IMPORT_DETAIL = "中断されました（アプリの再起動）"
+
+
+def recover_interrupted_imports(session: Session) -> list[int]:
+    """queued / fetching のまま残った取り込みを failed にする（サーバー起動時）。"""
+    rows = session.scalars(
+        select(InputSource).where(InputSource.fetch_status.in_((FETCH_QUEUED, FETCH_FETCHING)))
+    ).all()
+    for src in rows:
+        src.fetch_status = FETCH_FAILED
+        src.error_code = "unknown"
+        src.error_detail = INTERRUPTED_IMPORT_DETAIL
+        src.fetched_at = src.fetched_at or _utcnow()
+    session.commit()
+    return [s.source_id for s in rows]
