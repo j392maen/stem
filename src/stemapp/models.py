@@ -168,6 +168,9 @@ class SeparationJob(Base):
     output_gain_db: Mapped[float] = mapped_column(
         Float, default=0.0, server_default=text("0.0")
     )
+    # 配信用データ（stream rendition・peaks）の作り直し（done のジョブのみ）。
+    # NULL=依頼なし / queued / running / done / failed。ワーカーが1件ずつ処理する
+    postprocess_status: Mapped[str | None] = mapped_column(String(10))
 
 
 class Stem(Base):

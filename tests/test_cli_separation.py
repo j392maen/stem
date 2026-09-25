@@ -12,7 +12,7 @@ from audio_helpers import fake_ffmpeg, synth_mix, write_source
 from stemapp import audio, cli
 from stemapp.config import Settings
 from stemapp.db import make_engine, make_session_factory
-from stemapp.models import SeparationJob, Stem, Track
+from stemapp.models import SeparationJob, Stem, StemRendition, Track, Waveform
 from stemapp.separation import FakeSeparator
 
 runner = CliRunner()
@@ -49,6 +49,10 @@ def test_separate_command(cli_env: FakeSeparator, settings: Settings, tmp_path: 
     assert "分割済み" in again.output
     assert _count(settings, SeparationJob) == 1
 
+    # 配信用データ（stream rendition と peaks）も作る
+    assert _count(settings, StemRendition) == 16  # master 8 + stream 8
+    assert _count(settings, Waveform) == 8 * 4
+
     forced = runner.invoke(cli.app, ["separate", str(src), "--force", "--cpu"])
     assert forced.exit_code == 0, forced.output
     assert _count(settings, SeparationJob) == 2
@@ -81,3 +85,27 @@ def test_bench_command(cli_env: FakeSeparator, settings: Settings, tmp_path: Pat
     assert _count(settings, SeparationJob) == 0
     assert not list(settings.cache_dir.glob("bench-*"))
     assert np.isfinite(data["presets"][0]["seconds"])
+
+
+def test_separate_command_fills_missing_delivery(
+    cli_env: FakeSeparator, settings: Settings, tmp_path: Path
+) -> None:
+    """分割済みで配信用データが無い曲（T04 以前に CLI で分割した曲など）は、作り直す。"""
+    from sqlalchemy import delete
+
+    src = write_source(tmp_path / "b.wav", synth_mix(1.0))
+    assert runner.invoke(cli.app, ["separate", str(src)]).exit_code == 0
+    engine = make_engine(settings.db_path)
+    try:
+        with make_session_factory(engine)() as s:
+            s.execute(delete(StemRendition).where(StemRendition.purpose == "stream"))
+            s.execute(delete(Waveform))
+            s.commit()
+    finally:
+        engine.dispose()
+    res = runner.invoke(cli.app, ["separate", str(src)])
+    assert res.exit_code == 0, res.output
+    assert "配信用データ" in res.output
+    assert _count(settings, StemRendition) == 16
+    assert _count(settings, Waveform) == 32
+    assert _count(settings, SeparationJob) == 1

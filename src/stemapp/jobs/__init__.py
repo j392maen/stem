@@ -13,8 +13,10 @@ from stemapp.jobs.queue import (
     JobConflict,
     JobError,
     JobNotFound,
+    PostprocessRequest,
     enqueue_full_job,
     request_cancel,
+    request_postprocess,
 )
 
 __all__ = [
@@ -30,6 +32,8 @@ __all__ = [
     "JobConflict",
     "JobError",
     "JobNotFound",
+    "PostprocessRequest",
     "enqueue_full_job",
     "request_cancel",
+    "request_postprocess",
 ]
