@@ -35,6 +35,7 @@ from stemapp.jobs.queue import (
     DONE,
     FAILED,
     INTERRUPTED_MESSAGE,
+    QUEUED,
     RUNNING,
     STAGE_CANCELED,
     claim_next_job,
@@ -67,6 +68,12 @@ class ChildHandle(Protocol):
 ChildLauncher = Callable[[int], ChildHandle]
 # 拍の解析を実行する（job_id, 止めるべきかを返す関数）。失敗したら例外
 BeatRunner = Callable[[int, Callable[[], bool]], None]
+
+
+
+class BeatRunInterrupted(RuntimeError):
+    """停止の指示で拍の解析をやめた（解析の失敗ではない。作り直しは後でやり直す）。"""
+
 
 BEATS_TIMEOUT_SEC = 30 * 60.0  # CPU で長い曲を解析しても収まる長さ
 BEATS_POLL_SEC = 0.2
@@ -105,13 +112,16 @@ def subprocess_beat_runner(settings: Settings, extra_args: Sequence[str] = ()) -
         log.info("拍の解析の子プロセスを起動しました（job %d, pid %d）。", job_id, proc.pid)
         deadline = time.monotonic() + BEATS_TIMEOUT_SEC
         while proc.poll() is None:
-            if should_stop() or time.monotonic() > deadline:
+            stop = should_stop()
+            if stop or time.monotonic() > deadline:
                 proc.kill()
                 try:
                     proc.wait(timeout=KILL_WAIT_SEC)
                 except subprocess.TimeoutExpired:
                     log.error("拍の解析の子プロセスが終了しません。")
-                raise RuntimeError("拍の解析を中断しました（停止の指示または時間切れ）。")
+                if stop:
+                    raise BeatRunInterrupted("停止の指示で拍の解析を中断しました。")
+                raise RuntimeError("拍の解析が時間内に終わりませんでした。")
             time.sleep(BEATS_POLL_SEC)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -250,22 +260,32 @@ class Worker:
                 log.exception("配信用データを作れませんでした（job %d）", job_id)
                 set_postprocess_status(session, job_id, FAILED)
                 return job_id
-            self._postprocess_beats(session, job_id)
-            set_postprocess_status(session, job_id, DONE)
+            if self._postprocess_beats(session, job_id):
+                set_postprocess_status(session, job_id, DONE)
+            else:
+                # 停止の指示で中断した: 次に起動したときにやり直す
+                set_postprocess_status(session, job_id, QUEUED)
+                log.info("停止の指示で中断しました。作り直しを待ちに戻します（job %d）。", job_id)
         return job_id
 
-    def _postprocess_beats(self, session: Session, job_id: int) -> None:
-        """曲の拍が無ければ解析する。失敗しても例外を出さず、警告を JOB に残す。"""
+    def _postprocess_beats(self, session: Session, job_id: int) -> bool:
+        """曲の拍が無ければ解析する。失敗しても例外を出さず、警告を JOB に残す。
+
+        停止の指示で中断したときだけ False（警告は書かない）。
+        """
         from stemapp.beats.service import beat_warning_text, get_grid
 
         if self.beat_runner is None:
-            return
+            return True
         job = session.get(SeparationJob, job_id)
         if job is None or get_grid(session, job.track_id) is not None:
-            return
+            return True
         log.info("拍を解析します（job %d, track %d）。", job_id, job.track_id)
         try:
             self.beat_runner(job_id, self.should_stop)
+        except BeatRunInterrupted:
+            session.rollback()
+            return False
         except Exception as e:
             log.warning("job %d: 拍を解析できませんでした: %s", job_id, e)
             session.rollback()
@@ -276,6 +296,7 @@ class Worker:
             )
             session.commit()
         session.expire_all()  # 子プロセスが書いた内容を読み直す
+        return True
 
     def run_one(self) -> int | None:
         """queued のジョブを1件実行する（終わるまで戻らない）。無ければ None。"""

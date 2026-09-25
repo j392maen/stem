@@ -374,7 +374,9 @@ def test_subprocess_beat_runner_with_fake(
     job = session.get(SeparationJob, job_id)
     assert job.beat_warning is None
     assert get_grid(session, job.track_id).analyzer == "fake 1"
-    with pytest.raises(RuntimeError, match="中断"):
+    from stemapp.jobs.worker import BeatRunInterrupted
+
+    with pytest.raises(BeatRunInterrupted):
         run(job_id, lambda: True)
     with pytest.raises(RuntimeError, match="異常終了"):
         run(99999, lambda: False)  # ジョブが無い → 終了コード 1
@@ -391,3 +393,85 @@ def test_beat_this_is_not_imported_by_other_modules() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     ).stdout.split()
     assert out == ["False", "False"]
+
+
+# --- レビュー後の追加 ------------------------------------------------------------------
+
+
+def test_no_beats_is_warning(session: Session, settings: Settings, tmp_path: Path) -> None:
+    """拍が1つも見つからない（無音など）ときは、保存せず警告を残す。"""
+    job_id = _done_job(session, settings, tmp_path, FakeBeatAnalyzer(offset=999))
+    job = session.get(SeparationJob, job_id)
+    assert job.status == "done"
+    assert "拍が見つかりませんでした" in job.beat_warning
+    assert get_grid(session, job.track_id) is None
+    track_id = job.track_id
+    with pytest.raises(RuntimeError, match="拍が見つかりませんでした"):
+        analyze_track(session, settings, track_id, FakeBeatAnalyzer(offset=999))
+
+
+def test_save_failure_is_warning(
+    session: Session, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from stemapp.beats import service
+
+    job_id = _done_job(session, settings, tmp_path, FakeBeatAnalyzer(fail=True))
+
+    def broken(*_a, **_k):
+        raise RuntimeError("保存できません（テスト）")
+
+    monkeypatch.setattr(service, "save_grid", broken)
+    msg = analyze_job_beats(session, settings, job_id, FakeBeatAnalyzer())
+    assert msg is not None and "保存できません" in msg
+    session.expire_all()
+    job = session.get(SeparationJob, job_id)
+    assert job.status == "done" and "保存できません" in job.beat_warning
+
+
+def test_concurrent_grid_insert_is_treated_as_existing(
+    session: Session, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ曲の拍を別の処理が先に保存していた（主キーの重複）→ 警告にせず、そちらを使う。"""
+    from stemapp.beats import service
+
+    job_id = _done_job(session, settings, tmp_path, FakeBeatAnalyzer(fail=True))
+    track_id = session.get(SeparationJob, job_id).track_id
+    real_save = service.save_grid
+
+    def racing_save(s, tid, result):
+        # 解析の間に別の処理（別の接続）が同じ曲の拍を保存した
+        with make_session_factory(session.get_bind())() as other:
+            real_save(other, tid, FakeBeatAnalyzer(90).analyze(np.zeros((44100 * 4, 2))))
+            other.commit()
+        s.add(BeatGrid(track_id=tid, analyzer="x", beats_json=[], downbeats_json=[]))
+        s.flush()
+
+    monkeypatch.setattr(service, "save_grid", racing_save)
+    session.expire_all()
+    assert analyze_job_beats(session, settings, job_id, FakeBeatAnalyzer()) is None
+    session.expire_all()
+    grid = get_grid(session, track_id)
+    assert grid is not None and grid.beats_json[1] == pytest.approx(60 / 90, abs=1e-3)
+    # 先に保存した処理が警告を消している（こちらは警告を書かない）
+    assert session.get(SeparationJob, job_id).beat_warning is None
+
+
+def test_postprocess_interrupted_by_stop_goes_back_to_queue(
+    session: Session, settings: Settings, tmp_path: Path
+) -> None:
+    from stemapp.jobs.worker import BeatRunInterrupted
+
+    job_id = _done_job(session, settings, tmp_path, FakeBeatAnalyzer(fail=True))
+    session.execute(
+        SeparationJob.__table__.update().values(beat_warning=None)  # type: ignore[attr-defined]
+    )
+    session.commit()
+    assert request_postprocess(session, job_id, ["beats"]).created
+
+    def runner(_jid: int, _stop) -> None:
+        raise BeatRunInterrupted("停止の指示で拍の解析を中断しました。")
+
+    assert _postprocess_worker(settings, session, runner).run_postprocess_one() == job_id
+    session.expire_all()
+    job = session.get(SeparationJob, job_id)
+    assert job.postprocess_status == "queued" and job.beat_warning is None

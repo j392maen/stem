@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from stemapp.beats.base import BeatAnalysisError, BeatAnalyzer, BeatResult
@@ -23,6 +24,7 @@ from stemapp.models import BeatGrid, SeparationJob, Track
 log = logging.getLogger(__name__)
 
 STAGE_BEATS = "拍を解析中"
+NO_BEATS_MESSAGE = "拍が見つかりませんでした（無音・拍の無い曲など）。"
 
 
 @dataclass(frozen=True)
@@ -49,7 +51,10 @@ def analyze_audio(
     path = resolve_data_path(settings, track.normalized_path)
     if not path.is_file():
         raise BeatAnalysisError(f"正規化した音声が見つかりません: {path}")
-    return analyzer.analyze(path)
+    result = analyzer.analyze(path)
+    if not result.beats:
+        raise BeatAnalysisError(NO_BEATS_MESSAGE)
+    return result
 
 
 def save_grid(session: Session, track_id: int, result: BeatResult) -> BeatGrid:
@@ -111,6 +116,8 @@ def analyze_job_beats(
     """分割ジョブの後処理としての拍の解析。失敗しても例外を出さず、警告を JOB に残して返す。
 
     拍が無くても再生はできるため、失敗でジョブを failed にしない（commit まで行う）。
+    拍が1つも見つからないときも警告にする。保存（commit）の失敗も警告にする。
+    同じ曲の拍を別の処理が先に保存した（主キーの重複）ときは、既にあるものとして成功扱い。
     """
     job = session.get(SeparationJob, job_id)
     if job is None:
@@ -120,7 +127,14 @@ def analyze_job_beats(
         if get_grid(session, track_id) is not None and not force:
             return None
         result = analyze_audio(session, settings, track_id, analyzer)
+        save_grid(session, track_id, result)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        log.info("job %d: 同じ曲の拍が別の処理で先に保存されました（そちらを使います）。", job_id)
+        return None
     except Exception as e:
+        session.rollback()
         message = beat_warning_text(e)
         log.warning("job %d: %s", job_id, message, exc_info=not isinstance(e, BeatAnalysisError))
         session.execute(
@@ -130,8 +144,6 @@ def analyze_job_beats(
         )
         session.commit()
         return message
-    save_grid(session, track_id, result)
-    session.commit()
     log.info(
         "job %d: 拍を解析しました（拍 %d、%s、%.1f 秒）。",
         job_id, len(result.beats), result.device, result.seconds,

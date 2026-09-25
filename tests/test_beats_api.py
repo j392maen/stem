@@ -115,6 +115,23 @@ def test_reanalyze_beats(client: TestClient, tmp_path: Path) -> None:
     assert [s["bpm"] for s in segs] == [120.0, 150.0]
 
 
+def test_reanalyze_while_postprocess_active_drops_beats(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """作り直しが作成待ちのときに再解析を頼むと、拍を消してから active を返す（依頼が生きる）。"""
+    track_id = _track(client, tmp_path)
+    job_id = _separate(client, track_id, FakeBeatAnalyzer(100))
+    with _factory(client)() as s:
+        s.get(SeparationJob, job_id).postprocess_status = "queued"
+        s.commit()
+    res = client.post(f"/api/tracks/{track_id}/beats")
+    assert res.status_code == 200 and res.json()["reason"] == "active"
+    assert client.get(f"/api/tracks/{track_id}/beats").status_code == 404
+    assert _worker(client).run_postprocess_one() == job_id
+    segs = client.get(f"/api/tracks/{track_id}/beats").json()["segments"]
+    assert [s["bpm"] for s in segs] == [120.0, 150.0]
+
+
 def test_track_delete_removes_beats(client: TestClient, tmp_path: Path) -> None:
     track_id = _track(client, tmp_path)
     _separate(client, track_id, FakeBeatAnalyzer())
