@@ -233,7 +233,13 @@ def separation_presets(session: SessionDep) -> dict[str, Any]:
     presets = session.scalars(select(SeparationPreset).order_by(SeparationPreset.preset_id)).all()
     return {
         "presets": [
-            {"code": p.code, "display_name": p.display_name, "is_default": p.is_default}
+            {
+                "code": p.code,
+                "display_name": p.display_name,
+                "is_default": p.is_default,
+                # 聴き比べ用の実験プリセット（画面では通常隠す）
+                "experimental": bool(p.is_experimental),
+            }
             for p in presets
         ]
     }

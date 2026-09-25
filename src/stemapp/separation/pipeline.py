@@ -5,9 +5,15 @@
 1. input=mixture のステップを step_order 順に実行する。
    - role=multistem の出力（vocals, drums, bass, guitar, piano, other）を ensemble_weight で平均。
    - vocals は、multistem の vocals と role=vocals の出力を ensemble_weight で重み付き平均。
-2. input=vocals のステップ（role=karaoke）を vocals に適用し、lead を重み付き平均で得る。
-3. backing = vocals − lead（残差）。
-4. other += mixture − Σ上位 stem。これで上位 stem の合計が元の曲に一致する。
+   - role=karaoke で input=mixture なら、元の曲に karaoke をかけ、lead を重み付き平均で得る。
+2. 残差 R = mixture − Σ上位 stem を、プリセットの選択肢 residual_to に従って足す。
+   - other（既定）: other += R
+   - vocals: vocals += R
+   - split: R を「vocals の平均で生じた差（multistem の vocals − 平均の vocals）」と残りに分け、
+     前者を vocals、後者を other に足す。
+   どの方式でも上位 stem の合計は元の曲に一致する。
+3. input=vocals のステップ（role=karaoke）を、残差を足した後の vocals に適用し、lead を得る。
+4. backing = vocals − lead（残差）。lead + backing = vocals。
 
 `run_plan` は DB を触らない計算部分（bench でも使う）。`separate_track` が取り込み済みの曲を
 分割して DB 登録・ファイル保存まで行う。`separate_file` は取り込み（`stemapp.ingest`）→
@@ -77,6 +83,14 @@ LEAD = "lead_vocal"
 BACKING = "backing_vocal"
 RESIDUAL_STEMS: frozenset[str] = frozenset({BACKING})
 
+# プリセット全体の選択肢（SEPARATION_PRESET.options_json）
+OPT_RESIDUAL_TO = "residual_to"
+RESIDUAL_TO_OTHER = "other"
+RESIDUAL_TO_VOCALS = "vocals"
+RESIDUAL_TO_SPLIT = "split"
+RESIDUAL_TO_CHOICES: tuple[str, ...] = (RESIDUAL_TO_OTHER, RESIDUAL_TO_VOCALS, RESIDUAL_TO_SPLIT)
+PRESET_OPTION_KEYS: frozenset[str] = frozenset({OPT_RESIDUAL_TO})
+
 ProgressCallback = Callable[[float, str], None]
 
 
@@ -113,6 +127,11 @@ class PresetPlan:
     display_name: str
     steps: list[StepSpec]
     preset_id: int | None = None
+    options: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def residual_to(self) -> str:
+        return str(self.options.get(OPT_RESIDUAL_TO, RESIDUAL_TO_OTHER))
 
 
 def load_plan(session: Session, code: str | None = None) -> PresetPlan:
@@ -144,29 +163,51 @@ def load_plan(session: Session, code: str | None = None) -> PresetPlan:
         )
         for s, m in rows
     ]
-    plan = PresetPlan(preset.code, preset.display_name, steps, preset.preset_id)
+    plan = PresetPlan(
+        preset.code,
+        preset.display_name,
+        steps,
+        preset.preset_id,
+        options=dict(preset.options_json or {}),
+    )
     validate_plan(plan)
     return plan
 
 
 def validate_plan(plan: PresetPlan) -> None:
-    """パイプラインが扱える手順か確かめる。"""
+    """パイプラインが扱える手順・選択肢か確かめる。"""
+    unknown = sorted(set(plan.options) - PRESET_OPTION_KEYS)
+    if unknown:
+        raise SeparationError(
+            f"プリセット「{plan.code}」の選択肢 {', '.join(unknown)} には対応していません。"
+        )
+    if plan.residual_to not in RESIDUAL_TO_CHOICES:
+        raise SeparationError(
+            f"プリセット「{plan.code}」の residual_to「{plan.residual_to}」には対応していません"
+            f"（{' / '.join(RESIDUAL_TO_CHOICES)}）。"
+        )
     roles = [s.role for s in plan.steps]
     if ROLE_MULTISTEM not in roles:
         raise SeparationError(f"プリセット「{plan.code}」に multistem のステップがありません。")
     if ROLE_KARAOKE not in roles:
         raise SeparationError(f"プリセット「{plan.code}」に karaoke のステップがありません。")
     for s in plan.steps:
-        want = INPUT_VOCALS if s.role == ROLE_KARAOKE else INPUT_MIXTURE
         if s.role not in (ROLE_MULTISTEM, ROLE_VOCALS, ROLE_KARAOKE):
             raise SeparationError(f"ステップ {s.order} の role「{s.role}」には対応していません。")
-        if s.input != want:
+        allowed = (INPUT_MIXTURE, INPUT_VOCALS) if s.role == ROLE_KARAOKE else (INPUT_MIXTURE,)
+        if s.input not in allowed:
             raise SeparationError(
-                f"ステップ {s.order}（{s.role}）の input は {want} である必要があります"
-                f"（今は {s.input}）。"
+                f"ステップ {s.order}（{s.role}）の input は {' / '.join(allowed)} のどれかに"
+                f"してください（今は {s.input}）。"
             )
         if s.weight <= 0:
             raise SeparationError(f"ステップ {s.order} の ensemble_weight は正の数にしてください。")
+    karaoke_inputs = {s.input for s in plan.steps if s.role == ROLE_KARAOKE}
+    if len(karaoke_inputs) > 1:
+        raise SeparationError(
+            f"プリセット「{plan.code}」の karaoke の input は、全ステップで同じにしてください"
+            "（mixture と vocals を混ぜられません）。"
+        )
 
 
 # --- OOM への対応 -------------------------------------------------------------------
@@ -341,10 +382,9 @@ def run_plan(
         mix_path = workdir / "mixture.wav"
         write_wav_float(mix_path, mix)
 
-    ordered = [s for s in plan.steps if s.input == INPUT_MIXTURE] + [
-        s for s in plan.steps if s.input == INPUT_VOCALS
-    ]
-    total = len(ordered)
+    mixture_steps = [s for s in plan.steps if s.input == INPUT_MIXTURE]
+    vocal_steps = [s for s in plan.steps if s.input == INPUT_VOCALS]
+    total = len(mixture_steps) + len(vocal_steps)
 
     def report(i: int, stage: str) -> None:
         if progress is not None:
@@ -354,16 +394,10 @@ def run_plan(
     multi_order: list[str] = []
     vocals_sum = _WeightedSum()
     lead_sum = _WeightedSum()
-    vocals_path: Path | None = None
     results: list[StepResult] = []
 
-    for i, step in enumerate(ordered):
-        if step.input == INPUT_VOCALS and vocals_path is None:
-            vocals_path = workdir / "vocals.wav"
-            write_wav_float(vocals_path, vocals_sum.mean())
+    def run_one(i: int, step: StepSpec, wav: Path) -> None:
         report(i, f"分離中（{i + 1}/{total}）: {step.model_name}")
-        wav = mix_path if step.input == INPUT_MIXTURE else vocals_path
-        assert wav is not None
         out, res = run_step(separator, step, wav, device, policy)
         results.append(res)
         log.info(
@@ -383,21 +417,48 @@ def run_plan(
             lead_sum.add(_fit(_require(out, LEAD, step), n), step.weight)
         del out
 
+    # 1. 元の曲にかけるステップ
+    for i, step in enumerate(mixture_steps):
+        run_one(i, step, mix_path)
+
     if OTHER not in multi:
         raise SeparationError("multistem の出力に other がありません（残差を足す先が無い）。")
-    report(total, "仕上げ中")
     top: dict[str, np.ndarray] = {name: multi[name].mean() for name in multi_order}
     top[VOCALS] = vocals_sum.mean()
-    # 残差補正: 上位 stem の合計を元の曲に一致させる
+    # 2. 残差補正: 上位 stem の合計を元の曲に一致させる
     residual = mix64 - sum(top.values())
     residual_db = rms_db(residual)
     mixture_db = rms_db(mix64)
+    route = plan.residual_to
     log.info(
-        "補正前の残差: %.1f dBFS（mixture %.1f dBFS、差 %.1f dB）。other に足します。",
-        residual_db, mixture_db, mixture_db - residual_db,
+        "補正前の残差: %.1f dBFS（mixture %.1f dBFS、差 %.1f dB）。行き先: %s",
+        residual_db, mixture_db, mixture_db - residual_db, route,
     )
-    top[OTHER] = top[OTHER] + residual
+    if route == RESIDUAL_TO_VOCALS:
+        top[VOCALS] = top[VOCALS] + residual
+    elif route == RESIDUAL_TO_SPLIT:
+        # vocals の平均で生じた差（multistem の vocals − 平均の vocals）は vocals へ、
+        # 残り（multistem 自身の合計のずれ）は other へ
+        vocal_part = multi[VOCALS].mean() - top[VOCALS]
+        log.info(
+            "残差の内訳: ボーカルの平均による差 %.1f dBFS、その他 %.1f dBFS",
+            rms_db(vocal_part), rms_db(residual - vocal_part),
+        )
+        top[VOCALS] = top[VOCALS] + vocal_part
+        top[OTHER] = top[OTHER] + (residual - vocal_part)
+        del vocal_part
+    else:
+        top[OTHER] = top[OTHER] + residual
     del residual
+
+    # 3. 残差を足した後の vocals にかけるステップ
+    if vocal_steps:
+        vocals_path = workdir / "vocals.wav"
+        write_wav_float(vocals_path, top[VOCALS].astype(np.float32))
+        for i, step in enumerate(vocal_steps, start=len(mixture_steps)):
+            run_one(i, step, vocals_path)
+
+    report(total, "仕上げ中")
     lead = lead_sum.mean()
     stems: dict[str, np.ndarray] = {name: arr.astype(np.float32) for name, arr in top.items()}
     stems[LEAD] = lead.astype(np.float32)
@@ -561,7 +622,8 @@ def separate_file(
 ) -> SeparateResult:
     """1曲を取り込み（`import_file`）、分割してファイルと DB に保存する。
 
-    同じ audio_hash の TRACK に完了済みの full ジョブがあれば、force でない限り分割しない。
+    同じ audio_hash の TRACK に同じプリセットの完了済み full ジョブがあれば、force でない限り
+    分割しない。
     失敗したら JOB を failed にして SeparationError を投げる。
     """
     t0 = time.perf_counter()
@@ -687,7 +749,9 @@ def separate_track(
     job_id: int | None = None,
     postprocess: PostProcess | None = None,
 ) -> SeparateResult:
-    """取り込み済みの曲を分割する。完了済みの full ジョブがあれば、force でない限り分割しない。
+    """取り込み済みの曲を分割する。同じプリセットの完了済み full ジョブがあれば、force でない限り
+    分割しない（プリセットが違えば、同じ曲に複数の分け方を持てる）。preset_code が None なら
+    どのプリセットの完了済みジョブでも分割しない。
 
     job_id を渡すと、登録済みのジョブ（queued / running）を実行する（ワーカー用）。
     このときプリセットはジョブのものを使い、分割済みかどうかは調べない。
@@ -707,7 +771,8 @@ def separate_track(
     if track is None:
         raise SeparationError(f"曲が見つかりません（track {track_id}）。")
     if not force:
-        done = find_done_job(session, track.track_id)
+        same_preset = plan.preset_id if preset_code is not None else None
+        done = find_done_job(session, track.track_id, same_preset)
         if done is not None:
             log.info("分割済みの曲です（track %d, job %d）。", track.track_id, done.job_id)
             return SeparateResult(
@@ -772,6 +837,8 @@ def separate_track(
                 job.run_on = "cpu"
             gain = limit_output(output, mix)
             job.output_gain_db = round(gain_to_db(gain), 4) if gain != 1.0 else 0.0
+            job.residual_rms_db = round(output.residual_rms_db, 2)
+            job.mixture_rms_db = round(output.mixture_rms_db, 2)
             infos = _save_stems(session, settings, job, output)
             if postprocess is not None:
                 set_progress(0.92, "配信用データを作成中")

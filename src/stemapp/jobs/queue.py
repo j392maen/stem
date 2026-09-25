@@ -12,7 +12,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from stemapp.config import Settings
@@ -59,13 +59,16 @@ class EnqueueResult:
     reason: str | None = None
 
 
-def active_job(session: Session, track_id: int) -> SeparationJob | None:
-    """その曲の queued / running のジョブ（古いもの）。"""
-    return session.scalars(
-        select(SeparationJob)
-        .where(SeparationJob.track_id == track_id, SeparationJob.status.in_(ACTIVE_STATUSES))
-        .order_by(SeparationJob.job_id)
-    ).first()
+def active_job(
+    session: Session, track_id: int, preset_id: int | None = None
+) -> SeparationJob | None:
+    """その曲の queued / running のジョブ（古いもの）。preset_id でプリセットを絞る。"""
+    stmt = select(SeparationJob).where(
+        SeparationJob.track_id == track_id, SeparationJob.status.in_(ACTIVE_STATUSES)
+    )
+    if preset_id is not None:
+        stmt = stmt.where(SeparationJob.preset_id == preset_id)
+    return session.scalars(stmt.order_by(SeparationJob.job_id)).first()
 
 
 def enqueue_full_job(
@@ -78,19 +81,23 @@ def enqueue_full_job(
 ) -> EnqueueResult:
     """分割ジョブ（full）を queued で登録する（commit まで行う）。
 
-    - 分割待ち・分割中のジョブがあれば、新しく作らずそれを返す（force でも同じ）。
-    - 分割済みなら、force でない限り新しく作らず完了済みのジョブを返す。
+    - 同じプリセットで分割待ち・分割中のジョブがあれば、新しく作らずそれを返す（force でも同じ）。
+    - 同じプリセットで分割済みなら、force でない限り新しく作らず完了済みのジョブを返す。
+    プリセットが違えば、同じ曲に別の分け方のジョブを登録できる（聴き比べ用）。
+    preset_code が None（既定のプリセット）のときは、どのプリセットのジョブでも同じ扱いにする。
     プリセットが無ければ SeparationError。
     """
     track = session.get(Track, track_id)
     if track is None:
         raise JobNotFound(f"曲が見つかりません（track {track_id}）。")
     plan = load_plan(session, preset_code)
-    active = active_job(session, track_id)
+    # プリセットを指定しないときは、どの分け方でも「分割待ち・分割済み」とみなす
+    same_preset = plan.preset_id if preset_code is not None else None
+    active = active_job(session, track_id, same_preset)
     if active is not None:
         return EnqueueResult(active, False, "active")
     if not force:
-        done = find_done_job(session, track_id)
+        done = find_done_job(session, track_id, same_preset)
         if done is not None:
             return EnqueueResult(done, False, "done")
     job = SeparationJob(
@@ -131,6 +138,42 @@ def request_cancel(session: Session, job_id: int) -> SeparationJob:
     if res.rowcount == 0:  # type: ignore[attr-defined]
         raise JobConflict(f"このジョブは既に終わっています（状態: {job.status}）。")
     log.info("ジョブのキャンセルを受け付けました（job %d, %s）。", job_id, job.status)
+    return job
+
+
+def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJob:
+    """終わったジョブ（done / failed / canceled）を消す。stem・配信用データ・ファイルも消える。
+
+    分割待ち・分割中、配信用データの作成待ち・作成中のジョブは JobConflict。
+    消したジョブ（DB からは消えた後の値）を返す。
+    """
+    job = session.get(SeparationJob, job_id)
+    if job is None:
+        raise JobNotFound(f"ジョブが見つかりません（job {job_id}）。")
+    # 確かめてから消すまでの間にワーカーが取り出さないよう、条件付きで消す
+    res = session.execute(
+        delete(SeparationJob).where(
+            SeparationJob.job_id == job_id,
+            SeparationJob.status.not_in(ACTIVE_STATUSES),
+            or_(
+                SeparationJob.postprocess_status.is_(None),
+                SeparationJob.postprocess_status.not_in(ACTIVE_STATUSES),
+            ),
+        )
+    )
+    if res.rowcount != 1:  # type: ignore[attr-defined]
+        session.rollback()
+        session.refresh(job)
+        if job.status in ACTIVE_STATUSES:
+            raise JobConflict(
+                "分割待ち・分割中のジョブは削除できません。キャンセルしてから削除してください。"
+            )
+        raise JobConflict("配信用データを作成待ち・作成中です。終わってから削除してください。")
+    session.commit()  # STEM・STEM_RENDITION・WAVEFORM・EXPORT は外部キーの CASCADE で消える
+    session.expunge(job)
+    shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
+    shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
+    log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
     return job
 
 
