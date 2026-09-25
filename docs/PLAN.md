@@ -7,7 +7,7 @@
 | --- | --- | --- | --- | --- |
 | T01 | 基盤 | リポジトリ骨格、設定、DB モデル全実体、初期データ投入、`stemapp doctor`、Windows 用 setup/start スクリプト | `uv run pytest`（GPU テスト含む）と `uv run ruff check` が通る。doctor で GPU・ffmpeg・yt-dlp.exe・deno が OK | 完了（2026-09-25） |
 | T02 | 分離パイプライン（CLI） | 音声正規化、Separator 抽象、audio-separator 実装、Fake 実装、fast/standard/best、残差補正、OOM 再試行、`stemapp separate` / `stemapp bench` | Fake で合計一致テスト。PC で4分の曲が standard で完走し時間を記録 | 完了（2026-09-25） |
-| T03 | 取り込み | ファイル取り込み（重複検出）、URL 取得（yt-dlp）と失敗理由の分類 | 分類ロジックのテスト。PC で URL 取得を確認 | 実装中 |
+| T03 | 取り込み | ファイル取り込み（重複検出）、URL 取得（yt-dlp）と失敗理由の分類 | 分類ロジックのテスト。PC で URL 取得を確認 | 完了（2026-09-25） |
 | T04 | ジョブと API | ワーカープロセス、進捗配信、キャンセル、後処理（Opus・波形 peaks）、REST API、パスコード認証 | API テスト。PC で分割→API で stem 取得 | 未着手 |
 | T05 | 再生 UI | ライブラリ、マルチトラック再生、組み合わせ切替、グループ・組み合わせプリセット、DJ 風波形、キュー・ループ | ブラウザで同期再生と即時切替 | 未着手 |
 | T06 | iPhone・外出先 | PWA、Tailscale 手順、通知、続きから再生、オフライン保存、ロック画面モード | iPhone 実機で外出先から再生 | 未着手 |
@@ -26,3 +26,6 @@
 - T04 以降: onnxruntime-gpu（CUDA 13 版）と torch（cu128）の不一致警告が出る。実害はないが、ログが見づらい。
 - T07/T09: best 用モデル（kim_ft_unwa 等）は未ダウンロード。初回実行時に出力名の対応表を確かめる。分割済みかの判定はプリセットを区別しない（再分割は --force）。
 - T02 計測（240秒の合成音）: fast 80秒・GPU最大 3.4GB、standard 210秒・2.2GB。
+- T04（T03 レビューより）: 同じ音を同時に取り込むと audio_hash の一意制約違反になる。IntegrityError なら探し直して既存扱いにする。
+- T04/T05: 同じ URL の失敗が INPUT_SOURCE に溜まる。UI での見せ方（まとめるか）を決める。曲の削除機能では tracks/<id> フォルダも消す。
+- 随時: URL 失敗の理由分類で誤りが見つかったら規則を足す（"is not available" は広めの規則）。
