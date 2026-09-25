@@ -9,6 +9,8 @@
 - 同じデータフォルダで2つのワーカーが動かないよう、`data/worker.lock` をロックする。
 - 分割待ちのジョブが無いとき、配信用データの作り直し（postprocess_status=queued）を
   1件ずつ、このプロセスの中で実行する（GPU は使わない。ffmpeg は Job Object に入る）。
+  配信用データがそろっていて曲の拍が無ければ、拍の解析を子プロセス（`stemapp.beats.child`）で行う
+  （GPU を使うため。失敗しても作り直しは done とし、警告を JOB.beat_warning に残す）。
 """
 
 from __future__ import annotations
@@ -18,10 +20,12 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import IO, Protocol
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session, sessionmaker
 
 from stemapp.audio import FfmpegRunner
@@ -61,6 +65,11 @@ class ChildHandle(Protocol):
 
 
 ChildLauncher = Callable[[int], ChildHandle]
+# 拍の解析を実行する（job_id, 止めるべきかを返す関数）。失敗したら例外
+BeatRunner = Callable[[int, Callable[[], bool]], None]
+
+BEATS_TIMEOUT_SEC = 30 * 60.0  # CPU で長い曲を解析しても収まる長さ
+BEATS_POLL_SEC = 0.2
 
 
 def subprocess_launcher(settings: Settings, extra_args: Sequence[str] = ()) -> ChildLauncher:
@@ -81,6 +90,35 @@ def subprocess_launcher(settings: Settings, extra_args: Sequence[str] = ()) -> C
         return proc
 
     return launch
+
+
+def subprocess_beat_runner(settings: Settings, extra_args: Sequence[str] = ()) -> BeatRunner:
+    """`python -m stemapp.beats.child <job_id>` を起動して終わるまで待つ BeatRunner。"""
+
+    def run(job_id: int, should_stop: Callable[[], bool]) -> None:
+        cmd = [
+            sys.executable, "-m", "stemapp.beats.child", str(job_id),
+            "--data-dir", str(settings.data_dir),
+            *extra_args,
+        ]
+        proc = start_bound_process(cmd)
+        log.info("拍の解析の子プロセスを起動しました（job %d, pid %d）。", job_id, proc.pid)
+        deadline = time.monotonic() + BEATS_TIMEOUT_SEC
+        while proc.poll() is None:
+            if should_stop() or time.monotonic() > deadline:
+                proc.kill()
+                try:
+                    proc.wait(timeout=KILL_WAIT_SEC)
+                except subprocess.TimeoutExpired:
+                    log.error("拍の解析の子プロセスが終了しません。")
+                raise RuntimeError("拍の解析を中断しました（停止の指示または時間切れ）。")
+            time.sleep(BEATS_POLL_SEC)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"拍の解析の子プロセスが異常終了しました（終了コード {proc.returncode}）。"
+            )
+
+    return run
 
 
 class WorkerLockError(RuntimeError):
@@ -146,6 +184,7 @@ class Worker:
         stop_event: threading.Event | None = None,
         stop_file: Path | None = None,
         postprocess_encoder: FfmpegRunner | None = None,
+        beat_runner: BeatRunner | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -156,6 +195,8 @@ class Worker:
         # このファイルができたら止まる（`stemapp serve` からの停止の合図）
         self.stop_file = stop_file
         self.postprocess_encoder = postprocess_encoder  # テスト用（None なら ffmpeg）
+        # 作り直しのときの拍の解析（None なら拍は作らない）
+        self.beat_runner = beat_runner
         self.current_job_id: int | None = None
         self.current_child: ChildHandle | None = None
 
@@ -188,25 +229,53 @@ class Worker:
     # --- 1ジョブの実行 ----------------------------------------------------------------
 
     def run_postprocess_one(self) -> int | None:
-        """配信用データの作り直しを1件実行する。無ければ None。"""
-        from stemapp.delivery import rebuild_delivery_files
+        """配信用データの作り直しを1件実行する。無ければ None。
+
+        欠けている配信用データを作り直し、続けて曲の拍が無ければ拍を解析する。
+        """
+        from stemapp.delivery import missing_delivery, rebuild_delivery_files
 
         with self.session_factory() as session:
             job_id = claim_next_postprocess(session)
             if job_id is None:
                 return None
-            log.info("配信用データを作り直します（job %d）。", job_id)
             try:
-                rebuild_delivery_files(
-                    session, self.settings, job_id, encoder=self.postprocess_encoder
-                )
+                if missing_delivery(session, job_id):
+                    log.info("配信用データを作り直します（job %d）。", job_id)
+                    rebuild_delivery_files(
+                        session, self.settings, job_id, encoder=self.postprocess_encoder
+                    )
+                    log.info("配信用データを作り直しました（job %d）。", job_id)
             except Exception:
                 log.exception("配信用データを作れませんでした（job %d）", job_id)
                 set_postprocess_status(session, job_id, FAILED)
-            else:
-                set_postprocess_status(session, job_id, DONE)
-                log.info("配信用データを作り直しました（job %d）。", job_id)
+                return job_id
+            self._postprocess_beats(session, job_id)
+            set_postprocess_status(session, job_id, DONE)
         return job_id
+
+    def _postprocess_beats(self, session: Session, job_id: int) -> None:
+        """曲の拍が無ければ解析する。失敗しても例外を出さず、警告を JOB に残す。"""
+        from stemapp.beats.service import beat_warning_text, get_grid
+
+        if self.beat_runner is None:
+            return
+        job = session.get(SeparationJob, job_id)
+        if job is None or get_grid(session, job.track_id) is not None:
+            return
+        log.info("拍を解析します（job %d, track %d）。", job_id, job.track_id)
+        try:
+            self.beat_runner(job_id, self.should_stop)
+        except Exception as e:
+            log.warning("job %d: 拍を解析できませんでした: %s", job_id, e)
+            session.rollback()
+            session.execute(
+                update(SeparationJob)
+                .where(SeparationJob.job_id == job_id)
+                .values(beat_warning=beat_warning_text(e))
+            )
+            session.commit()
+        session.expire_all()  # 子プロセスが書いた内容を読み直す
 
     def run_one(self) -> int | None:
         """queued のジョブを1件実行する（終わるまで戻らない）。無ければ None。"""
