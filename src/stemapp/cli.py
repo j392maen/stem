@@ -549,12 +549,12 @@ def migrate_folders_cmd(
     table = Table(title="保存フォルダの移行" + ("（予定・dry-run）" if dry_run else ""))
     table.add_column("job", justify="right")
     table.add_column("track", justify="right")
-    table.add_column("今のフォルダ")
-    table.add_column("新しいフォルダ")
+    table.add_column("今のフォルダ", overflow="fold")
+    table.add_column("新しいフォルダ", overflow="fold")
     table.add_column("ファイル", justify="right")
     table.add_column("サイズ", justify="right")
     table.add_column("DB のパス", justify="right")
-    table.add_column("結果")
+    table.add_column("結果", overflow="fold")
     for i in report.items:
         result = labels[i.status] + (f": {i.message}" if i.message else "")
         table.add_row(
