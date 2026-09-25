@@ -563,7 +563,7 @@ def test_multiple_jobs_per_track_and_delete_job(
     assert "この分け方" in again.json()["message"]
 
     track = client.get(f"/api/tracks/{track_id}").json()
-    assert track["playable_job_id"] == exp_job  # 新しい方
+    assert track["playable_job_id"] == fast_job  # 実験のジョブは既定にしない
     jobs = {j["job_id"]: j for j in track["jobs"]}
     assert set(jobs) == {fast_job, exp_job}
     for j in jobs.values():
@@ -583,5 +583,10 @@ def test_multiple_jobs_per_track_and_delete_job(
     track = client.get(f"/api/tracks/{track_id}").json()
     assert track["playable_job_id"] == fast_job
     assert [j["job_id"] for j in track["jobs"]] == [fast_job]
+    # 実験のジョブしか無ければそれを再生する
+    assert client.delete(f"/api/jobs/{fast_job}").status_code == 200
+    res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_kara_mix"})
+    only_exp = res.json()["job"]["job_id"]
+    assert _run_worker_once(client) == only_exp
+    assert client.get(f"/api/tracks/{track_id}").json()["playable_job_id"] == only_exp
     assert client.delete(f"/api/jobs/{exp_job}").status_code == 404
-    assert client.get(f"/api/jobs/{fast_job}/stems").status_code == 200
