@@ -208,14 +208,16 @@ def _kara(model: str, source: str) -> StepDef:
 
 RESID_VOCALS = {"residual_to": "vocals"}
 EXPERIMENTAL_PRESETS: list[PresetDef] = [
-    # 残差（主に SW と Kim のボーカルの差）を other ではなく vocals に足す
-    PresetDef("exp_resid_vocals", "残差をボーカルへ", False,
-              [_SW4, _KIM4, _kara(KARAOKE_BS_FRAZER, "vocals")],
+    # 残差を vocals に足す。vocals = 元の曲 − SW の楽器 stem の合計 になり、ボーカル専用モデル
+    # （Kim）の出力は結果に効かないので使わない（validate_plan も弾く）
+    PresetDef("exp_resid_vocals", "ボーカル＝元の曲−楽器", False,
+              [_SW4, _kara(KARAOKE_BS_FRAZER, "vocals")],
               experimental=True, options=RESID_VOCALS),
-    # 残差を「ボーカルの平均で生じた差」→ vocals、「それ以外」→ other に分ける
-    PresetDef("exp_resid_split", "残差を分けて戻す", False,
-              [_SW4, _KIM4, _kara(KARAOKE_BS_FRAZER, "vocals")],
-              experimental=True, options={"residual_to": "split"}),
+    # 対照: SW だけ（Kim の平均なし）。standard と比べて Kim が役立っているかを確かめる。
+    # （残差の split はボーカル専用モデルが無いと other と同じなので、選択肢は既定のまま）
+    PresetDef("exp_resid_split", "SW のみ（対照）", False,
+              [_SW4, _kara(KARAOKE_BS_FRAZER, "vocals")],
+              experimental=True),
     # karaoke を元の曲にかける（lead = karaoke の出力、backing = vocals − lead）
     PresetDef("exp_kara_mix", "カラオケを元の曲に", False,
               [_SW4, _KIM4, _kara(KARAOKE_BS_FRAZER, "mixture")],
@@ -225,14 +227,13 @@ EXPERIMENTAL_PRESETS: list[PresetDef] = [
               [_SW4, _KIM4, _kara(KARAOKE_BS_ANVUEW, "vocals"),
                _kara(KARAOKE_BS_FRAZER, "vocals")],
               experimental=True),
-    # 残差を vocals へ ＋ karaoke（anvuew ＋ frazer）を元の曲に
-    PresetDef("exp_combo", "残差ボーカル＋カラオケ2種を元の曲に", False,
-              [_SW4, _KIM4, _kara(KARAOKE_BS_ANVUEW, "mixture"),
-               _kara(KARAOKE_BS_FRAZER, "mixture")],
+    # vocals = 元の曲 − 楽器 ＋ karaoke（anvuew ＋ frazer）を元の曲に
+    PresetDef("exp_combo", "ボーカル＝元の曲−楽器＋カラオケ2種を元の曲に", False,
+              [_SW4, _kara(KARAOKE_BS_ANVUEW, "mixture"), _kara(KARAOKE_BS_FRAZER, "mixture")],
               experimental=True, options=RESID_VOCALS),
     # exp_combo に gabox v2（Mel-RoFormer）を足した 3 種の平均（系統の違うモデルを混ぜる）
-    PresetDef("exp_combo_gabox", "残差ボーカル＋カラオケ3種を元の曲に", False,
-              [_SW4, _KIM4, _kara(KARAOKE_BS_ANVUEW, "mixture"),
+    PresetDef("exp_combo_gabox", "ボーカル＝元の曲−楽器＋カラオケ3種を元の曲に", False,
+              [_SW4, _kara(KARAOKE_BS_ANVUEW, "mixture"),
                _kara(KARAOKE_BS_FRAZER, "mixture"), _kara(KARAOKE_MEL_GABOX_V2, "mixture")],
               experimental=True, options=RESID_VOCALS),
 ]

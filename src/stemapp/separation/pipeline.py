@@ -202,6 +202,13 @@ def validate_plan(plan: PresetPlan) -> None:
             )
         if s.weight <= 0:
             raise SeparationError(f"ステップ {s.order} の ensemble_weight は正の数にしてください。")
+    if plan.residual_to != RESIDUAL_TO_OTHER and ROLE_VOCALS in roles:
+        # vocals: vocals = 元の曲 − multistem の楽器 stem の合計、split: vocals = multistem の
+        # vocals になり、どちらもボーカル専用モデルの出力が結果に効かない（GPU の時間の無駄）
+        raise SeparationError(
+            f"プリセット「{plan.code}」: residual_to が {plan.residual_to} のときは、ボーカル専用"
+            "モデル（role=vocals）のステップは結果に効きません。外してください。"
+        )
     karaoke_inputs = {s.input for s in plan.steps if s.role == ROLE_KARAOKE}
     if len(karaoke_inputs) > 1:
         raise SeparationError(

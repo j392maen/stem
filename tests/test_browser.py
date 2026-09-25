@@ -21,7 +21,7 @@ from sqlalchemy import delete, select
 from audio_helpers import synth_mix, write_source
 from browser_helpers import EDGE_ARGS, SCREENS_DIR, LiveServer, run_server
 from stemapp.config import Settings
-from stemapp.models import ListenPreset, Stem, StemRendition, Track
+from stemapp.models import ListenPreset, SeparationJob, Stem, StemRendition, Track
 
 pytestmark = [
     pytest.mark.browser,
@@ -555,7 +555,7 @@ def test_switch_separation_job(page: Any, server: LiveServer, tmp_path: Path) ->
     assert page.evaluate(f"() => {view}.jobId") == fast_job
     assert page.locator("#job-select option").count() == 2
     assert page.input_value("#job-select") == str(fast_job)
-    assert "実験: 残差をボーカルへ" in page.inner_text("#job-select")
+    assert "実験: ボーカル＝元の曲−楽器" in page.inner_text("#job-select")
     assert "補正前の残差" in page.inner_text("#job-metric")
 
     # ドラムを OFF、1.5 秒から再生してから、分け方を切り替える
@@ -590,10 +590,105 @@ def test_switch_separation_job(page: Any, server: LiveServer, tmp_path: Path) ->
     assert page.evaluate(f"() => {view}.jobId") == exp_job
     assert not page.errors  # type: ignore[attr-defined]
 
-    # 選んでいたジョブを消したら、残った方を再生する
+    # 「この分け方を削除」: 確認して消し、残った方に切り替える（再生位置は保つ）
+    page.evaluate(f"() => {view}.seek(2.0)")
+    page.click("#delete-job-btn")
+    page.wait_for_selector(".modal")
+    page.click(".modal .btn:has-text('やめる')")
+    assert page.evaluate(f"() => {view}.jobId") == exp_job
+    page.click("#delete-job-btn")
+    page.click(".modal .btn:has-text('削除する')")
+    page.wait_for_function(f"() => {view}.jobId === {fast_job} && {view}.ready", timeout=60_000)
+    assert page.evaluate(f"() => {view}.engine.position") == pytest.approx(2.0, abs=0.05)
+    with server.session_factory() as s:
+        assert s.get(SeparationJob, exp_job) is None
+        assert s.get(SeparationJob, fast_job) is not None
+    # 分け方が1つだけになったら、切り替えも削除も使えない（曲は残る）
+    assert page.locator("#job-select[disabled]").count() == 1
+    assert page.locator("#delete-job-btn").count() == 0
+    assert not page.errors  # type: ignore[attr-defined]
+
+
+def _second_job(server: LiveServer, track_id: int, preset: str) -> int:
     with httpx.Client(base_url=server.base_url, timeout=30) as c:
-        assert c.delete(f"/api/jobs/{exp_job}").status_code == 200
-    page.reload()
+        res = c.post(f"/api/tracks/{track_id}/jobs", json={"preset": preset})
+        assert res.status_code == 201, res.text
+        job_id = int(res.json()["job"]["job_id"])
+    _wait_jobs_done(server, track_id, 2)
+    return job_id
+
+
+def test_switch_job_while_loading(page: Any, server: LiveServer, tmp_path: Path) -> None:
+    """読み込み中は切り替えられない。読み込みに失敗した後の切り替えは、前の状態を引き継ぐ。"""
+    track_id, fast_job = _done_track(server, tmp_path)
+    exp_job = _second_job(server, track_id, "exp_kara_mix")
+    view = "window.__stemapp.view"
+    page.goto(f"{server.base_url}/#/track/{track_id}")
     page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
     assert page.evaluate(f"() => {view}.jobId") == fast_job
-    assert page.locator("#job-select[disabled]").count() == 1
+    page.evaluate(f"() => {view}.seek(1.5)")
+    page.click(".stem-btn[data-code='drums']")
+    _wait_gains(page, {"drums": 0.0})
+
+    # 切り替えた直後（読み込み中）は選択肢を使えず、もう一度切り替えても無視される
+    res = page.evaluate(
+        f"""async ([a, b]) => {{
+        const v = {view};
+        v.switchJob(a);
+        while (!v.loading) await new Promise((r) => setTimeout(r, 2));
+        const disabled = [document.querySelector("#job-select").disabled,
+                          document.querySelector("#delete-job-btn").disabled];
+        v.switchJob(b);
+        return [disabled, v.jobId];
+    }}""",
+        [exp_job, fast_job],
+    )
+    assert res == [[True, True], exp_job]
+    page.wait_for_function(f"() => {view}.jobId === {exp_job} && {view}.ready", timeout=60_000)
+    assert page.locator("#job-select:not([disabled])").count() == 1
+    assert page.evaluate(f"() => {view}.engine.position") == pytest.approx(1.5, abs=0.05)
+    _wait_gains(page, {"drums": 0.0, "bass": 1.0})
+
+    # 読み込みに失敗 → 別の分け方へ切り替えると、失敗前の位置・選択を引き継ぐ
+    def fail(route: Any) -> None:
+        route.fulfill(status=500, content_type="application/json",
+                      body='{"detail": "テスト用の失敗"}')
+
+    page.route("**/api/files/renditions/*", fail)
+    page.select_option("#job-select", str(fast_job))
+    page.wait_for_selector("text=読み込めませんでした", timeout=30_000)
+    assert page.locator("#job-select:not([disabled])").count() == 1
+    page.unroute("**/api/files/renditions/*")
+    page.select_option("#job-select", str(exp_job))
+    page.wait_for_function(f"() => {view}.jobId === {exp_job} && {view}.ready", timeout=60_000)
+    assert page.evaluate(f"() => {view}.engine.position") == pytest.approx(1.5, abs=0.05)
+    _wait_gains(page, {"drums": 0.0, "bass": 1.0})
+    assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_library_prefers_active_job(page: Any, server: LiveServer, tmp_path: Path) -> None:
+    """同じ曲に複数のジョブがあるとき、一覧は分割待ち・分割中のものを優先して出す。"""
+    track_id, _fast_job = _done_track(server, tmp_path)
+
+    def tracks(route: Any) -> None:
+        data = route.fetch().json()
+        for t in data["tracks"]:
+            if t["track_id"] == track_id:
+                # 最新は完了済み、別の分け方が分割中（ほかに1件待ち）
+                t["active_job"] = {
+                    **t["latest_job"], "job_id": 99999, "status": "running",
+                    "progress": 0.4, "stage": "分離中（1/3）", "preset": "exp_combo",
+                    "preset_name": "テストの分け方", "preset_experimental": True,
+                }
+                t["active_count"] = 2
+        route.fulfill(json=data)
+
+    page.route("**/api/tracks", tracks)
+    page.goto(server.base_url + "/#/library")
+    row = f".track-row[data-track-id='{track_id}']"
+    page.wait_for_selector(f"{row} .badge:has-text('分割中')")
+    text = page.inner_text(row)
+    assert "40%" in text and "実験: テストの分け方" in text and "ほか 1 件待ち" in text
+    assert page.locator(f"{row} .btn:has-text('キャンセル')").count() == 1
+    assert page.locator(f"{row} .btn:has-text('別の分け方で分割')").count() == 0
+    assert page.locator(f"{row} .btn:has-text('再生')").count() == 1

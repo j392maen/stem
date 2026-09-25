@@ -23,6 +23,8 @@ from stemapp.delivery import missing_delivery
 from stemapp.jobs import (
     ACTIVE_STATUSES,
     FINISHED_STATUSES,
+    QUEUED,
+    RUNNING,
     JobConflict,
     JobNotFound,
     delete_job,
@@ -73,6 +75,10 @@ def _track_summary(
 
     # 実験プリセット（聴き比べ用）のジョブは、ほかに完了したジョブがあれば既定にしない
     playable = next((j for j in done if not experimental(j)), done[0] if done else None)
+    # 分割中のもの、無ければ次に分割されるもの（いちばん古い分割待ち）
+    running = [j for j in jobs if j.status == RUNNING]
+    queued = [j for j in jobs if j.status == QUEUED]
+    active = running[0] if running else (queued[-1] if queued else None)
     return {
         "track_id": track.track_id,
         "title": track.title,
@@ -82,6 +88,9 @@ def _track_summary(
         "latest_job": job_to_dict(jobs[0], presets) if jobs else None,
         # 再生に使う既定のジョブ（完了した full ジョブのうち新しいもの。実験プリセットは後回し）
         "playable_job_id": playable.job_id if playable is not None else None,
+        # 分割待ち・分割中のジョブ（同じ曲に複数の分け方があるとき、一覧はこれを優先して出す）
+        "active_job": job_to_dict(active, presets) if active is not None else None,
+        "active_count": len(running) + len(queued),
     }
 
 

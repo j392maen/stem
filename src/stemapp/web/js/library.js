@@ -78,7 +78,7 @@ export class LibraryView {
     const data = await api("/api/tracks");
     this.tracks = data.tracks;
     for (const t of this.tracks) {
-      if (t.latest_job) this.jobs.set(t.latest_job.job_id, t.latest_job);
+      for (const j of [t.latest_job, t.active_job]) if (j) this.jobs.set(j.job_id, j);
     }
     if (render && this.alive) this.render();
     if (this.alive) this.syncWatchers();
@@ -86,10 +86,16 @@ export class LibraryView {
 
   // --- 進捗（SSE） -------------------------------------------------------------
 
+  /** 行に出すジョブ: 分割待ち・分割中があればそれ（同じ曲に複数の分け方があるとき）、無ければ最新。 */
+  shownJob(t) {
+    const base = t.active_job || t.latest_job;
+    return base ? (this.jobs.get(base.job_id) || base) : null;
+  }
+
   syncWatchers() {
     const active = new Set();
     for (const t of this.tracks) {
-      const job = t.latest_job && this.jobs.get(t.latest_job.job_id);
+      const job = this.shownJob(t);
       if (job && !FINISHED.has(job.status)) active.add(job.job_id);
     }
     for (const [id, es] of this.watchers) {
@@ -340,7 +346,7 @@ export class LibraryView {
   }
 
   trackRow(t) {
-    const job = t.latest_job ? (this.jobs.get(t.latest_job.job_id) || t.latest_job) : null;
+    const job = this.shownJob(t);
     const status = job ? job.status : null;
     const active = status === "queued" || status === "running";
     const playable = t.playable_job_id !== null && t.playable_job_id !== undefined;
@@ -349,10 +355,13 @@ export class LibraryView {
     let state;
     if (active) {
       const pct = Math.round((job.progress || 0) * 100);
+      const others = (t.active_count || 1) - 1;
       state = el("div", { class: "t-state" },
         el("div", { class: "row" },
           el("span", { class: "badge active", text: STATUS_LABELS[status] }),
-          el("span", { class: "muted", text: `${pct}%` })),
+          el("span", { class: "muted", text: `${pct}%` }),
+          job.preset_experimental ? el("span", { class: "muted", text: `実験: ${job.preset_name || job.preset}` }) : null,
+          others > 0 ? el("span", { class: "muted", text: `（ほか ${others} 件待ち）` }) : null),
         el("div", { class: "progress" }, el("span", { style: { width: `${pct}%` } })),
         el("div", { class: "stage", text: job.stage || "" }));
     } else {
