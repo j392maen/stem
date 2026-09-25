@@ -5,7 +5,11 @@ T02 の `separate_track` を実行する（進捗は JOB に書く）。最後�
 （Opus と波形 peaks）を作る。キャンセル時はワーカーがこのプロセスを終了させる
 （GPU メモリを確実に解放するため）。
 
-終了コード: 0=完了、1=失敗（JOB は failed）、2=想定外の例外。
+終了コード: 0=完了、1=失敗（JOB は failed）、2=想定外の例外、3=親（ワーカー）がいなくなった。
+
+`--stop-on-stdin-eof` を付けると、標準入力が閉じられた（＝ワーカーが終了・強制終了された）
+ときにすぐ終了する。ワーカーは標準入力をパイプにして起動するので、ワーカーだけが
+強制終了されても子が残って GPU を使い続けることはない。
 
 `--fake` を付けると FakeSeparator とダミーのエンコーダで動く（テスト用。GPU・ffmpeg 不要）。
 """
@@ -14,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -34,6 +40,25 @@ log = logging.getLogger(__name__)
 EXIT_DONE = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
+EXIT_ORPHANED = 3
+
+
+def exit_on_stdin_eof() -> threading.Thread:
+    """標準入力が閉じられたらプロセスをすぐ終了させるスレッド（GPU メモリも OS が解放する）。"""
+
+    def reader() -> None:
+        try:
+            while sys.stdin.buffer.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
+        log.error("ワーカーがいなくなったため終了します。")
+        logging.shutdown()
+        os._exit(EXIT_ORPHANED)
+
+    t = threading.Thread(target=reader, name="stdin-eof", daemon=True)
+    t.start()
+    return t
 
 
 def run_job(
@@ -97,7 +122,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--fake", action="store_true", help="FakeSeparator で動かす（テスト用）")
     parser.add_argument("--fake-delay", type=float, default=0.0)
     parser.add_argument("--fake-fail", action="store_true")
+    parser.add_argument(
+        "--stop-on-stdin-eof", action="store_true", help="標準入力が閉じたら終了する"
+    )
     args = parser.parse_args(argv)
+    if args.stop_on_stdin_eof:
+        exit_on_stdin_eof()
 
     logging.basicConfig(
         level=logging.INFO,

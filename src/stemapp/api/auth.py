@@ -68,7 +68,7 @@ def make_token(secret: bytes, passcode: str, now: float | None = None) -> str:
 
 
 def verify_token(secret: bytes, passcode: str, token: str | None, now: float | None = None) -> bool:
-    if not token:
+    if not token or not token.isascii():  # compare_digest は非 ASCII の str を受け付けない
         return False
     parts = token.split(".")
     if len(parts) != 3:

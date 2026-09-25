@@ -20,7 +20,6 @@ import gc
 import logging
 import shutil
 import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -83,6 +82,15 @@ ProgressCallback = Callable[[float, str], None]
 
 class SeparationError(RuntimeError):
     """分割の失敗（メッセージは日本語）。"""
+
+
+class JobAbandoned(SeparationError):
+    """ジョブが running でなくなった・キャンセルされたので、結果を書き込まずにやめた。"""
+
+
+def job_tmp_dir(settings: Settings, job_id: int) -> Path:
+    """分割中の一時ファイルの置き場所（ジョブごと。中断後にワーカーが片付ける）。"""
+    return settings.cache_dir / "tmp" / f"job-{job_id}"
 
 
 # --- 手順 ------------------------------------------------------------------------
@@ -717,11 +725,30 @@ def separate_track(
     except Exception as e:
         raise SeparationError(f"正規化した音声を読めません: {normalized_path}: {e}") from e
 
-    tmp_dir = settings.cache_dir / "tmp" / uuid.uuid4().hex
+    tmp_dir: Path | None = None
     try:
         job = _prepare_job(session, track, plan, device, job_id)
+        tmp_dir = job_tmp_dir(settings, job.job_id)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        def ensure_still_ours() -> None:
+            """ジョブが running のままで、キャンセルされていないか確かめる。
+
+            ワーカーが先に終わった後などに残った処理が、結果を書き込まないようにする。
+            """
+            row = session.execute(
+                select(SeparationJob.status, SeparationJob.cancel_requested).where(
+                    SeparationJob.job_id == job.job_id
+                )
+            ).one_or_none()
+            if row is None or row.status != "running" or row.cancel_requested:
+                state = "削除済み" if row is None else row.status
+                if row is not None and row.cancel_requested:
+                    state += "・キャンセル依頼あり"
+                raise JobAbandoned(f"ジョブ {job.job_id} は続けられない状態です（{state}）。")
 
         def set_progress(p: float, stage: str) -> None:
+            ensure_still_ours()
             job.progress = round(min(max(p, 0.0), 1.0), 4)
             job.stage = stage[:100]
             session.commit()
@@ -754,13 +781,39 @@ def separate_track(
                     job.job_id,
                     lambda p, s: set_progress(0.92 + 0.07 * p, s),
                 )
-            job.status = "done"
-            job.progress = 1.0
-            job.stage = "完了"
-            job.finished_at = _utcnow()
+            # running のままでキャンセルされていないときだけ done にする（同じトランザクション）
+            res = session.execute(
+                update(SeparationJob)
+                .where(
+                    SeparationJob.job_id == job.job_id,
+                    SeparationJob.status == "running",
+                    SeparationJob.cancel_requested.is_(False),
+                )
+                .values(status="done", progress=1.0, stage="完了", finished_at=_utcnow())
+            )
+            if res.rowcount != 1:  # type: ignore[attr-defined]
+                raise JobAbandoned(f"ジョブ {job.job_id} は完了を書き込める状態ではありません。")
             session.commit()
+            session.refresh(job)
             if progress is not None:
                 progress(1.0, "完了")
+        except JobAbandoned:
+            # 状態は他（ワーカー・キャンセル）が決める。自分が作った成果物だけ消す
+            session.rollback()
+            delete_job_stems(session, job.job_id)
+            session.execute(
+                update(SeparationJob)
+                .where(
+                    SeparationJob.job_id == job.job_id,
+                    SeparationJob.status == "running",
+                    SeparationJob.cancel_requested.is_(True),
+                )
+                .values(status="canceled", stage="キャンセルしました", finished_at=_utcnow())
+            )
+            session.commit()
+            shutil.rmtree(settings.stems_dir / str(job.job_id), ignore_errors=True)
+            log.warning("job %d の処理をやめました（結果は書き込みません）。", job.job_id)
+            raise
         except Exception as e:
             session.rollback()
             stage = job.stage or ""
@@ -782,4 +835,5 @@ def separate_track(
             steps=output.steps,
         )
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)

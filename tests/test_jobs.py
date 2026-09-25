@@ -424,3 +424,161 @@ def test_worker_process_stops_when_stdin_closes(
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+# --- 残った処理が結果を書き込まない・子プロセスの後始末 -------------------------------------
+
+
+class Interfere(FakeSeparator):
+    """最初の分離の呼び出しで、DB 上のジョブを他のプロセスが変えたことにする。"""
+
+    def __init__(self, factory: sessionmaker[Session], job_id: int, **values: object) -> None:
+        super().__init__()
+        self.factory = factory
+        self.job_id = job_id
+        self.values = values
+
+    def separate(self, *args: object, **kw: object):  # type: ignore[override]
+        if len(self.calls) == 0:
+            with self.factory() as s:
+                job = s.get(SeparationJob, self.job_id)
+                assert job is not None
+                for k, v in self.values.items():
+                    setattr(job, k, v)
+                s.commit()
+        return super().separate(*args, **kw)  # type: ignore[arg-type]
+
+
+def test_abandoned_job_does_not_write_done(
+    seeded: Session, settings: Settings, factory: sessionmaker[Session], track_id: int
+) -> None:
+    """実行中にジョブが failed にされた（ワーカーの再起動で片付けられた等）ら、結果を書かない。"""
+    from stemapp.jobs.child import EXIT_FAILED, run_job
+
+    job_id = enqueue_full_job(seeded, track_id, "fast").job.job_id
+    with factory() as s:
+        from stemapp.jobs.queue import claim_next_job
+
+        assert claim_next_job(s) == job_id
+    sep = Interfere(factory, job_id, status="failed", error_message=INTERRUPTED_MESSAGE)
+    assert run_job(settings, job_id, sep) == EXIT_FAILED
+    job = _job(factory, job_id)
+    assert job.status == "failed" and job.error_message == INTERRUPTED_MESSAGE
+    with factory() as s:
+        assert s.scalars(select(Stem).where(Stem.job_id == job_id)).all() == []
+    assert not (settings.stems_dir / str(job_id)).exists()
+    assert not (settings.cache_dir / "tmp" / f"job-{job_id}").exists()
+
+
+def test_cancel_without_worker_is_honored_by_child(
+    seeded: Session, settings: Settings, factory: sessionmaker[Session], track_id: int
+) -> None:
+    """ワーカーがいなくても、子はキャンセル依頼に気づいて canceled にしてやめる。"""
+    from stemapp.jobs.child import run_job
+
+    job_id = enqueue_full_job(seeded, track_id, "fast").job.job_id
+    with factory() as s:
+        from stemapp.jobs.queue import claim_next_job
+
+        claim_next_job(s)
+    run_job(settings, job_id, Interfere(factory, job_id, cancel_requested=True))
+    job = _job(factory, job_id)
+    assert job.status == "canceled"
+    with factory() as s:
+        assert s.scalars(select(Stem).where(Stem.job_id == job_id)).all() == []
+
+
+def test_tmp_dirs_are_cleaned(
+    seeded: Session, settings: Settings, factory: sessionmaker[Session], track_id: int
+) -> None:
+    from stemapp.jobs.queue import finish_job
+
+    tmp = settings.cache_dir / "tmp"
+    job_id = enqueue_full_job(seeded, track_id, "fast").job.job_id
+    (tmp / f"job-{job_id}").mkdir(parents=True)
+    (tmp / f"job-{job_id}" / "vocals.wav").write_bytes(b"x")
+    with factory() as s:
+        finish_job(s, settings, job_id, "canceled")
+    assert not (tmp / f"job-{job_id}").exists()
+
+    # 起動時: running でないジョブの一時フォルダは消す（取り込み用の一時フォルダは残す）
+    (tmp / "job-999").mkdir()
+    (tmp / "abcdef").mkdir()
+    Worker(settings, factory, sync_launcher(settings)).recover()
+    assert not (tmp / "job-999").exists()
+    assert (tmp / "abcdef").exists()
+
+
+def _pid_alive(pid: int) -> bool:
+    import subprocess
+    import sys
+
+    if sys.platform == "win32":
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stdout
+        return f'"{pid}"' in out
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+WORKER_SCRIPT = """
+import sys
+from pathlib import Path
+from stemapp.config import Settings
+from stemapp.db import make_engine, make_session_factory
+from stemapp.jobs.worker import Worker, subprocess_launcher
+
+settings = Settings(_env_file=None, data_dir=Path(sys.argv[1]))
+pid_file = Path(sys.argv[2])
+real = subprocess_launcher(settings, ["--fake", "--fake-delay", "60"])
+
+def launch(job_id):
+    child = real(job_id)
+    pid_file.write_text(str(child.pid), encoding="utf-8")
+    return child
+
+factory = make_session_factory(make_engine(settings.db_path))
+Worker(settings, factory, launch, poll_interval=0.1).run_forever()
+"""
+
+
+def test_killing_worker_stops_child(
+    seeded: Session, settings: Settings, factory: sessionmaker[Session], track_id: int,
+    tmp_path: Path,
+) -> None:
+    """ワーカーだけを強制終了しても、分割の子プロセスは残らない。"""
+    import subprocess
+    import sys
+
+    from stemapp.jobs.worker import child_env, new_group_kwargs
+
+    job_id = enqueue_full_job(seeded, track_id, "fast").job.job_id
+    pid_file = tmp_path / "child.pid"
+    worker = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", WORKER_SCRIPT, str(settings.data_dir), str(pid_file)],
+        env=child_env(), stdin=subprocess.DEVNULL, **new_group_kwargs(),  # type: ignore[call-overload]
+    )
+    child_pid = None
+    try:
+        _wait_for(lambda: (_job(factory, job_id).stage or "").startswith("分離中"), 60)
+        child_pid = int(pid_file.read_text(encoding="utf-8"))
+        assert _pid_alive(child_pid)
+        worker.kill()  # ワーカーだけを強制終了（後始末の機会なし）
+        worker.wait(10)
+        _wait_for(lambda: not _pid_alive(child_pid), 15)
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        if child_pid is not None and _pid_alive(child_pid):
+            subprocess.run(["taskkill", "/F", "/PID", str(child_pid)], check=False)
+    # ジョブは running のまま残るが、次のワーカー起動時に片付けられる
+    assert _job(factory, job_id).status == "running"
+    assert Worker(settings, factory, sync_launcher(settings)).recover() == [job_id]
+    assert _job(factory, job_id).status == "failed"

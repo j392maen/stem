@@ -77,12 +77,16 @@ def subprocess_launcher(settings: Settings, extra_args: Sequence[str] = ()) -> C
         cmd = [
             sys.executable, "-m", "stemapp.jobs.child", str(job_id),
             "--data-dir", str(settings.data_dir),
+            "--stop-on-stdin-eof",
             *extra_args,
         ]
-        log.info("子プロセスを起動します（job %d）。", job_id)
-        return subprocess.Popen(  # noqa: S603
-            cmd, env=child_env(), stdin=subprocess.DEVNULL, **new_group_kwargs()  # type: ignore[call-overload]
+        # 標準入力はパイプにして、書き込み側をこのプロセスが持ち続ける。ワーカーが
+        # （強制終了も含めて）終わるとパイプが閉じ、子は EOF を受けて自分で終了する。
+        proc = subprocess.Popen(  # noqa: S603
+            cmd, env=child_env(), stdin=subprocess.PIPE, **new_group_kwargs()  # type: ignore[call-overload]
         )
+        log.info("子プロセスを起動しました（job %d, pid %d）。", job_id, proc.pid)
+        return proc
 
     return launch
 
@@ -175,6 +179,15 @@ class Worker:
         except subprocess.TimeoutExpired:
             log.error("子プロセスが終了しません。")
 
+    @staticmethod
+    def _close_stdin(child: ChildHandle) -> None:
+        stdin = getattr(child, "stdin", None)
+        if stdin is not None:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
     def _finish(self, job_id: int, status: str, message: str | None, stage: str | None) -> None:
         with self.session_factory() as session:
             finish_job(session, self.settings, job_id, status, message=message, stage=stage)
@@ -203,6 +216,7 @@ class Worker:
             self._finish(job_id, FAILED, INTERRUPTED_MESSAGE, None)
             raise
         finally:
+            self._close_stdin(child)
             self.current_job_id, self.current_child = None, None
         return job_id
 

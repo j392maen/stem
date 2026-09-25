@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from stemapp.config import Settings
 from stemapp.library import find_done_job
 from stemapp.models import SeparationJob, Track
-from stemapp.separation.pipeline import delete_job_stems, load_plan
+from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
 
 log = logging.getLogger(__name__)
 
@@ -142,10 +142,31 @@ def is_cancel_requested(session: Session, job_id: int) -> bool:
 
 
 def discard_job_outputs(session: Session, settings: Settings, job_id: int) -> None:
-    """ジョブの STEM 行と `data/stems/<job_id>` を消す（commit まで行う）。"""
+    """ジョブの STEM 行、`data/stems/<job_id>`、一時フォルダを消す（commit まで行う）。"""
     delete_job_stems(session, job_id)
     session.commit()
     shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
+    shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
+
+
+def clean_stale_tmp(session: Session, settings: Settings) -> list[str]:
+    """running でないジョブの一時フォルダ（`data/cache/tmp/job-<id>`）を消す。"""
+    tmp_root = settings.cache_dir / "tmp"
+    if not tmp_root.is_dir():
+        return []
+    running = set(
+        session.scalars(select(SeparationJob.job_id).where(SeparationJob.status == RUNNING))
+    )
+    removed: list[str] = []
+    for d in tmp_root.glob("job-*"):
+        try:
+            job_id = int(d.name.removeprefix("job-"))
+        except ValueError:
+            continue
+        if d.is_dir() and job_id not in running:
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(d.name)
+    return removed
 
 
 def finish_job(
@@ -179,6 +200,9 @@ def recover_interrupted_jobs(session: Session, settings: Settings) -> list[int]:
     for job_id in ids:
         finish_job(session, settings, job_id, FAILED, message=INTERRUPTED_MESSAGE)
         log.warning("中断されたジョブを failed にしました（job %d）。", job_id)
+    removed = clean_stale_tmp(session, settings)
+    if removed:
+        log.info("残っていた一時フォルダを消しました: %s", removed)
     return ids
 
 
