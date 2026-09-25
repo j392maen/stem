@@ -12,8 +12,9 @@
 - 処理PC: Windows 11 ノートPC、Core i7-14650HX、GeForce RTX 4060 Laptop（VRAM 8GB）。
 - 操作・再生: PC のブラウザ、および外出先の iPhone（Chrome。中身は WebKit）。
 - 外部アクセス: Tailscale Serve（`tailscale serve --bg 8000`）経由の HTTPS。アプリ自体は 127.0.0.1:8000 のみで待ち受ける。
-- 開発・テストは Linux のクラウド環境（GPU なし）。GPU が必要な処理は必ず差し替え可能にし、テストは偽物（Fake）で通す。
-- Windows と Linux の両方で動くコードにする（パス区切り、改行、シェル依存に注意。`pathlib` を使う）。
+- 開発も同じ Windows PC 上で行う（Claude Code をネイティブ Windows で実行）。プロジェクトの場所は `C:\mine\stem`。GPU を使った実行確認ができる。
+- 通常のテストは GPU なしでも通るよう Fake（偽の分離器）で書く。実 GPU を使うテストには `@pytest.mark.gpu` を付け、`uv run pytest -m gpu` で別に実行する。
+- `pathlib` を使い、Windows のパス・文字コード（UTF-8 を明示）に注意する。シェルは PowerShell / Git Bash のどちらでも動く手順にする。
 
 ## 3. 技術スタック（決定事項）
 - Python 3.12、パッケージ管理 uv（`pyproject.toml`）。
@@ -21,10 +22,11 @@
 - DB: SQLite（SQLAlchemy 2.0 ORM）。起動時に自動作成。
 - 分離: `audio-separator`（python-audio-separator）を optional 依存 `gpu` として利用。コアは抽象インターフェース越しに呼ぶ。
 - 音声処理: ffmpeg（外部コマンド）、numpy、soundfile。
-- URL取得: yt-dlp（Python API）。YouTube には Deno が必要。
+- URL取得: 既存の `C:\mine\yt-dlp.exe` を外部コマンドとして使う（パスは設定 `STEMAPP_YTDLP_PATH`）。見つからない場合は Python パッケージ yt-dlp を代わりに使う。YouTube には Deno が必要。起動時に `yt-dlp.exe -U` で更新できる仕組みを用意する。
 - フロント: ビルド不要の素の JavaScript（ES modules）+ Canvas + Web Audio API。npm は使わない。
 - テスト: pytest。CI 相当として `uv run pytest` が Linux で通ること。
-- 設定: pydantic-settings。データ置き場の既定は `%USERPROFILE%\stemapp-data`（Linux は `~/stemapp-data`）。環境変数 `STEMAPP_DATA_DIR` で上書き可。
+- GPU: CUDA 版 torch（cu128）を uv の index 設定で `pyproject.toml` に組み込む（Windows のみ。`[tool.uv.sources]` と marker を使う）。audio-separator[gpu] は optional 依存 `gpu`。
+- 設定: pydantic-settings。`C:\mine\stem\.env` を読む。データ置き場は `STEMAPP_DATA_DIR`（既定 `C:\mine\stem\data`、git 管理外）。
 
 ## 4. stem
 基本7種（分割時に必ず作る）: lead_vocal, backing_vocal, drums, bass, guitar, piano, other
