@@ -74,3 +74,19 @@ def safe_data_file(settings: Settings, stored: str) -> Path:
     if not path.is_relative_to(root) or not path.is_file():
         raise not_found("ファイル")
     return path
+
+
+LOCAL_HOSTS = frozenset({"127.0.0.1", "::1"})
+# 中継（Tailscale Serve など）を通ったしるし。接続元が 127.0.0.1 でも、この PC の外から来ている
+PROXY_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host", "tailscale-user-login")
+
+
+def is_local_request(request: Request) -> bool:
+    """このサーバーと同じ PC のブラウザからの呼び出しか。
+
+    接続元が 127.0.0.1 / ::1 で、中継のヘッダーが付いていないときだけ True。
+    """
+    host = request.client.host if request.client else ""
+    if host not in LOCAL_HOSTS:
+        return False
+    return not any(h in request.headers for h in PROXY_HEADERS)

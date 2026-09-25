@@ -19,7 +19,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
 from stemapp import __version__
-from stemapp.api import auth, cues, files, imports, master, tracks
+from stemapp.api import auth, cues, files, folders, imports, master, tracks
 from stemapp.api.imports import ImportDeps, ImportManager
 from stemapp.config import Settings, get_settings
 from stemapp.db import init_db, make_engine, make_session_factory
@@ -118,7 +118,7 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    for module in (auth, imports, tracks, cues, files, master):
+    for module in (auth, imports, tracks, cues, files, folders, master):
         app.include_router(module.router)
     # 画面。API のルートより後に登録する（/api/* はここまで来ない）
     app.mount("/", WebFiles(directory=WEB_DIR, html=True), name="web")
