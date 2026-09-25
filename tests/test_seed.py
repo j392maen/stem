@@ -224,3 +224,65 @@ def test_listen_preset_user_edits_kept(session: Session) -> None:
     seed(session)
     session.expire_all()
     assert session.get(ListenPresetItem, item.item_id).gain_db == -6.0  # type: ignore[union-attr]
+
+
+def _hue(color: str) -> float:
+    import colorsys
+
+    r, g, b = (int(color[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    return colorsys.rgb_to_hls(r, g, b)[0] * 360
+
+
+def _sat(color: str) -> float:
+    import colorsys
+
+    r, g, b = (int(color[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    return colorsys.rgb_to_hls(r, g, b)[2]
+
+
+def test_colors_avoid_accent_red_and_groups_differ(session: Session) -> None:
+    """stem・グループの色は差し色（赤系統）と紛れず、グループはメンバーの stem と別の色。"""
+    seed(session)
+    types = {t.code: t for t in session.scalars(select(StemType))}
+    groups = session.scalars(select(StemGroup)).all()
+    all_colors = [t.color for t in types.values()] + [g.color for g in groups]
+    for color in all_colors:
+        h = _hue(color)
+        # 彩度のある色は赤〜ピンク（330°〜15°）を避ける
+        if _sat(color) > 0.25:
+            assert 15 <= h <= 330, color
+    base = [types[c].color.upper() for c in BASE_STEM_CODES]
+    assert len(set(base)) == len(base)
+    members = {
+        g.group_id: {
+            types_by_id.color.upper()
+            for m in session.scalars(
+                select(StemGroupMember).where(StemGroupMember.group_id == g.group_id)
+            )
+            for types_by_id in [session.get(StemType, m.stem_type_id)]
+            if types_by_id is not None
+        }
+        for g in groups
+    }
+    for g in groups:
+        assert g.color.upper() not in members[g.group_id], g.code
+        assert g.color.upper() not in base, g.code
+    group_colors = [g.color.upper() for g in groups]
+    assert len(set(group_colors)) == len(group_colors)
+
+
+def test_seed_updates_colors_of_existing_db(session: Session) -> None:
+    """既存 DB の古い色（T01 の色）も seed で新しい色になる。"""
+    seed(session)
+    drums = session.scalar(select(StemType).where(StemType.code == "drums"))
+    rhythm = session.scalar(select(StemGroup).where(StemGroup.code == "rhythm"))
+    assert drums is not None and rhythm is not None
+    drums.color = "#F58231"
+    rhythm.color = "#F58231"
+    session.commit()
+    seed(session)
+    session.expire_all()
+    want_type = next(d.color for d in seed_mod.STEM_TYPES if d.code == "drums")
+    want_group = next(g.color for g in seed_mod.GROUPS if g.code == "rhythm")
+    assert session.get(StemType, drums.stem_type_id).color == want_type  # type: ignore[union-attr]
+    assert session.get(StemGroup, rhythm.group_id).color == want_group  # type: ignore[union-attr]
