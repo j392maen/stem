@@ -9,6 +9,8 @@
   ふつうに起動した孫は親の Job から抜けてしまう。明示的に Job に入れればそれを防げる。
 - Linux など: 子は環境変数 STEMAPP_PARENT_PID を受け取り、`watch_parent()` のスレッドが
   1秒ごとに親が変わっていないか（os.getppid）を調べ、親がいなくなったら終了する。
+- 例外: エクスプローラーのようにユーザーが使い続ける画面は `start_detached` で起動し、
+  Job に入れない（アプリを終了しても閉じない）。
 
 標準入力は読まない（Windows で stdin パイプを別スレッドで同期読み取りしていると、
 その間の DLL 読み込み（例: import scipy.signal）が止まってしまうため）。
@@ -23,6 +25,7 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -187,3 +190,43 @@ def watch_parent() -> threading.Thread | None:
     t = threading.Thread(target=check, name="parent-watch", daemon=True)
     t.start()
     return t
+
+
+# Windows の CreateProcess の作成フラグ
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_DETACHED_PROCESS = 0x00000008
+_ERROR_ACCESS_DENIED = 5
+
+
+def start_detached(cmd: Sequence[str]) -> None:
+    """親（このプロセス）が終わっても道連れにしない外部プログラムを起動する（Windows 用）。
+
+    エクスプローラーなど、ユーザーが使い続ける画面を開くためのもの。`popen_bound` と違って
+    このプロセスの Job に入れず、可能なら親の Job（venv のランチャーなど）からも抜けさせる。
+    終わるのは待たない（後始末はスレッドで wait するだけ）。
+    """
+    base: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        flags = _DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        try:
+            proc = subprocess.Popen(  # noqa: S603
+                list(cmd), creationflags=flags | _CREATE_BREAKAWAY_FROM_JOB, **base
+            )
+        except OSError as e:
+            # 親の Job が抜け出しを許していないと ERROR_ACCESS_DENIED になる
+            if getattr(e, "winerror", None) != _ERROR_ACCESS_DENIED:
+                raise
+            proc = subprocess.Popen(list(cmd), creationflags=flags, **base)  # noqa: S603
+    else:
+        proc = subprocess.Popen(list(cmd), start_new_session=True, **base)  # noqa: S603
+    threading.Thread(target=proc.wait, name="detached-wait", daemon=True).start()
+
+
+def open_in_explorer(folder: Path) -> None:
+    """フォルダをエクスプローラーで開く（Windows のみ）。"""
+    start_detached(["explorer.exe", str(folder)])
