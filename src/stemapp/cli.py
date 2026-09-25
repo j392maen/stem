@@ -21,6 +21,7 @@ from stemapp.config import Settings, get_settings
 from stemapp.doctor import CheckResult, Status, exit_code, run_checks
 
 if TYPE_CHECKING:
+    from stemapp.beats.base import BeatAnalyzer
     from stemapp.ingest import ImportResult
     from stemapp.ingest.url import YtDlpRunner
     from stemapp.separation.base import Separator
@@ -155,6 +156,7 @@ def worker(
         Worker,
         WorkerLock,
         WorkerLockError,
+        subprocess_beat_runner,
         subprocess_launcher,
     )
     from stemapp.proc import watch_parent
@@ -170,7 +172,13 @@ def worker(
         raise typer.Exit(1) from e
     try:
         with _db_engine(settings) as factory:
-            w = Worker(settings, factory, subprocess_launcher(settings), stop_file=stop_file)
+            w = Worker(
+                settings,
+                factory,
+                subprocess_launcher(settings),
+                stop_file=stop_file,
+                beat_runner=subprocess_beat_runner(settings),
+            )
             try:
                 w.run_forever()
             except KeyboardInterrupt:
@@ -456,6 +464,61 @@ def bench(
     render_bench(report, console)
     path = save_report(settings, report)
     console.print(f"結果を保存しました: {path}")
+
+
+# --- 拍 ----------------------------------------------------------------------------
+
+
+def make_beat_analyzer(settings: Settings, cpu: bool = False) -> BeatAnalyzer:
+    """実際の拍の解析器（beat_this）。テストでは差し替える。"""
+    from stemapp.beats.beat_this_backend import BeatThisAnalyzer
+
+    return BeatThisAnalyzer(settings.models_dir, device="cpu" if cpu else None)
+
+
+@app.command()
+def beats(
+    track_id: Annotated[int, typer.Argument(help="曲の番号（track_id）")],
+    force: Annotated[bool, typer.Option("--force", help="解析済みでも解析し直す")] = False,
+    cpu: Annotated[bool, typer.Option("--cpu", help="GPU を使わず CPU で解析する")] = False,
+) -> None:
+    """曲の拍・小節の頭を解析して保存し、区間ごとの BPM と拍子を表示する。"""
+    from stemapp.beats.service import analyze_track
+    from stemapp.beats.tempo import tempo_segments
+
+    _setup_logging()
+    settings = _settings()
+    console = Console()
+    with _db_session(settings) as session:
+        try:
+            outcome = analyze_track(
+                session, settings, track_id, make_beat_analyzer(settings, cpu), force=force
+            )
+            session.commit()
+        except Exception as e:
+            console.print(f"[bold red]拍を解析できませんでした: {e}[/bold red]", soft_wrap=True)
+            raise typer.Exit(1) from e
+        grid = outcome.grid
+        beat_list = list(grid.beats_json or [])
+        if outcome.skipped:
+            console.print("解析済みです（解析し直すには --force）。保存済みの結果を表示します。")
+        segments = tempo_segments(beat_list)
+        table = Table(title=f"track {track_id} の区間ごとの BPM")
+        table.add_column("開始", justify="right")
+        table.add_column("終了", justify="right")
+        table.add_column("BPM", justify="right")
+        for seg in segments:
+            table.add_row(f"{seg.start_sec:.2f}", f"{seg.end_sec:.2f}", f"{seg.bpm:.2f}")
+        console.print(table)
+        console.print(
+            f"拍 {len(beat_list)}・小節の頭 {len(grid.downbeats_json or [])}・"
+            f"拍子 {grid.time_signature}/4・解析器 {grid.analyzer}"
+        )
+        if outcome.result is not None:
+            console.print(
+                f"装置: {outcome.result.device}　解析: {outcome.result.seconds:.1f} 秒"
+                f"（読み込み等を含む全体 {outcome.seconds:.1f} 秒）"
+            )
 
 
 def main() -> None:

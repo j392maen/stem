@@ -2,7 +2,8 @@
 
 ワーカーが1ジョブごとに起動する。job_id だけを受け取り、DB からジョブを読んで
 T02 の `separate_track` を実行する（進捗は JOB に書く）。最後の段階で配信用データ
-（Opus と波形 peaks）を作る。キャンセル時はワーカーがこのプロセスを終了させる
+（Opus と波形 peaks）を作り、続けて曲の拍を解析する（T10。失敗してもジョブは done のまま、
+警告を JOB.beat_warning に残す）。キャンセル時はワーカーがこのプロセスを終了させる
 （GPU メモリを確実に解放するため）。
 
 終了コード: 0=完了、1=失敗（JOB は failed）、2=想定外の例外、3=親（ワーカー）がいなくなった。
@@ -10,7 +11,8 @@ T02 の `separate_track` を実行する（進捗は JOB に書く）。最後�
 ワーカーが強制終了されたときは、Windows ではワーカーの Job Object により OS がこのプロセスを
 終了させる。Linux では `watch_parent()` が親の終了に気づいて終了する（`stemapp.proc`）。
 
-`--fake` を付けると FakeSeparator とダミーのエンコーダで動く（テスト用。GPU・ffmpeg 不要）。
+`--fake` を付けると FakeSeparator・FakeBeatAnalyzer とダミーのエンコーダで動く
+（テスト用。GPU・ffmpeg 不要）。
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from stemapp.audio import FfmpegRunner
+from stemapp.beats.base import BeatAnalyzer
+from stemapp.beats.service import STAGE_BEATS, analyze_job_beats
 from stemapp.config import Settings, get_settings
 from stemapp.db import make_engine, make_session_factory
 from stemapp.delivery import create_delivery_files, fake_encoder
@@ -47,8 +51,12 @@ def run_job(
     separator: Separator,
     *,
     encoder: FfmpegRunner | None = None,
+    beat_analyzer: BeatAnalyzer | None = None,
 ) -> int:
-    """登録済みのジョブを実行する（子プロセスの本体。テストではそのまま呼べる）。"""
+    """登録済みのジョブを実行する（子プロセスの本体。テストではそのまま呼べる）。
+
+    beat_analyzer を渡すと、配信用データの後に拍を解析する（None なら拍の段階を飛ばす）。
+    """
     engine = make_engine(settings.db_path)
     factory = make_session_factory(engine)
     try:
@@ -62,7 +70,14 @@ def run_job(
             def postprocess(
                 s: Session, st: Settings, jid: int, progress: ProgressCallback
             ) -> None:
-                create_delivery_files(s, st, jid, encoder=encoder, progress=progress)
+                if beat_analyzer is None:
+                    create_delivery_files(s, st, jid, encoder=encoder, progress=progress)
+                    return
+                create_delivery_files(
+                    s, st, jid, encoder=encoder, progress=lambda p, m: progress(0.7 * p, m)
+                )
+                progress(0.75, STAGE_BEATS)
+                analyze_job_beats(s, st, jid, beat_analyzer)
 
             try:
                 separate_track(
@@ -95,6 +110,12 @@ def _real_separator(settings: Settings) -> Separator:
     )
 
 
+def _real_beat_analyzer(settings: Settings) -> BeatAnalyzer:
+    from stemapp.beats.beat_this_backend import BeatThisAnalyzer
+
+    return BeatThisAnalyzer(settings.models_dir)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="stemapp 分割の子プロセス")
     parser.add_argument("job_id", type=int)
@@ -121,20 +142,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     encoder: FfmpegRunner | None = None
     separator: Separator
+    beat_analyzer: BeatAnalyzer
     if args.fake:
+        from stemapp.beats.fake import FakeBeatAnalyzer
         from stemapp.seed import SW
         from stemapp.separation.fake import FakeSeparator
 
+        beat_analyzer = FakeBeatAnalyzer()
         separator = FakeSeparator(
             delay_sec=args.fake_delay, fail_models={SW} if args.fake_fail else ()
         )
         encoder = fake_encoder
     else:
         separator = _real_separator(settings)
+        beat_analyzer = _real_beat_analyzer(settings)
     try:
         for name in args.preimport:
             importlib.import_module(name)
-        return run_job(settings, args.job_id, separator, encoder=encoder)
+        return run_job(
+            settings, args.job_id, separator, encoder=encoder, beat_analyzer=beat_analyzer
+        )
     except Exception:
         log.exception("job %d で想定外のエラー", args.job_id)
         return EXIT_ERROR

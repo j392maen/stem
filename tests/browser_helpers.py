@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from job_helpers import FinishedHandle
 from stemapp.api.imports import ImportDeps
 from stemapp.app import create_app
+from stemapp.beats.base import BeatAnalyzer
+from stemapp.beats.service import analyze_job_beats
 from stemapp.config import REPO_ROOT, Settings
 from stemapp.db import init_db, make_engine, make_session_factory
 from stemapp.jobs.child import run_job
@@ -50,8 +52,13 @@ class LiveServer:
 
 @contextmanager
 def run_server(
-    settings: Settings, *, fake_delay: float = 0.2, with_worker: bool = True
+    settings: Settings,
+    *,
+    fake_delay: float = 0.2,
+    with_worker: bool = True,
+    beat_analyzer: BeatAnalyzer | None = None,
 ) -> Iterator[LiveServer]:
+    """beat_analyzer を渡すと、分割の後処理と作り直しで拍を作る（省略時は拍を作らない）。"""
     engine = make_engine(settings.db_path)
     init_db(engine)
     factory = make_session_factory(engine)
@@ -80,10 +87,21 @@ def run_server(
 
         def launch(job_id: int) -> ChildHandle:
             # 子プロセスの代わりにその場で実行する（配信用データは本物の ffmpeg で作る）
-            rc = run_job(settings, job_id, FakeSeparator(delay_sec=fake_delay), encoder=None)
+            rc = run_job(
+                settings, job_id, FakeSeparator(delay_sec=fake_delay), encoder=None,
+                beat_analyzer=beat_analyzer,
+            )
             return FinishedHandle(rc)
 
-        worker = Worker(settings, factory, launch, poll_interval=0.2, cancel_check_interval=0.1)
+        def beat_runner(job_id: int, _stop: object) -> None:
+            assert beat_analyzer is not None
+            with factory() as s:
+                analyze_job_beats(s, settings, job_id, beat_analyzer)
+
+        worker = Worker(
+            settings, factory, launch, poll_interval=0.2, cancel_check_interval=0.1,
+            beat_runner=beat_runner if beat_analyzer is not None else None,
+        )
         worker_thread = threading.Thread(target=worker.run_forever, name="test-worker", daemon=True)
         worker_thread.start()
     try:
