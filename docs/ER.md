@@ -10,14 +10,14 @@
 | SEPARATION_PRESET | preset_id PK, code UK(fast/standard/best), display_name, is_default |
 | PRESET_STEP | preset_id PK FK, step_order PK, model_id FK, input(mixture/vocals), role(multistem/vocals/karaoke), ensemble_weight, options_json |
 | MODEL | model_id PK, filename UK, display_name, architecture, output_stems_json, min_vram_mb, checkpoint_sha256, license, source_url |
-| SEPARATION_JOB | job_id PK, track_id FK, job_kind(full/refine), preset_id FK(full のみ), input_stem_id FK(refine のみ), requested_by FK→DEVICE, status(queued/running/done/failed/canceled), run_on(gpu/cpu/nightly), progress(0-1), stage, created_at, started_at, finished_at, error_message, cancel_requested(bool、キャンセル依頼), output_gain_db(float、既定0。保存前に全 stem にかけた倍率) |
+| SEPARATION_JOB | job_id PK, track_id FK, job_kind(full/refine), preset_id FK(full のみ), input_stem_id FK(refine のみ), requested_by FK→DEVICE, status(queued/running/done/failed/canceled), run_on(gpu/cpu/nightly), progress(0-1), stage, created_at, started_at, finished_at, error_message, cancel_requested(bool、キャンセル依頼), output_gain_db(float、既定0。保存前に全 stem にかけた倍率), postprocess_status(NULL/queued/running/done/failed、配信用データの作り直し) |
 | STEM_TYPE | stem_type_id PK, code UK, display_name(日本語), parent_id FK→STEM_TYPE, tier(base/detail), refine_model_id FK→MODEL, experimental, color(#RRGGBB), display_order |
 | STEM | stem_id PK, job_id FK, stem_type_id FK, parent_stem_id FK→STEM, is_residual, rms_db, is_silent |
 | STEM_RENDITION | rendition_id PK, stem_id FK, purpose(master/stream), codec(flac/opus/wav), bitrate_kbps, file_path, bytes |
 | WAVEFORM | stem_id PK FK, samples_per_px PK, peaks_path |
 | STEM_GROUP | group_id PK, code UK, display_name, color, is_builtin |
 | STEM_GROUP_MEMBER | group_id PK FK, stem_type_id PK FK |
-| LISTEN_PRESET | listen_preset_id PK, name, sort_order |
+| LISTEN_PRESET | listen_preset_id PK, name, sort_order, seed_code UK(組み込みの識別子、ユーザー作成は NULL), hidden(bool、組み込みを削除したとき) |
 | LISTEN_PRESET_ITEM | item_id PK, listen_preset_id FK, stem_type_id FK（どちらか一方）, group_id FK（どちらか一方）, gain_db |
 | PLAYBACK_STATE | device_id PK FK, track_id PK FK, listen_preset_id FK, channel_gains_json, position_sec, updated_at |
 | CUE_POINT | cue_id PK, track_id FK, position_sec, loop_end_sec(null可), label, color |
