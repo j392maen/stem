@@ -169,6 +169,30 @@ def test_normalize_failure_leaves_db_unchanged(session: Session, settings: Setti
     assert session.scalars(select(InputSource)).all() == []
 
 
+def test_commit_failure_removes_track_dir(session: Session, settings: Settings, tmp_path: Path,
+                                          mix: np.ndarray, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = write_source(tmp_path / "a.wav", mix)
+
+    def failing_commit() -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(session, "commit", failing_commit)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        _import(session, settings, src)
+    monkeypatch.undo()
+
+    # 置いた正規化ファイルのフォルダは消え、DB にも残らない
+    assert not any(settings.tracks_dir.iterdir())
+    assert session.scalars(select(Track)).all() == []
+    assert session.scalars(select(InputSource)).all() == []
+    assert not list((settings.cache_dir / "tmp").glob("*"))
+
+    # やり直せば登録できる
+    res = _import(session, settings, src)
+    assert res.is_new is True
+    assert (settings.tracks_dir / str(res.track_id) / "normalized.wav").is_file()
+
+
 # --- 実際の ffmpeg / ffprobe を使うもの -------------------------------------------------
 
 needs_ffmpeg = pytest.mark.skipif(
