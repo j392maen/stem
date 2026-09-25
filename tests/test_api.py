@@ -184,7 +184,7 @@ def test_delete_track(client: TestClient, done_job: tuple[int, int]) -> None:
     track_id, job_id = done_job
     settings = client.app.state.settings  # type: ignore[attr-defined]
     assert (settings.tracks_dir / str(track_id)).is_dir()
-    assert (settings.stems_dir / str(job_id)).is_dir()
+    assert (settings.stems_dir / "song" / "fast").is_dir()  # data/stems/<元のファイル名>/<分け方>
 
     # 分割待ちのジョブがあると 409
     queued = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "fast", "force": True})
@@ -196,7 +196,7 @@ def test_delete_track(client: TestClient, done_job: tuple[int, int]) -> None:
     res = client.delete(f"/api/tracks/{track_id}")
     assert res.status_code == 200 and res.json()["deleted"] is True
     assert not (settings.tracks_dir / str(track_id)).exists()
-    assert not (settings.stems_dir / str(job_id)).exists()
+    assert not (settings.stems_dir / "song").exists()  # 空になった曲のフォルダも消える
     with _factory(client)() as s:
         assert s.scalars(select(Track)).all() == []
         assert s.scalars(select(SeparationJob)).all() == []
@@ -590,8 +590,8 @@ def test_multiple_jobs_per_track_and_delete_job(
     res = client.delete(f"/api/jobs/{exp_job}")
     assert res.status_code == 200
     assert res.json() == {"deleted": True, "job_id": exp_job, "track_id": track_id}
-    assert not (settings.stems_dir / str(exp_job)).exists()
-    assert (settings.stems_dir / str(fast_job)).is_dir()
+    assert not (settings.stems_dir / "song" / "exp_resid_vocals").exists()
+    assert (settings.stems_dir / "song" / "fast").is_dir()
     track = client.get(f"/api/tracks/{track_id}").json()
     assert track["playable_job_id"] == fast_job
     assert exp_job not in [j["job_id"] for j in track["jobs"]]
