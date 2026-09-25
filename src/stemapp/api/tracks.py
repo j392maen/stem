@@ -170,7 +170,8 @@ def reanalyze_beats(track_id: int, response: Response, session: SessionDep) -> d
     """拍を解析し直す（ワーカーが「作り直し」として処理する）。登録したら 202。
 
     今の結果は消してから登録する（解析が終わるまで拍の無い曲として表示される）。
-    分割が終わっていない曲は 409。
+    作り直しが作成待ち・作成中のときも拍は消す（ワーカーは作り直しの最後に拍の有無を見るので、
+    その作り直しの中で解析される）。分割が終わっていない曲は 409。
     """
     if session.get(Track, track_id) is None:
         raise not_found("曲")
@@ -187,13 +188,13 @@ def reanalyze_beats(track_id: int, response: Response, session: SessionDep) -> d
         raise HTTPException(
             status_code=409, detail="分割が終わっていない曲です。分割が終わると拍も解析されます。"
         )
+    grid = session.get(BeatGrid, track_id)
+    if grid is not None:
+        session.delete(grid)
+        session.commit()
     if job.postprocess_status in ACTIVE_STATUSES:
         res_job, created, reason = job, False, "active"
     else:
-        grid = session.get(BeatGrid, track_id)
-        if grid is not None:
-            session.delete(grid)
-            session.flush()
         res = request_postprocess(session, job.job_id, [MISSING_BEATS])
         res_job, created, reason = res.job, res.created, res.reason
     response.status_code = 202 if created else 200
