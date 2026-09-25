@@ -375,9 +375,24 @@ class Export(Base):
         ForeignKey("listen_preset.listen_preset_id", ondelete="SET NULL")
     )  # mix のみ
     export_type: Mapped[str] = mapped_column(String(10))  # single / all / mix
-    format: Mapped[str] = mapped_column(String(10))  # wav / flac / mp3 / zip
+    # 音声の形式 wav / flac / mp3。all は ZIP にまとめ、中身の音声がこの形式になる
+    format: Mapped[str] = mapped_column(String(10))
+    # データフォルダからの相対パス（できあがったファイル）
     output_path: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # queued / running / done / failed
+    status: Mapped[str] = mapped_column(
+        String(10), default="queued", server_default=text("'queued'")
+    )
+    progress: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0.0"))
+    stage: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    # ダウンロード時のファイル名（<曲名> - <stem の表示名>.<拡張子> など）
+    filename: Mapped[str | None] = mapped_column(String(300))
+    bytes: Mapped[int | None] = mapped_column(Integer)
+    # mix で合計が ±1 を超えたとき、全体にかけた倍率（dB、負の値）。下げなければ 0
+    mix_gain_db: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0.0"))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ExportItem(Base):
@@ -389,6 +404,8 @@ class ExportItem(Base):
     stem_id: Mapped[int] = mapped_column(
         ForeignKey("stem.stem_id", ondelete="CASCADE"), primary_key=True
     )
+    # mix で、この stem にかけた音量（dB。組み合わせの gain_db）。single / all は 0
+    gain_db: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0.0"))
 
 
 ALL_MODELS: tuple[type[Base], ...] = (

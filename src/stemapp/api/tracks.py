@@ -21,6 +21,7 @@ from stemapp.api.common import SessionDep, iso, job_to_dict, not_found, preset_c
 from stemapp.beats.service import beats_payload, get_grid
 from stemapp.config import Settings
 from stemapp.delivery import missing_delivery
+from stemapp.exports import export_ids_for_jobs, remove_export_dirs
 from stemapp.jobs import (
     ACTIVE_STATUSES,
     DONE,
@@ -133,8 +134,10 @@ def delete_track(
             detail="分割待ち・分割中のジョブがあるため削除できません。キャンセルしてから削除してください。",
         )
     job_ids = [j.job_id for j in jobs]
-    session.delete(track)  # JOB・STEM・INPUT_SOURCE などは外部キーの CASCADE で消える
+    export_ids = export_ids_for_jobs(session, job_ids)
+    session.delete(track)  # JOB・STEM・INPUT_SOURCE・EXPORT などは外部キーの CASCADE で消える
     session.commit()
+    remove_export_dirs(settings, export_ids)
     shutil.rmtree(settings.tracks_dir / str(track_id), ignore_errors=True)
     for job_id in job_ids:
         shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)

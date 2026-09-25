@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     model_dir: Path | None = None
     # アップロードできるファイルの大きさの上限（MB）
     max_upload_mb: int = 1024
+    # 書き出し（data/exports）を残す時間と、合計の大きさの上限（超えた分は古い順に消す）
+    export_ttl_hours: float = 24.0
+    export_max_mb: int = 2048
 
     @property
     def data_root(self) -> Path:
@@ -60,6 +63,10 @@ class Settings(BaseSettings):
     @property
     def cache_dir(self) -> Path:
         return _ensure_dir(self.data_dir / "cache")
+
+    @property
+    def exports_dir(self) -> Path:
+        return _ensure_dir(self.data_dir / "exports")
 
     @property
     def models_dir(self) -> Path:
