@@ -3,7 +3,9 @@
 - STEM_TYPE / MODEL / SEPARATION_PRESET / STEM_GROUP は一意キー（code, filename）で
   作成または更新する。
 - PRESET_STEP と STEM_GROUP_MEMBER（組み込みのみ）は定義どおりに揃える。
-- LISTEN_PRESET は名前で探し、無いときだけ作る（ユーザーが編集した中身は上書きしない）。
+- LISTEN_PRESET は seed_code（組み込みの識別子）で探し、無いときだけ作る（ユーザーが編集した
+  名前・中身は上書きしない。ユーザーが削除した組み込みは hidden で残っているので作り直さない）。
+  seed_code を持たない古い DB では、同じ名前の行に seed_code を付けて組み込みとみなす。
 """
 
 from __future__ import annotations
@@ -93,52 +95,54 @@ BASE_STEM_CODES: tuple[str, ...] = (
 )
 
 # 並び順＝表示順。親は必ず子より前に置く。
+# 色は暗い背景で見分けやすく、画面の差し色（赤系統）と紛れないよう、赤〜ピンクの色相を避ける。
+# 基本 stem は色相を離し（紫・黄・緑・シアン・青・赤紫）、詳細 stem は親と同じ系統で明るさを変える。
 STEM_TYPES: list[StemTypeDef] = [
     # 基本（分割時に必ず作る）
-    StemTypeDef("vocals", "ボーカル", None, "base", "#E6194B"),
-    StemTypeDef("lead_vocal", "メインボーカル", "vocals", "base", "#FF4D6D"),
-    StemTypeDef("backing_vocal", "サブボーカル", "vocals", "base", "#FF9EB5"),
-    StemTypeDef("drums", "ドラム", None, "base", "#F58231"),
-    StemTypeDef("bass", "ベース", None, "base", "#3CB44B"),
-    StemTypeDef("guitar", "ギター", None, "base", "#FFE119"),
-    StemTypeDef("piano", "ピアノ", None, "base", "#4363D8"),
-    StemTypeDef("other", "その他", None, "base", "#911EB4"),
-    # ボーカルの詳細
-    StemTypeDef("male", "男声", "vocals", "detail", "#C2185B", refine_model=MALE_FEMALE),
-    StemTypeDef("female", "女声", "vocals", "detail", "#F48FB1", refine_model=MALE_FEMALE),
-    StemTypeDef("breath", "息", "vocals", "detail", "#FFCDD2", refine_model=ASPIRATION),
-    # ドラムの詳細
-    StemTypeDef("kick", "キック", "drums", "detail", "#E65100", refine_model=DRUMSEP),
-    StemTypeDef("snare", "スネア", "drums", "detail", "#FB8C00", refine_model=DRUMSEP),
-    StemTypeDef("toms", "タム", "drums", "detail", "#FFA726", refine_model=DRUMSEP),
-    StemTypeDef("hihat", "ハイハット", "drums", "detail", "#FFCC80", experimental=True,
+    StemTypeDef("vocals", "ボーカル", None, "base", "#A78BFA"),
+    StemTypeDef("lead_vocal", "メインボーカル", "vocals", "base", "#E9D5FF"),
+    StemTypeDef("backing_vocal", "サブボーカル", "vocals", "base", "#6366F1"),
+    StemTypeDef("drums", "ドラム", None, "base", "#FACC15"),
+    StemTypeDef("bass", "ベース", None, "base", "#4ADE80"),
+    StemTypeDef("guitar", "ギター", None, "base", "#22D3EE"),
+    StemTypeDef("piano", "ピアノ", None, "base", "#60A5FA"),
+    StemTypeDef("other", "その他", None, "base", "#E879F9"),
+    # ボーカルの詳細（紫の系統）
+    StemTypeDef("male", "男声", "vocals", "detail", "#7C3AED", refine_model=MALE_FEMALE),
+    StemTypeDef("female", "女声", "vocals", "detail", "#C4B5FD", refine_model=MALE_FEMALE),
+    StemTypeDef("breath", "息", "vocals", "detail", "#DDD6FE", refine_model=ASPIRATION),
+    # ドラムの詳細（黄の系統）
+    StemTypeDef("kick", "キック", "drums", "detail", "#EAB308", refine_model=DRUMSEP),
+    StemTypeDef("snare", "スネア", "drums", "detail", "#FDE047", refine_model=DRUMSEP),
+    StemTypeDef("toms", "タム", "drums", "detail", "#CA8A04", refine_model=DRUMSEP),
+    StemTypeDef("hihat", "ハイハット", "drums", "detail", "#FEF08A", experimental=True,
                 refine_model=DRUMSEP),
-    StemTypeDef("ride", "ライド", "drums", "detail", "#FFE0B2", experimental=True,
+    StemTypeDef("ride", "ライド", "drums", "detail", "#A16207", experimental=True,
                 refine_model=DRUMSEP),
-    StemTypeDef("crash", "クラッシュ", "drums", "detail", "#BF360C", experimental=True,
+    StemTypeDef("crash", "クラッシュ", "drums", "detail", "#FEF9C3", experimental=True,
                 refine_model=DRUMSEP),
-    # ギターの詳細
-    StemTypeDef("acoustic_guitar", "アコースティックギター", "guitar", "detail", "#FDD835"),
-    StemTypeDef("electric_guitar", "エレキギター", "guitar", "detail", "#F9A825"),
-    # その他の詳細
-    StemTypeDef("wind", "管楽器", "other", "detail", "#46F0F0", experimental=True),
-    StemTypeDef("saxophone", "サックス", "other", "detail", "#00ACC1"),
-    StemTypeDef("brass", "金管", "other", "detail", "#FFD700"),
-    StemTypeDef("woodwind", "木管", "other", "detail", "#80CBC4", experimental=True),
-    StemTypeDef("strings", "ストリングス", "other", "detail", "#AA6E28"),
-    StemTypeDef("organ", "オルガン", "other", "detail", "#6D4C41"),
-    StemTypeDef("keys", "キーボード", "other", "detail", "#7986CB"),
-    StemTypeDef("synth", "シンセ", "other", "detail", "#F032E6", experimental=True),
-    StemTypeDef("percussion", "パーカッション", "other", "detail", "#808000",
+    # ギターの詳細（シアンの系統）
+    StemTypeDef("acoustic_guitar", "アコースティックギター", "guitar", "detail", "#A5F3FC"),
+    StemTypeDef("electric_guitar", "エレキギター", "guitar", "detail", "#0891B2"),
+    # その他の詳細（赤紫・水色・黄緑・灰色など、基本 stem と重ならないもの）
+    StemTypeDef("wind", "管楽器", "other", "detail", "#67E8F9", experimental=True),
+    StemTypeDef("saxophone", "サックス", "other", "detail", "#06B6D4"),
+    StemTypeDef("brass", "金管", "other", "detail", "#BEF264"),
+    StemTypeDef("woodwind", "木管", "other", "detail", "#86EFAC", experimental=True),
+    StemTypeDef("strings", "ストリングス", "other", "detail", "#F0ABFC"),
+    StemTypeDef("organ", "オルガン", "other", "detail", "#C026D3"),
+    StemTypeDef("keys", "キーボード", "other", "detail", "#93C5FD"),
+    StemTypeDef("synth", "シンセ", "other", "detail", "#D946EF", experimental=True),
+    StemTypeDef("percussion", "パーカッション", "other", "detail", "#A3A3A3",
                 experimental=True),
-    # パーカッションの詳細
-    StemTypeDef("congas", "コンガ", "percussion", "detail", "#9E9D24", experimental=True),
-    StemTypeDef("tambourine", "タンバリン", "percussion", "detail", "#C0CA33",
+    # パーカッションの詳細（灰色の系統）
+    StemTypeDef("congas", "コンガ", "percussion", "detail", "#D4D4D4", experimental=True),
+    StemTypeDef("tambourine", "タンバリン", "percussion", "detail", "#737373",
                 experimental=True),
-    StemTypeDef("triangle", "トライアングル", "percussion", "detail", "#D4E157",
+    StemTypeDef("triangle", "トライアングル", "percussion", "detail", "#E5E5E5",
                 experimental=True),
-    StemTypeDef("bells", "ベル", "percussion", "detail", "#E6EE9C", experimental=True),
-    StemTypeDef("glockenspiel", "グロッケンシュピール", "percussion", "detail", "#AFB42B",
+    StemTypeDef("bells", "ベル", "percussion", "detail", "#BDB76B", experimental=True),
+    StemTypeDef("glockenspiel", "グロッケンシュピール", "percussion", "detail", "#8B8B6B",
                 experimental=True),
 ]
 
@@ -193,11 +197,12 @@ class GroupDef:
     members: list[str]
 
 
+# グループの色は、メンバーの stem のどの色とも違うものにする（赤系統も避ける）。
 GROUPS: list[GroupDef] = [
-    GroupDef("vocals_all", "ボーカル", "#E6194B", ["lead_vocal", "backing_vocal"]),
-    GroupDef("chords", "コード", "#4363D8", ["guitar", "piano", "other"]),
-    GroupDef("rhythm", "リズム", "#F58231", ["drums", "bass"]),
-    GroupDef("accompaniment", "伴奏", "#3CB44B", ["drums", "bass", "guitar", "piano", "other"]),
+    GroupDef("vocals_all", "ボーカル", "#FB923C", ["lead_vocal", "backing_vocal"]),
+    GroupDef("chords", "コード", "#A3E635", ["guitar", "piano", "other"]),
+    GroupDef("rhythm", "リズム", "#94A3B8", ["drums", "bass"]),
+    GroupDef("accompaniment", "伴奏", "#D4A373", ["drums", "bass", "guitar", "piano", "other"]),
 ]
 
 # --- LISTEN_PRESET -----------------------------------------------------------
@@ -205,16 +210,19 @@ GROUPS: list[GroupDef] = [
 
 @dataclass(frozen=True)
 class ListenDef:
+    code: str  # LISTEN_PRESET.seed_code
     name: str
     stem_types: list[str]
     groups: list[str]
 
 
 LISTEN_PRESETS: list[ListenDef] = [
-    ListenDef("ベース＋コード", ["bass"], ["chords"]),
-    ListenDef("ドラム＋ボーカル＋コード", ["drums"], ["vocals_all", "chords"]),
-    ListenDef("カラオケ（伴奏）", [], ["accompaniment"]),
-    ListenDef("サブボーカルのみ", ["backing_vocal"], []),
+    ListenDef("bass_chords", "ベース＋コード", ["bass"], ["chords"]),
+    ListenDef(
+        "drums_vocals_chords", "ドラム＋ボーカル＋コード", ["drums"], ["vocals_all", "chords"]
+    ),
+    ListenDef("karaoke", "カラオケ（伴奏）", [], ["accompaniment"]),
+    ListenDef("backing_only", "サブボーカルのみ", ["backing_vocal"], []),
 ]
 
 
@@ -321,11 +329,18 @@ def _seed_groups(session: Session, types: dict[str, StemType]) -> dict[str, Stem
 def _seed_listen_presets(
     session: Session, types: dict[str, StemType], groups: dict[str, StemGroup]
 ) -> None:
-    existing = {p.name: p for p in session.scalars(select(ListenPreset))}
+    rows = session.scalars(select(ListenPreset).order_by(ListenPreset.listen_preset_id)).all()
+    by_code = {p.seed_code: p for p in rows if p.seed_code}
     for order, d in enumerate(LISTEN_PRESETS, start=1):
-        if d.name in existing:
+        if d.code in by_code:
             continue
-        p = ListenPreset(name=d.name, sort_order=order * 10)
+        # 移行: seed_code を持たない同じ名前の行（以前の seed が作ったもの）を組み込みとみなす
+        legacy = next((p for p in rows if p.seed_code is None and p.name == d.name), None)
+        if legacy is not None:
+            legacy.seed_code = d.code
+            by_code[d.code] = legacy
+            continue
+        p = ListenPreset(name=d.name, sort_order=order * 10, seed_code=d.code)
         session.add(p)
         session.flush()
         for code in d.stem_types:

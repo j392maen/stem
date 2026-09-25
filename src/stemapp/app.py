@@ -8,19 +8,25 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from stemapp import __version__
-from stemapp.api import auth, files, imports, master, tracks
+from stemapp.api import auth, cues, files, imports, master, tracks
 from stemapp.api.imports import ImportDeps, ImportManager
 from stemapp.config import Settings, get_settings
 from stemapp.db import init_db, make_engine, make_session_factory
 from stemapp.ingest.service import recover_interrupted_imports
 from stemapp.seed import seed
+
+WEB_DIR: Path = Path(__file__).resolve().parent / "web"
 
 # Starlette の既定の英語メッセージを日本語にする
 _DEFAULT_DETAILS: dict[int, str] = {
@@ -40,13 +46,28 @@ def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
         parts = []
+        reasons = []
         for err in exc.errors():
             loc = ".".join(str(x) for x in err.get("loc", ()) if x != "body")
             parts.append(loc or "本文")
+            # 自前の検証（model_validator）の日本語メッセージはそのまま添える
+            msg = str(err.get("msg", "")).removeprefix("Value error, ")
+            if msg and not msg.isascii() and msg not in reasons:
+                reasons.append(msg)
         where = "、".join(parts) if parts else "本文"
-        return JSONResponse(
-            {"detail": f"リクエストの内容が正しくありません（{where}）。"}, status_code=422
-        )
+        detail = f"リクエストの内容が正しくありません（{where}）。" + "".join(reasons)
+        return JSONResponse({"detail": detail}, status_code=422)
+
+
+class WebFiles(StaticFiles):
+    """画面（src/stemapp/web）の配信。/api 以下は扱わない。更新がすぐ効くよう毎回確認させる。"""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        if path == "api" or path.startswith("api/"):
+            raise StarletteHTTPException(status_code=404)
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(
@@ -97,6 +118,8 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    for module in (auth, imports, tracks, files, master):
+    for module in (auth, imports, tracks, cues, files, master):
         app.include_router(module.router)
+    # 画面。API のルートより後に登録する（/api/* はここまで来ない）
+    app.mount("/", WebFiles(directory=WEB_DIR, html=True), name="web")
     return app

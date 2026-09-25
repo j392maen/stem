@@ -6,7 +6,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -321,11 +321,19 @@ def separate(
     force: Annotated[bool, typer.Option("--force", help="分割済みでも分割し直す")] = False,
     cpu: Annotated[bool, typer.Option("--cpu", help="GPU を使わず CPU で実行する")] = False,
 ) -> None:
-    """1曲を取り込み、stem に分割して保存する。"""
+    """1曲を取り込み、stem に分割して保存する。配信用データ（Opus・波形）も作る。"""
     import time
 
+    from stemapp import audio
+    from stemapp.delivery import create_delivery_files, missing_delivery, rebuild_delivery_files
     from stemapp.separation.base import DEVICE_CPU, DEVICE_CUDA
     from stemapp.separation.pipeline import SeparationError, load_plan, separate_track
+
+    def postprocess(
+        s: Session, st: Settings, job_id: int, progress: Callable[[float, str], None]
+    ) -> None:
+        # audio.run_ffmpeg は呼ぶときに探す（テストで差し替えられるように）
+        create_delivery_files(s, st, job_id, encoder=audio.run_ffmpeg, progress=progress)
 
     _setup_logging()
     settings = _settings()
@@ -349,7 +357,12 @@ def separate(
                 device=DEVICE_CPU if cpu else DEVICE_CUDA,
                 progress=lambda p, stage: console.print(f"[{p * 100:5.1f}%] {stage}"),
                 started=t0,
+                postprocess=postprocess,
             )
+            if result.skipped and missing_delivery(session, result.job_id):
+                # 分割済みでも配信用データが欠けていれば作る（T04 以前に CLI で分割した曲など）
+                console.print("配信用データ（Opus・波形）を作成しています。")
+                rebuild_delivery_files(session, settings, result.job_id, encoder=audio.run_ffmpeg)
         except SeparationError as e:
             console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e

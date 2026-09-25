@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from stemapp.api.common import SessionDep, iso, job_to_dict, not_found, preset_codes
 from stemapp.config import Settings
+from stemapp.delivery import missing_delivery
 from stemapp.jobs import (
     ACTIVE_STATUSES,
     FINISHED_STATUSES,
@@ -26,6 +27,7 @@ from stemapp.jobs import (
     JobNotFound,
     enqueue_full_job,
     request_cancel,
+    request_postprocess,
 )
 from stemapp.models import (
     InputSource,
@@ -49,32 +51,37 @@ SSE_KEEPALIVE_SEC = 15.0
 # --- 曲 ---------------------------------------------------------------------------
 
 
-def _latest_jobs(session: Session) -> dict[int, SeparationJob]:
-    latest: dict[int, SeparationJob] = {}
+def _jobs_by_track(session: Session) -> dict[int, list[SeparationJob]]:
+    """曲ごとのジョブ（新しい順）。"""
+    out: dict[int, list[SeparationJob]] = {}
     for job in session.scalars(select(SeparationJob).order_by(SeparationJob.job_id.desc())):
-        latest.setdefault(job.track_id, job)
-    return latest
+        out.setdefault(job.track_id, []).append(job)
+    return out
 
 
 def _track_summary(
-    track: Track, latest: SeparationJob | None, presets: dict[int, str]
+    track: Track, jobs: list[SeparationJob], presets: dict[int, str]
 ) -> dict[str, Any]:
+    """jobs はその曲のジョブ（新しい順）。"""
+    playable = next((j for j in jobs if j.job_kind == "full" and j.status == "done"), None)
     return {
         "track_id": track.track_id,
         "title": track.title,
         "artist": track.artist,
         "duration_sec": track.duration_sec,
         "created_at": iso(track.created_at),
-        "latest_job": job_to_dict(latest, presets) if latest is not None else None,
+        "latest_job": job_to_dict(jobs[0], presets) if jobs else None,
+        # 再生に使うジョブ（完了した full ジョブのうち新しいもの）
+        "playable_job_id": playable.job_id if playable is not None else None,
     }
 
 
 @router.get("/tracks")
 def list_tracks(session: SessionDep) -> dict[str, Any]:
     presets = preset_codes(session)
-    latest = _latest_jobs(session)
+    jobs = _jobs_by_track(session)
     tracks = session.scalars(select(Track).order_by(Track.track_id.desc())).all()
-    return {"tracks": [_track_summary(t, latest.get(t.track_id), presets) for t in tracks]}
+    return {"tracks": [_track_summary(t, jobs.get(t.track_id, []), presets) for t in tracks]}
 
 
 @router.get("/tracks/{track_id}")
@@ -93,7 +100,7 @@ def get_track(track_id: int, session: SessionDep) -> dict[str, Any]:
         .where(InputSource.track_id == track_id)
         .order_by(InputSource.source_id)
     ).all()
-    out = _track_summary(track, jobs[0] if jobs else None, presets)
+    out = _track_summary(track, list(jobs), presets)
     out["jobs"] = [job_to_dict(j, presets) for j in jobs]
     out["sources"] = [
         {
@@ -193,6 +200,37 @@ def cancel_job(job_id: int, session: SessionDep) -> dict[str, Any]:
     return job_to_dict(job, preset_codes(session))
 
 
+POSTPROCESS_MESSAGES = {
+    None: "配信用データの作成を登録しました。",
+    "active": "配信用データを作成待ち・作成中です。",
+    "ready": "配信用データはそろっています。",
+}
+
+
+@router.post("/jobs/{job_id}/postprocess")
+def postprocess_job(job_id: int, response: Response, session: SessionDep) -> dict[str, Any]:
+    """配信用データ（stream rendition・peaks）が欠けているとき、ワーカーで作り直す。
+
+    登録したら 202、欠けていない・作成待ちなら 200。done 以外のジョブは 409。
+    """
+    job = _get_job(session, job_id)
+    missing = missing_delivery(session, job_id) if job.status == "done" else []
+    try:
+        res = request_postprocess(session, job_id, missing)
+    except JobNotFound as e:
+        raise not_found("ジョブ") from e
+    except JobConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    response.status_code = 202 if res.created else 200
+    return {
+        "created": res.created,
+        "reason": res.reason,
+        "message": POSTPROCESS_MESSAGES.get(res.reason, ""),
+        "missing": missing,
+        "job": job_to_dict(res.job, preset_codes(session)),
+    }
+
+
 @router.get("/jobs/{job_id}/events")
 def job_events(job_id: int, request: Request) -> StreamingResponse:
     """Server-Sent Events。progress・stage・status が変わるたびに `event: job` を送る。
@@ -271,6 +309,7 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
         stems.append(
             {
                 "stem_id": s.stem_id,
+                "stem_type_id": t.stem_type_id,
                 "code": t.code,
                 "display_name": t.display_name,
                 "color": t.color,
@@ -299,10 +338,15 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
                 ],
             }
         )
+    missing = missing_delivery(session, job_id) if job.status == "done" else []
     return {
         "job_id": job.job_id,
         "track_id": job.track_id,
         "status": job.status,
         "output_gain_db": job.output_gain_db,
+        "postprocess_status": job.postprocess_status,
+        # 配信用データ（stream と全解像度の peaks）がそろっているか
+        "delivery_ready": job.status == "done" and not missing,
+        "delivery_missing": missing,
         "stems": stems,
     }

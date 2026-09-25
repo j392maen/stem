@@ -65,7 +65,8 @@ def _column_ddl(engine: Engine, column: Column[object]) -> str:
 def migrate_db(engine: Engine) -> list[str]:
     """既存のテーブルに無い列を `ALTER TABLE ... ADD COLUMN` で足す（簡易的な移行）。
 
-    列の追加だけを扱う（型の変更・削除はしない）。足した列を「テーブル.列」で返す。
+    列の追加と、無い索引（index）の作成だけを扱う（型の変更・削除はしない）。
+    足した列を「テーブル.列」で返す。
     """
     added: list[str] = []
     insp = inspect(engine)
@@ -82,6 +83,8 @@ def migrate_db(engine: Engine) -> list[str]:
                     f'ALTER TABLE "{table.name}" ADD COLUMN {_column_ddl(engine, column)}'
                 )
                 added.append(f"{table.name}.{column.name}")
+            for index in table.indexes:
+                index.create(conn, checkfirst=True)
     return added
 
 
