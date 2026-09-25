@@ -158,4 +158,22 @@ def test_track_without_beats_keeps_second_grid(
     assert "none" in (page.get_attribute("#tempo", "class") or "")
     assert page.locator("#meter[hidden]").count() == 1
     assert "まだ解析されていません" in (page.get_attribute("#tempo", "title") or "")
+
+    # 「拍を解析」で解析を頼むと、画面を開いたまま小節線と BPM が出る
+    assert page.inner_text("#beats-btn") == "拍を解析"
+    page.click("#beats-btn")
+    _wait_bpm(page, "120.0", timeout_ms=20_000)
+    page.wait_for_function("() => document.querySelector('#wave-zoom').dataset.grid === 'beats'")
+    assert page.inner_text("#beats-btn") == "拍を再解析"
+    assert "none" not in (page.get_attribute("#tempo", "class") or "")
+    _shot(page, "beats_analyzed.png")
+    # 再解析は確認してから（やめると何もしない）
+    page.click("#beats-btn")
+    page.click(".modal button:has-text('やめる')")
+    assert _bpm(page) == "120.0"
+    page.click("#beats-btn")
+    page.click(".modal button:has-text('解析し直す')")
+    page.wait_for_function("() => document.querySelector('#beats-btn').disabled === false"
+                           " && document.querySelector('#bpm-value').textContent === '120.0'",
+                           timeout=20_000)
     assert not page.errors  # type: ignore[attr-defined]
