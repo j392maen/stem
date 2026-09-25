@@ -200,6 +200,15 @@ def recover_interrupted_jobs(session: Session, settings: Settings) -> list[int]:
     for job_id in ids:
         finish_job(session, settings, job_id, FAILED, message=INTERRUPTED_MESSAGE)
         log.warning("中断されたジョブを failed にしました（job %d）。", job_id)
+    pp = session.execute(
+        update(SeparationJob)
+        .where(SeparationJob.postprocess_status == RUNNING)
+        .values(postprocess_status=FAILED)
+    )
+    session.commit()
+    count = int(pp.rowcount or 0)  # type: ignore[attr-defined]
+    if count:
+        log.warning("中断された配信用データの作り直しを failed にしました（%d 件）。", count)
     removed = clean_stale_tmp(session, settings)
     if removed:
         log.info("残っていた一時フォルダを消しました: %s", removed)
@@ -226,3 +235,68 @@ def claim_next_job(session: Session) -> int | None:
         if res.rowcount == 1:  # type: ignore[attr-defined]
             return int(job_id)
         # 取り出す直前にキャンセルされた。次を探す
+
+
+# --- 配信用データの作り直し ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PostprocessRequest:
+    job: SeparationJob
+    # created=False のときの理由: "ready"（欠けていない） / "active"（作り直し待ち・作成中）
+    created: bool
+    reason: str | None = None
+
+
+def request_postprocess(
+    session: Session, job_id: int, missing: list[str]
+) -> PostprocessRequest:
+    """done のジョブの配信用データの作り直しを登録する（ワーカーが処理する。commit まで）。
+
+    missing は欠けている stem（`delivery.missing_delivery` の結果）。空なら登録しない。
+    """
+    job = session.get(SeparationJob, job_id)
+    if job is None:
+        raise JobNotFound(f"ジョブが見つかりません（job {job_id}）。")
+    if job.status != DONE:
+        raise JobConflict(
+            f"分割が終わっていないジョブです（状態: {job.status}）。配信用データは作れません。"
+        )
+    if job.postprocess_status in ACTIVE_STATUSES:
+        return PostprocessRequest(job, False, "active")
+    if not missing:
+        return PostprocessRequest(job, False, "ready")
+    job.postprocess_status = QUEUED
+    session.commit()
+    log.info("配信用データの作り直しを登録しました（job %d, 欠け: %s）。", job_id, missing)
+    return PostprocessRequest(job, True)
+
+
+def claim_next_postprocess(session: Session) -> int | None:
+    """作り直し待ち（postprocess_status=queued）のジョブを running にして job_id を返す。"""
+    while True:
+        job_id = session.scalar(
+            select(SeparationJob.job_id)
+            .where(SeparationJob.postprocess_status == QUEUED, SeparationJob.status == DONE)
+            .order_by(SeparationJob.job_id)
+            .limit(1)
+        )
+        if job_id is None:
+            return None
+        res = session.execute(
+            update(SeparationJob)
+            .where(SeparationJob.job_id == job_id, SeparationJob.postprocess_status == QUEUED)
+            .values(postprocess_status=RUNNING)
+        )
+        session.commit()
+        if res.rowcount == 1:  # type: ignore[attr-defined]
+            return int(job_id)
+
+
+def set_postprocess_status(session: Session, job_id: int, status: str) -> None:
+    session.execute(
+        update(SeparationJob)
+        .where(SeparationJob.job_id == job_id)
+        .values(postprocess_status=status)
+    )
+    session.commit()

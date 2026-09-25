@@ -7,6 +7,8 @@
 - 起動時、running のまま残ったジョブを failed（中断されました）にする。
 - 停止（stop_event、停止ファイル、Ctrl+C）のときは実行中の子プロセスを終了させ、同じ後始末をする。
 - 同じデータフォルダで2つのワーカーが動かないよう、`data/worker.lock` をロックする。
+- 分割待ちのジョブが無いとき、配信用データの作り直し（postprocess_status=queued）を
+  1件ずつ、このプロセスの中で実行する（GPU は使わない。ffmpeg は Job Object に入る）。
 """
 
 from __future__ import annotations
@@ -22,17 +24,21 @@ from typing import IO, Protocol
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from stemapp.audio import FfmpegRunner
 from stemapp.config import Settings
 from stemapp.jobs.queue import (
     CANCELED,
+    DONE,
     FAILED,
     INTERRUPTED_MESSAGE,
     RUNNING,
     STAGE_CANCELED,
     claim_next_job,
+    claim_next_postprocess,
     finish_job,
     is_cancel_requested,
     recover_interrupted_jobs,
+    set_postprocess_status,
 )
 from stemapp.models import SeparationJob
 from stemapp.proc import start_bound_process
@@ -139,6 +145,7 @@ class Worker:
         cancel_check_interval: float = CANCEL_CHECK_INTERVAL_SEC,
         stop_event: threading.Event | None = None,
         stop_file: Path | None = None,
+        postprocess_encoder: FfmpegRunner | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -148,6 +155,7 @@ class Worker:
         self.stop_event = stop_event or threading.Event()
         # このファイルができたら止まる（`stemapp serve` からの停止の合図）
         self.stop_file = stop_file
+        self.postprocess_encoder = postprocess_encoder  # テスト用（None なら ffmpeg）
         self.current_job_id: int | None = None
         self.current_child: ChildHandle | None = None
 
@@ -178,6 +186,27 @@ class Worker:
             finish_job(session, self.settings, job_id, status, message=message, stage=stage)
 
     # --- 1ジョブの実行 ----------------------------------------------------------------
+
+    def run_postprocess_one(self) -> int | None:
+        """配信用データの作り直しを1件実行する。無ければ None。"""
+        from stemapp.delivery import rebuild_delivery_files
+
+        with self.session_factory() as session:
+            job_id = claim_next_postprocess(session)
+            if job_id is None:
+                return None
+            log.info("配信用データを作り直します（job %d）。", job_id)
+            try:
+                rebuild_delivery_files(
+                    session, self.settings, job_id, encoder=self.postprocess_encoder
+                )
+            except Exception:
+                log.exception("配信用データを作れませんでした（job %d）", job_id)
+                set_postprocess_status(session, job_id, FAILED)
+            else:
+                set_postprocess_status(session, job_id, DONE)
+                log.info("配信用データを作り直しました（job %d）。", job_id)
+        return job_id
 
     def run_one(self) -> int | None:
         """queued のジョブを1件実行する（終わるまで戻らない）。無ければ None。"""
@@ -249,6 +278,8 @@ class Worker:
         log.info("ワーカーを開始しました。")
         while not self.should_stop():
             job_id = self.run_one()
+            if job_id is None:
+                job_id = self.run_postprocess_one()
             if job_id is None:
                 self.stop_event.wait(self.poll_interval)
         log.info("ワーカーを停止しました。")

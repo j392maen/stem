@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -168,6 +169,9 @@ class SeparationJob(Base):
     output_gain_db: Mapped[float] = mapped_column(
         Float, default=0.0, server_default=text("0.0")
     )
+    # 配信用データ（stream rendition・peaks）の作り直し（done のジョブのみ）。
+    # NULL=依頼なし / queued / running / done / failed。ワーカーが1件ずつ処理する
+    postprocess_status: Mapped[str | None] = mapped_column(String(10))
 
 
 class Stem(Base):
@@ -235,9 +239,17 @@ class StemGroupMember(Base):
 class ListenPreset(Base):
     __tablename__ = "listen_preset"
 
+    __table_args__ = (
+        Index("ux_listen_preset_seed_code", "seed_code", unique=True),
+    )
+
     listen_preset_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    # 組み込み（seed で作る）の識別子。ユーザーが作ったものは NULL
+    seed_code: Mapped[str | None] = mapped_column(String(50))
+    # 組み込みをユーザーが削除したときは行を残して隠す（次の起動で seed が作り直さないように）
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
 
 
 class ListenPresetItem(Base):

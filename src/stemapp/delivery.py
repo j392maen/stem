@@ -11,11 +11,12 @@ DB へは flush まで（commit は呼び出し側）。
 from __future__ import annotations
 
 import logging
+import shutil
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from stemapp.audio import SAMPLE_RATE, FfmpegRunner, read_audio, run_ffmpeg
@@ -156,3 +157,76 @@ def create_delivery_files(
     if progress is not None:
         progress(1.0, "配信用データを作成中")
     log.info("job %d: 配信用データを作成しました（stem %d 個）。", job_id, len(rows))
+
+
+def missing_delivery(
+    session: Session, job_id: int, levels: Iterable[int] = DEFAULT_LEVELS
+) -> list[str]:
+    """配信用データ（stream rendition・全解像度の peaks）が欠けている stem の code。
+
+    stem が1つも無いジョブも「欠けている」とみなし、["*"] を返す。
+    """
+    rows = session.execute(
+        select(Stem.stem_id, StemType.code)
+        .join(StemType, StemType.stem_type_id == Stem.stem_type_id)
+        .where(Stem.job_id == job_id)
+        .order_by(StemType.display_order)
+    ).all()
+    if not rows:
+        return ["*"]
+    ids = [r.stem_id for r in rows]
+    streams = set(
+        session.scalars(
+            select(StemRendition.stem_id).where(
+                StemRendition.stem_id.in_(ids), StemRendition.purpose == PURPOSE_STREAM
+            )
+        )
+    )
+    waves: dict[int, set[int]] = {}
+    for stem_id, spp in session.execute(
+        select(Waveform.stem_id, Waveform.samples_per_px).where(Waveform.stem_id.in_(ids))
+    ):
+        waves.setdefault(stem_id, set()).add(spp)
+    want = set(levels)
+    return [
+        r.code
+        for r in rows
+        if r.stem_id not in streams or not want <= waves.get(r.stem_id, set())
+    ]
+
+
+def _drop_delivery(session: Session, settings: Settings, job_id: int) -> None:
+    """ジョブの stream rendition・peaks（DB の行とファイル）を消す（commit まで）。"""
+    stem_ids = select(Stem.stem_id).where(Stem.job_id == job_id)
+    session.execute(
+        delete(StemRendition).where(
+            StemRendition.stem_id.in_(stem_ids), StemRendition.purpose == PURPOSE_STREAM
+        )
+    )
+    session.execute(delete(Waveform).where(Waveform.stem_id.in_(stem_ids)))
+    session.commit()
+    out_dir = settings.stems_dir / str(job_id)
+    shutil.rmtree(out_dir / PURPOSE_STREAM, ignore_errors=True)
+    shutil.rmtree(out_dir / "peaks", ignore_errors=True)
+
+
+def rebuild_delivery_files(
+    session: Session,
+    settings: Settings,
+    job_id: int,
+    *,
+    encoder: FfmpegRunner | None = None,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """配信用データを作り直す（既存の stream rendition・peaks を消してから作る。commit まで）。
+
+    失敗したら作りかけ（DB の行とファイル）を消して例外を出す（master には触れない）。
+    """
+    _drop_delivery(session, settings, job_id)
+    try:
+        create_delivery_files(session, settings, job_id, encoder=encoder, progress=progress)
+        session.commit()
+    except BaseException:
+        session.rollback()
+        _drop_delivery(session, settings, job_id)
+        raise
