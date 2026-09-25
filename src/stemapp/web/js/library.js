@@ -13,6 +13,8 @@ const STATUS_LABELS = {
 const FINISHED = new Set(["done", "failed", "canceled"]);
 const IMPORT_POLL_MS = 1000;
 const PRESET_KEY = "stemapp.preset";
+// 聴き比べ用の実験プリセットを品質の選択肢に出すか
+const SHOW_EXP_KEY = "stemapp.showExperimental";
 
 // 取り込み中の一覧は画面を切り替えても残す（ページを読み直すと消える）
 const imports = [];
@@ -26,6 +28,14 @@ function savePresetChoice(code) {
   try { localStorage.setItem(PRESET_KEY, code); } catch { /* 保存できなくても動く */ }
 }
 
+function loadShowExperimental() {
+  try { return localStorage.getItem(SHOW_EXP_KEY) === "1"; } catch { return false; }
+}
+
+function saveShowExperimental(on) {
+  try { localStorage.setItem(SHOW_EXP_KEY, on ? "1" : "0"); } catch { /* 保存できなくても動く */ }
+}
+
 export class LibraryView {
   constructor(root) {
     this.root = root;
@@ -35,6 +45,7 @@ export class LibraryView {
     this.jobs = new Map(); // job_id → 最新のジョブ情報（SSE で更新）
     this.timers = new Set();
     this.alive = true;
+    this.showExperimental = loadShowExperimental();
   }
 
   async mount() {
@@ -67,7 +78,7 @@ export class LibraryView {
     const data = await api("/api/tracks");
     this.tracks = data.tracks;
     for (const t of this.tracks) {
-      if (t.latest_job) this.jobs.set(t.latest_job.job_id, t.latest_job);
+      for (const j of [t.latest_job, t.active_job]) if (j) this.jobs.set(j.job_id, j);
     }
     if (render && this.alive) this.render();
     if (this.alive) this.syncWatchers();
@@ -75,10 +86,16 @@ export class LibraryView {
 
   // --- 進捗（SSE） -------------------------------------------------------------
 
+  /** 行に出すジョブ: 分割待ち・分割中があればそれ（同じ曲に複数の分け方があるとき）、無ければ最新。 */
+  shownJob(t) {
+    const base = t.active_job || t.latest_job;
+    return base ? (this.jobs.get(base.job_id) || base) : null;
+  }
+
   syncWatchers() {
     const active = new Set();
     for (const t of this.tracks) {
-      const job = t.latest_job && this.jobs.get(t.latest_job.job_id);
+      const job = this.shownJob(t);
       if (job && !FINISHED.has(job.status)) active.add(job.job_id);
     }
     for (const [id, es] of this.watchers) {
@@ -216,16 +233,39 @@ export class LibraryView {
 
   // --- 描画 --------------------------------------------------------------------
 
-  render() {
-    if (!this.alive) return;
-    const defaultPreset = loadPresetChoice()
-      || (this.presets.find((p) => p.is_default) || {}).code || "standard";
-    const presetSelect = el("select", {
+  presetSelectEl() {
+    const normal = this.presets.filter((p) => !p.experimental);
+    const exp = this.showExperimental ? this.presets.filter((p) => p.experimental) : [];
+    const saved = loadPresetChoice();
+    const visible = [...normal, ...exp].map((p) => p.code);
+    const chosen = visible.includes(saved) ? saved
+      : (normal.find((p) => p.is_default) || normal[0] || {}).code || "standard";
+    const option = (p) => el("option", { value: p.code, text: p.display_name, selected: p.code === chosen });
+    return el("select", {
       id: "preset-select", class: "select", "aria-label": "品質",
       onchange: (e) => savePresetChoice(e.target.value),
-    }, this.presets.map((p) => el("option", {
-      value: p.code, text: p.display_name, selected: p.code === defaultPreset,
-    })));
+    },
+    normal.map(option),
+    exp.length ? el("optgroup", { label: "実験（聴き比べ用）" }, exp.map(option)) : null);
+  }
+
+  toggleExperimental(on) {
+    this.showExperimental = on;
+    saveShowExperimental(on);
+    const old = this.root.querySelector("#preset-select");
+    if (old) old.replaceWith(this.presetSelectEl());
+  }
+
+  render() {
+    if (!this.alive) return;
+    const presetSelect = this.presetSelectEl();
+    const expToggle = this.presets.some((p) => p.experimental)
+      ? el("label", { class: "exp-toggle", title: "同じ曲を別の分け方で分割して、プレイヤーで聴き比べるための選択肢を出します" },
+        el("input", {
+          type: "checkbox", id: "show-experimental", checked: this.showExperimental,
+          onchange: (e) => this.toggleExperimental(e.target.checked),
+        }), "実験を表示")
+      : null;
 
     const fileInput = el("input", {
       type: "file", accept: "audio/*,video/*,.mp3,.m4a,.flac,.wav,.ogg,.opus,.aac,.webm,.mp4",
@@ -267,7 +307,7 @@ export class LibraryView {
       el("h2", { text: "取り込み・分割" }),
       drop, fileInput, urlForm,
       el("div", { class: "row" },
-        el("label", { class: "muted", for: "preset-select", text: "品質" }), presetSelect,
+        el("label", { class: "muted", for: "preset-select", text: "品質" }), presetSelect, expToggle,
         el("span", { class: "muted", text: "取り込んだら自動で分割します。" })),
       el("div", { class: "jobs-list", id: "imports" }),
     );
@@ -306,7 +346,7 @@ export class LibraryView {
   }
 
   trackRow(t) {
-    const job = t.latest_job ? (this.jobs.get(t.latest_job.job_id) || t.latest_job) : null;
+    const job = this.shownJob(t);
     const status = job ? job.status : null;
     const active = status === "queued" || status === "running";
     const playable = t.playable_job_id !== null && t.playable_job_id !== undefined;
@@ -315,10 +355,13 @@ export class LibraryView {
     let state;
     if (active) {
       const pct = Math.round((job.progress || 0) * 100);
+      const others = (t.active_count || 1) - 1;
       state = el("div", { class: "t-state" },
         el("div", { class: "row" },
           el("span", { class: "badge active", text: STATUS_LABELS[status] }),
-          el("span", { class: "muted", text: `${pct}%` })),
+          el("span", { class: "muted", text: `${pct}%` }),
+          job.preset_experimental ? el("span", { class: "muted", text: `実験: ${job.preset_name || job.preset}` }) : null,
+          others > 0 ? el("span", { class: "muted", text: `（ほか ${others} 件待ち）` }) : null),
         el("div", { class: "progress" }, el("span", { style: { width: `${pct}%` } })),
         el("div", { class: "stage", text: job.stage || "" }));
     } else {
@@ -335,8 +378,15 @@ export class LibraryView {
     const actions = el("div", { class: "t-actions" },
       playable ? el("button", { class: "btn small primary", type: "button", text: "再生", onclick: stop(open) }) : null,
       active ? el("button", { class: "btn small", type: "button", text: "キャンセル", onclick: stop(() => this.cancel(job)) }) : null,
-      !active && status !== "done"
+      !active && !playable
         ? el("button", { class: "btn small", type: "button", text: "分割", onclick: stop(() => this.separate(t)) })
+        : null,
+      !active && playable
+        ? el("button", {
+          class: "btn small", type: "button", text: "別の分け方で分割",
+          title: "上の「品質」で選んだ分け方で、もう一度分割します（今の分け方も残ります。プレイヤーで切り替えて聴き比べられます）",
+          onclick: stop(() => this.separate(t)),
+        })
         : null,
       el("button", {
         class: "btn small danger", type: "button", text: "削除", "aria-label": `${t.title} を削除`,

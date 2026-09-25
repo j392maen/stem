@@ -162,7 +162,7 @@ def test_plan_validation(tmp_path: Path, mix: np.ndarray) -> None:
         "x",
         [
             StepSpec(1, SW, "SW", "mixture", "multistem"),
-            StepSpec(2, KARAOKE_BS_FRAZER, "k", "mixture", "karaoke"),
+            StepSpec(2, KARAOKE_BS_FRAZER, "k", "stems", "karaoke"),
         ],
     )
     with pytest.raises(SeparationError, match="input"):

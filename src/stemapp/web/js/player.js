@@ -13,6 +13,8 @@ const SEEK_STEP_SEC = 5;
 const LOAD_CONCURRENCY = 3;
 const POSTPROCESS_POLL_MS = 1500;
 const VOLUME_KEY = "stemapp.volume";
+// 曲ごとに最後に選んだ分け方（ジョブ）。無い・消えたときは新しい完了済みジョブ
+const JOB_KEY_PREFIX = "stemapp.job.";
 // キューの色。stem・グループの色と重ならないよう、差し色の赤2色と白だけにする
 export const CUE_COLORS = ["#FF3B4E", "#F5F5F4", "#FF8A95"];
 
@@ -21,6 +23,18 @@ function loadVolume() {
     const v = Number(localStorage.getItem(VOLUME_KEY));
     return Number.isFinite(v) && localStorage.getItem(VOLUME_KEY) !== null ? v : 0.9;
   } catch { return 0.9; }
+}
+
+function loadJobChoice(trackId) {
+  try { return Number(localStorage.getItem(JOB_KEY_PREFIX + trackId)) || null; } catch { return null; }
+}
+
+function saveJobChoice(trackId, jobId) {
+  try { localStorage.setItem(JOB_KEY_PREFIX + trackId, String(jobId)); } catch { /* 保存できなくても動く */ }
+}
+
+function formatDb(v) {
+  return v === null || v === undefined ? "-" : v.toFixed(1).replace("-", "−");
 }
 
 /** items を最大 limit 個ずつ並行して処理する。signal が中断されたら新しい項目を始めない。 */
@@ -59,8 +73,15 @@ export class PlayerView {
     // 「全部」にする直前の組み合わせ（0 キーで戻る）
     this.beforeAll = null;
     this.canOpenFolder = false;
+    // 音声と波形を読み込み中（分け方の切り替え・削除はできない）
+    this.loading = false;
+    // 再生する分け方（ジョブ）。切り替えたときは restore に再生位置・選択を持って読み直す
+    this.jobId = null;
+    this.restore = null;
     this.beatGrid = null; // 拍が未解析なら null
     this.beatBusy = false; // 拍の解析を依頼して待っている
+    // 拍の解析を受け持つジョブ（拍は曲ごと。同じ曲に分け方が複数あると、表示中とは限らない）
+    this.beatJobId = null;
     this.tempoKey = "";
     this.onKey = (e) => this.handleKey(e);
   }
@@ -73,15 +94,22 @@ export class PlayerView {
   // --- 読み込み ---------------------------------------------------------------
 
   async mount() {
+    // 読み直し（remount）の後に、前の mount の続きが画面を触らないようにする
+    const signal = this.abort.signal;
+    const live = () => this.alive && !signal.aborted;
     this.root.replaceChildren(el("p", { class: "empty", text: "読み込み中…" }));
     try {
       this.track = await api(`/api/tracks/${this.trackId}`);
     } catch (e) {
-      if (this.alive) this.showMessage(e.status === 404 ? "曲が見つかりません。" : e.message);
+      if (live()) this.showMessage(e.status === 404 ? "曲が見つかりません。" : e.message);
       return;
     }
-    if (!this.alive) return;
-    const jobId = this.track.playable_job_id;
+    if (!live()) return;
+    this.doneJobs = (this.track.jobs || []).filter((j) => j.job_kind === "full" && j.status === "done");
+    const isDone = (id) => this.doneJobs.some((j) => j.job_id === id);
+    const saved = loadJobChoice(this.trackId);
+    const jobId = [this.jobId, saved].find((id) => id && isDone(id)) || this.track.playable_job_id;
+    this.jobId = jobId;
     if (!jobId) {
       this.showMessage("この曲はまだ分割されていません。ライブラリで分割してください。");
       return;
@@ -106,20 +134,29 @@ export class PlayerView {
       this.presets = presets.listen_presets;
       this.cues = cues.cues;
     } catch (e) {
-      if (this.alive) this.showMessage(e.message);
+      if (live()) this.showMessage(e.message);
       return;
     }
-    if (!this.alive) return;
+    if (!live()) return;
     if (!this.job.delivery_ready) {
       this.showDeliveryMissing();
       return;
     }
     this.tree = S.buildTree(this.job.stems);
     this.sel = S.allOn(this.tree);
+    this.loading = true;
     this.render();
     document.addEventListener("keydown", this.onKey);
-    await this.loadMedia();
-    if (!this.alive) return;
+    // 拍の解析を待っている間に分け方を切り替えた（読み直した）ときは、待つのを続ける
+    if (this.beatBusy) this.later(() => this.pollBeats(), POSTPROCESS_POLL_MS);
+    try {
+      await this.loadMedia();
+    } finally {
+      if (live()) {
+        this.loading = false;
+        this.updateJobBar();
+      }
+    }
   }
 
   showMessage(text) {
@@ -139,6 +176,7 @@ export class PlayerView {
     });
     this.root.replaceChildren(el("div", { class: "player-main" },
       this.headEl(),
+      this.jobBarEl(),
       el("div", { class: "notice", id: "delivery-notice" },
         el("strong", { text: "配信用データがありません" }),
         el("span", { class: "muted", text: busy
@@ -202,7 +240,9 @@ export class PlayerView {
     // 1つでも失敗したら残りの取得を中断する（画面を離れたときの中断にも従う）
     const loading = new AbortController();
     const onLeave = () => loading.abort();
-    this.abort.signal.addEventListener("abort", onLeave);
+    const mountSignal = this.abort.signal;
+    const live = () => this.alive && !mountSignal.aborted;
+    mountSignal.addEventListener("abort", onLeave);
     try {
       this.engine = new Engine();
       const signal = loading.signal;
@@ -221,7 +261,7 @@ export class PlayerView {
         loading.abort();
         throw e;
       });
-      if (!this.alive) return;
+      if (!live()) return;
       for (const code of this.tree.order) {
         const item = loaded.find((x) => x.stem.code === code);
         this.engine.addTrack(code, item ? item.buffer : null, 0);
@@ -253,13 +293,157 @@ export class PlayerView {
       cover.hidden = true;
       this.root.querySelector("#play-btn").disabled = false;
       this.frame();
+      await this.applyRestore();
     } catch (e) {
-      if (!this.alive) return;
+      if (!live()) return;
       if (e.name === "AbortError") return;
       label.textContent = `読み込めませんでした: ${e.message}`;
       label.classList.add("error-text");
       cover.querySelector(".progress").hidden = true;
     }
+  }
+
+  // --- 分け方（ジョブ）の切り替え ------------------------------------------------------
+
+  /** 別の分け方に切り替える。再生位置・stem の選択・ループをなるべく保つ。 */
+  switchJob(jobId) {
+    if (!jobId || jobId === this.jobId || this.loading) return;
+    // 前の切り替えがまだ反映されていない（読み込みに失敗した等）なら、その状態を引き継ぐ
+    if (!this.restore) this.restore = this.captureState();
+    saveJobChoice(this.trackId, jobId);
+    this.jobId = jobId;
+    this.remount();
+  }
+
+  /** 再生位置・stem の選択・ループなど、分け方を変えても保ちたい状態。 */
+  captureState() {
+    const engine = this.ready ? this.engine : null;
+    return {
+      position: engine ? engine.position : 0,
+      playing: !!(engine && engine.playing),
+      sel: new Set(this.sel),
+      gainsDb: new Map(this.gainsDb),
+      presetId: this.activePresetId,
+      beforeAll: this.beforeAll,
+      soloMode: this.soloMode,
+      loopCueId: this.loopCueId,
+      loopOn: this.loopOn,
+      zoom: this.wave ? this.wave.zoomSeconds : null,
+    };
+  }
+
+  /** 今の分け方（ジョブ）を消す。ほかに完了した分け方があるときだけ（残った方に切り替える）。 */
+  async deleteCurrentJob() {
+    const job = (this.doneJobs || []).find((j) => j.job_id === this.jobId);
+    if (!job || this.doneJobs.length < 2 || this.loading) return;
+    const ok = await confirmDialog(
+      `分け方「${this.jobLabel(job)}」を削除しますか？ この分け方の stem のファイルも消えます。元に戻せません。`
+        + "（曲とほかの分け方、キューは残ります）",
+      { ok: "削除する", danger: true },
+    );
+    if (!ok || !this.alive) return;
+    try {
+      await api(`/api/jobs/${job.job_id}`, { method: "DELETE" });
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    toast("分け方を削除しました。");
+    if (!this.alive) return;
+    try { localStorage.removeItem(JOB_KEY_PREFIX + this.trackId); } catch { /* 保存できなくても動く */ }
+    if (!this.restore) this.restore = this.captureState();
+    this.jobId = null; // 既定の分け方に戻る
+    this.remount();
+  }
+
+  /** 読み込み中かどうかに合わせて、分け方の切り替え・削除を使えるようにする。 */
+  updateJobBar() {
+    const n = this.doneJobs ? this.doneJobs.length : 0;
+    const select = this.root.querySelector("#job-select");
+    if (select) select.disabled = n < 2 || this.loading;
+    const del = this.root.querySelector("#delete-job-btn");
+    if (del) del.disabled = n < 2 || this.loading;
+  }
+
+  async applyRestore() {
+    const r = this.restore;
+    this.restore = null;
+    if (!r || !this.alive || !this.engine) return;
+    // 新しいジョブに無い stem は外す（全部外れたら全部 ON）
+    const leaves = new Set(this.tree.leaves);
+    const sel = new Set([...r.sel].filter((c) => leaves.has(c)));
+    this.soloMode = r.soloMode;
+    this.beforeAll = r.beforeAll;
+    this.sel = sel.size ? sel : S.allOn(this.tree);
+    this.gainsDb = r.gainsDb;
+    this.activePresetId = sel.size ? r.presetId : null;
+    this.applySelection(0);
+    this.renderPresets();
+    this.loopCueId = r.loopCueId;
+    this.loopOn = r.loopOn && !!this.activeLoop();
+    this.engine.setLoop(this.loopOn ? this.activeLoop() : null);
+    this.renderCues();
+    if (r.zoom && this.wave) this.wave.setZoom(r.zoom);
+    this.engine.seek(clampTime(r.position, this.engine.duration));
+    if (r.playing) await this.engine.play();
+    this.updateTransport();
+  }
+
+  jobLabel(j) {
+    const name = j.preset_name || j.preset || "不明";
+    return `${j.preset_experimental ? "実験: " : ""}${name}（#${j.job_id}）`;
+  }
+
+  /** 分け方の切り替えと、聴き比べ用の数値（stem ごとの RMS、補正前の残差）。 */
+  jobBarEl() {
+    if (!this.doneJobs || !this.doneJobs.length) return null;
+    const current = this.doneJobs.find((j) => j.job_id === this.jobId);
+    const select = el("select", {
+      class: "select", id: "job-select", "aria-label": "分け方",
+      disabled: this.doneJobs.length < 2 || this.loading,
+      onchange: (e) => this.switchJob(Number(e.target.value)),
+    }, this.doneJobs.map((j) => el("option", {
+      value: String(j.job_id), text: this.jobLabel(j), selected: j.job_id === this.jobId,
+    })));
+    const resid = current && current.residual_rms_db !== null && current.residual_rms_db !== undefined
+      ? `補正前の残差 ${formatDb(current.residual_rms_db)} dB（元の曲 ${formatDb(current.mixture_rms_db)} dB）`
+      : "";
+    // 分け方が1つしか無いときは消せない（曲の削除はライブラリで）
+    const del = this.doneJobs.length > 1 && current
+      ? el("button", {
+        class: "btn small danger", id: "delete-job-btn", type: "button", text: "この分け方を削除",
+        title: "今の分け方（ジョブ）と、その stem のファイルを消します。曲とほかの分け方は残ります。",
+        disabled: this.loading, onclick: () => this.deleteCurrentJob(),
+      })
+      : null;
+    return el("div", { class: "job-bar", id: "job-bar" },
+      el("label", { class: "muted", for: "job-select", text: "分け方" }), select, del,
+      el("span", { class: "job-metric", id: "job-metric", text: resid }),
+      this.doneJobs.length > 1 || current ? this.levelsEl() : null);
+  }
+
+  /** 完了したジョブを行、stem を列にした RMS（dBFS）の表（開いたときだけ見える）。 */
+  levelsEl() {
+    const codes = [];
+    for (const j of this.doneJobs) {
+      for (const c of Object.keys(j.stem_rms_db || {})) if (!codes.includes(c)) codes.push(c);
+    }
+    const nameOf = (c) => {
+      const t = (this.stemTypes || []).find((x) => x.code === c);
+      return t ? t.display_name : c;
+    };
+    const table = el("table", { class: "levels" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "分け方" }),
+        ...codes.map((c) => el("th", { text: nameOf(c) })),
+        el("th", { text: "残差" }))),
+      el("tbody", {}, ...this.doneJobs.map((j) => el("tr", { class: j.job_id === this.jobId ? "current" : "" },
+        el("th", { text: this.jobLabel(j) }),
+        ...codes.map((c) => el("td", { text: formatDb((j.stem_rms_db || {})[c]) })),
+        el("td", { text: formatDb(j.residual_rms_db) })))));
+    return el("details", { class: "levels-box" },
+      el("summary", { text: "数値で比較（RMS dB）" }),
+      el("div", { class: "levels-scroll" }, table));
   }
 
   unmount() {
@@ -272,6 +456,7 @@ export class PlayerView {
     if (this.engine) this.engine.close();
     this.engine = null;
     this.ready = false;
+    this.loading = false;
   }
 
   // --- 再生 -------------------------------------------------------------------
@@ -338,6 +523,7 @@ export class PlayerView {
       const res = await api(`/api/tracks/${this.trackId}/beats`, { method: "POST" });
       if (!this.alive) return;
       toast(res.message);
+      this.beatJobId = res.job.job_id;
       this.beatBusy = true;
       this.setBeatGrid(null);
       this.later(() => this.pollBeats(), POSTPROCESS_POLL_MS);
@@ -348,13 +534,17 @@ export class PlayerView {
 
   async pollBeats() {
     try {
-      const job = await api(`/api/jobs/${this.job.job_id}`);
+      const job = await api(`/api/jobs/${this.beatJobId || this.job.job_id}`);
       if (!this.alive) return;
       if (job.postprocess_status === "queued" || job.postprocess_status === "running") {
         this.later(() => this.pollBeats(), POSTPROCESS_POLL_MS);
         return;
       }
-      this.job.beat_warning = job.beat_warning;
+      // 警告はジョブごと。画面には表示中のジョブの警告を出す（成功すれば曲の全ジョブで消える）
+      const cur = job.job_id === this.job.job_id
+        ? job : await api(`/api/jobs/${this.job.job_id}`).catch(() => null);
+      if (!this.alive) return;
+      if (cur) this.job.beat_warning = cur.beat_warning;
       const beats = await api(`/api/tracks/${this.trackId}/beats`).catch(() => null);
       if (!this.alive) return;
       this.beatBusy = false;
@@ -772,7 +962,7 @@ export class PlayerView {
       ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ");
 
     this.root.replaceChildren(el("div", { class: "player" },
-      el("div", { class: "player-main" }, this.headEl(), wave, transport, stems),
+      el("div", { class: "player-main" }, this.headEl(), this.jobBarEl(), wave, transport, stems),
       el("div", { class: "player-side" }, presets, cues, help)));
     this.tempoKey = "";
     this.updateTempo(0);
