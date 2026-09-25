@@ -29,6 +29,7 @@ from stemapp.audio import FfmpegRunner, normalize_audio
 from stemapp.config import Settings
 from stemapp.library import data_relative, find_done_job, resolve_data_path
 from stemapp.models import InputSource, Track
+from stemapp.proc import run_bound
 
 log = logging.getLogger(__name__)
 
@@ -79,18 +80,16 @@ def read_tags_ffprobe(path: Path) -> dict[str, str]:
     if exe is None:
         return {}
     try:
-        proc = subprocess.run(
+        proc = run_bound(
             [
                 exe, "-v", "error",
                 "-show_entries", "format_tags:stream_tags",
                 "-of", "json",
                 str(path),
             ],
-            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as e:

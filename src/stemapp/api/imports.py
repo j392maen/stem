@@ -291,36 +291,39 @@ async def create_import(request: Request) -> JSONResponse:
         length = request.headers.get("content-length")
         if length and length.isdigit() and int(length) > limit:
             raise too_large
-        form = await request.form()
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile) or not upload.filename:
-            raise HTTPException(status_code=400, detail="ファイルが指定されていません（file）。")
-        options: dict[str, Any] = {k: form.get(k) for k in ("separate", "preset", "force")}
-        dest_dir = settings.cache_dir / "uploads" / uuid.uuid4().hex
-        dest = dest_dir / safe_filename(upload.filename)
+        # 受け取ったファイル（一時ファイル）は with を抜けると閉じられる
+        async with request.form() as form:
+            upload = form.get("file")
+            if not isinstance(upload, UploadFile) or not upload.filename:
+                raise HTTPException(
+                    status_code=400, detail="ファイルが指定されていません（file）。"
+                )
+            options: dict[str, Any] = {k: form.get(k) for k in ("separate", "preset", "force")}
+            dest_dir = settings.cache_dir / "uploads" / uuid.uuid4().hex
+            dest = dest_dir / safe_filename(upload.filename)
 
-        def save() -> bool:
-            """保存する。上限を超えたら途中で消して False。"""
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            total = 0
-            with open(dest, "wb") as fh:
-                while chunk := upload.file.read(1024 * 1024):
-                    total += len(chunk)
-                    if total > limit:
-                        break
-                    fh.write(chunk)
-            if total > limit:
-                shutil.rmtree(dest_dir, ignore_errors=True)
-                return False
-            return True
+            def save() -> bool:
+                """保存する。上限を超えたら途中で消して False。"""
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                total = 0
+                with open(dest, "wb") as fh:
+                    while chunk := upload.file.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > limit:
+                            break
+                        fh.write(chunk)
+                if total > limit:
+                    shutil.rmtree(dest_dir, ignore_errors=True)
+                    return False
+                return True
 
-        if not await run_in_threadpool(save):
-            raise too_large
-        task = {
-            "source_type": SOURCE_FILE,
-            "file_path": dest,
-            "original_name": upload.filename.replace("\\", "/").split("/")[-1],
-        }
+            if not await run_in_threadpool(save):
+                raise too_large
+            task = {
+                "source_type": SOURCE_FILE,
+                "file_path": dest,
+                "original_name": upload.filename.replace("\\", "/").split("/")[-1],
+            }
     elif ctype.startswith("application/json"):
         try:
             body = await request.json()
