@@ -18,6 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 gpu = [
     "audio-separator[gpu]>=0.30",
+    # librosa 1.0 で audioread が必須依存から外れたが、audio-separator が import する
+    "audioread>=3.0",
     "torch>=2.7",
     # onnx2torch 経由で入る torchvision も torch と同じ CUDA 版 index から取る
     "torchvision",

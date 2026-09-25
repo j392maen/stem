@@ -58,6 +58,10 @@ uv run stemapp serve
 | `uv run stemapp init-db` | DB 作成と初期データ投入（何度実行しても同じ結果） |
 | `uv run stemapp doctor` | 環境診断。項目ごとに OK / 注意 / NG。NG があると終了コード 1 |
 | `uv run stemapp serve` | Web サーバー起動 |
+| `uv run stemapp separate <ファイル> [--preset fast\|standard\|best] [--force] [--cpu]` | 1曲を stem に分割し `data\stems\<job_id>\` に FLAC で保存、DB に登録。分割済みの曲は `--force` が無ければ分割しない |
+| `uv run stemapp bench <ファイル> [--presets fast,standard]` | プリセットごとの処理時間と GPU メモリ最大使用量を測り、`data\cache\bench\<日時>.json` に保存（DB には登録しない） |
+
+分離モデルは初回に `data\models\` へ自動でダウンロードされる（fast と standard で約 3.5GB）。
 
 ## テスト
 
