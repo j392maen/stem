@@ -24,7 +24,6 @@ from stemapp.jobs.worker import (
     Worker,
     WorkerLock,
     WorkerLockError,
-    stop_on_stdin_eof,
     subprocess_launcher,
 )
 from stemapp.models import SeparationJob, Stem, StemRendition, Waveform
@@ -398,29 +397,22 @@ def test_worker_lock_is_exclusive(tmp_path: Path) -> None:
     b.release()
 
 
-def test_stop_on_stdin_eof() -> None:
-    import io
-
-    ev = threading.Event()
-    t = stop_on_stdin_eof(ev, io.BytesIO(b"abc"))
-    t.join(5)
-    assert ev.is_set()
-
-
-def test_worker_process_stops_when_stdin_closes(
+def test_worker_process_stops_with_stop_file(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`stemapp serve` と同じ方法でワーカーを起動し、標準入力を閉じると止まる。"""
+    """`stemapp serve` と同じ方法でワーカーを起動し、停止ファイルを置くと止まる。"""
     from stemapp import cli
 
     monkeypatch.setenv("STEMAPP_DATA_DIR", str(settings.data_dir))
-    proc = cli._start_worker_process()
+    stop_file = settings.data_dir / "run" / "test.stop"
+    proc = cli._start_worker_process(stop_file)
     try:
         _wait_for(lambda: (settings.data_dir / "worker.lock").exists(), 60)
         time.sleep(1.0)
         assert proc.poll() is None  # 動き続けている
-        cli._stop_worker_process(proc)
+        cli._stop_worker_process(proc, stop_file)
         assert proc.returncode == 0
+        assert not stop_file.exists()
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -557,7 +549,7 @@ def test_killing_worker_stops_child(
     import subprocess
     import sys
 
-    from stemapp.jobs.worker import child_env, new_group_kwargs
+    from stemapp.proc import child_env, new_group_kwargs
 
     job_id = enqueue_full_job(seeded, track_id, "fast").job.job_id
     pid_file = tmp_path / "child.pid"

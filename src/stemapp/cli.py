@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -79,30 +80,35 @@ def doctor() -> None:
 WORKER_STOP_WAIT_SEC = 20.0
 
 
-def _start_worker_process() -> subprocess.Popen[bytes]:
-    """ワーカーを別プロセスで起動する。標準入力を閉じると止まる。"""
-    from stemapp.jobs.worker import child_env, new_group_kwargs
+def worker_stop_file(settings: Settings) -> Path:
+    """serve が起動したワーカーへの停止の合図（このファイルができたら止まる）。"""
+    return settings.data_root / "run" / f"worker-{os.getpid()}.stop"
 
-    return subprocess.Popen(  # noqa: S603
-        [sys.executable, "-m", "stemapp.cli", "worker", "--stop-on-stdin-eof"],
-        stdin=subprocess.PIPE,
-        env=child_env(),
-        **new_group_kwargs(),  # type: ignore[arg-type]
+
+def _start_worker_process(stop_file: Path) -> subprocess.Popen[bytes]:
+    """ワーカーを別プロセスで起動する（このプロセスが終わると OS が一緒に終了させる）。"""
+    from stemapp.proc import start_bound_process
+
+    stop_file.parent.mkdir(parents=True, exist_ok=True)
+    stop_file.unlink(missing_ok=True)
+    return start_bound_process(
+        [sys.executable, "-m", "stemapp.cli", "worker", "--stop-file", str(stop_file)]
     )
 
 
-def _stop_worker_process(proc: subprocess.Popen[bytes]) -> None:
+def _stop_worker_process(proc: subprocess.Popen[bytes], stop_file: Path) -> None:
+    """停止ファイルを置いてワーカーに後始末させ、止まるのを待つ。止まらなければ強制終了。"""
     try:
-        if proc.stdin is not None:
-            proc.stdin.close()
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=WORKER_STOP_WAIT_SEC)
-    except subprocess.TimeoutExpired:
-        typer.echo("ワーカーが止まらないため強制終了します。")
-        proc.kill()
-        proc.wait()
+        stop_file.parent.mkdir(parents=True, exist_ok=True)
+        stop_file.write_text("stop", encoding="utf-8")
+        try:
+            proc.wait(timeout=WORKER_STOP_WAIT_SEC)
+        except subprocess.TimeoutExpired:
+            typer.echo("ワーカーが止まらないため強制終了します。")
+            proc.kill()
+            proc.wait()
+    finally:
+        stop_file.unlink(missing_ok=True)
 
 
 @app.command()
@@ -124,7 +130,8 @@ def serve() -> None:
             seed(session)
     finally:
         engine.dispose()
-    worker_proc = _start_worker_process()
+    stop_file = worker_stop_file(settings)
+    worker_proc = _start_worker_process(stop_file)
     try:
         uvicorn.run(
             create_app(settings),
@@ -133,14 +140,15 @@ def serve() -> None:
             timeout_graceful_shutdown=3,
         )
     finally:
-        _stop_worker_process(worker_proc)
+        _stop_worker_process(worker_proc, stop_file)
 
 
 @app.command()
 def worker(
-    stop_on_stdin_eof: Annotated[
-        bool, typer.Option("--stop-on-stdin-eof", hidden=True, help="標準入力が閉じたら止まる")
-    ] = False,
+    stop_file: Annotated[
+        Path | None,
+        typer.Option("--stop-file", hidden=True, help="このファイルができたら止まる"),
+    ] = None,
 ) -> None:
     """分割ワーカーだけを起動する（queued のジョブを1件ずつ実行する）。Ctrl+C で止まる。"""
     from stemapp.jobs.worker import (
@@ -149,9 +157,10 @@ def worker(
         WorkerLockError,
         subprocess_launcher,
     )
-    from stemapp.jobs.worker import stop_on_stdin_eof as watch_stdin
+    from stemapp.proc import watch_parent
 
     _setup_logging()
+    watch_parent()  # serve から起動されたとき（Linux）: serve がいなくなったら終了する
     settings = _settings()
     lock = WorkerLock(settings.data_root / "worker.lock")
     try:
@@ -161,9 +170,7 @@ def worker(
         raise typer.Exit(1) from e
     try:
         with _db_engine(settings) as factory:
-            w = Worker(settings, factory, subprocess_launcher(settings))
-            if stop_on_stdin_eof:
-                watch_stdin(w.stop_event)
+            w = Worker(settings, factory, subprocess_launcher(settings), stop_file=stop_file)
             try:
                 w.run_forever()
             except KeyboardInterrupt:

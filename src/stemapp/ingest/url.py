@@ -35,6 +35,7 @@ from stemapp.ingest.service import (
     import_file,
 )
 from stemapp.models import InputSource
+from stemapp.proc import run_bound
 
 log = logging.getLogger(__name__)
 
@@ -70,16 +71,13 @@ def _subprocess_env() -> dict[str, str]:
 
 
 def _run_command(cmd: Sequence[str], timeout: float | None) -> YtDlpProcess:
-    proc = subprocess.run(
+    proc = run_bound(
         list(cmd),
-        capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
         timeout=timeout,
         env=_subprocess_env(),
-        stdin=subprocess.DEVNULL,
     )
     return YtDlpProcess(proc.returncode, proc.stdout or "", proc.stderr or "")
 

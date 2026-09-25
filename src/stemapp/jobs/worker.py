@@ -5,7 +5,7 @@
 - 実行中は 0.5 秒ごとに cancel_requested を調べ、立っていれば子プロセスを終了させて
   canceled にし、stems フォルダを消す。
 - 起動時、running のまま残ったジョブを failed（中断されました）にする。
-- 停止（stop_event、Ctrl+C）のときは実行中の子プロセスを終了させ、同じ後始末をする。
+- 停止（stop_event、停止ファイル、Ctrl+C）のときは実行中の子プロセスを終了させ、同じ後始末をする。
 - 同じデータフォルダで2つのワーカーが動かないよう、`data/worker.lock` をロックする。
 """
 
@@ -35,6 +35,7 @@ from stemapp.jobs.queue import (
     recover_interrupted_jobs,
 )
 from stemapp.models import SeparationJob
+from stemapp.proc import start_bound_process
 
 log = logging.getLogger(__name__)
 
@@ -56,35 +57,20 @@ class ChildHandle(Protocol):
 ChildLauncher = Callable[[int], ChildHandle]
 
 
-def child_env() -> dict[str, str]:
-    env = dict(os.environ)
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    return env
-
-
-def new_group_kwargs() -> dict[str, object]:
-    """コンソールの Ctrl+C が子に届かないようにする（後始末は親が行う）。"""
-    if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}
-
-
 def subprocess_launcher(settings: Settings, extra_args: Sequence[str] = ()) -> ChildLauncher:
-    """`python -m stemapp.jobs.child <job_id>` を起動する launcher。"""
+    """`python -m stemapp.jobs.child <job_id>` を起動する launcher。
+
+    子はこのプロセスの Job Object に入る（Windows）。ワーカーが強制終了されても、
+    OS が子（と子が起動した ffmpeg）を終了させる。Linux では子が親の終了を見張る。
+    """
 
     def launch(job_id: int) -> ChildHandle:
         cmd = [
             sys.executable, "-m", "stemapp.jobs.child", str(job_id),
             "--data-dir", str(settings.data_dir),
-            "--stop-on-stdin-eof",
             *extra_args,
         ]
-        # 標準入力はパイプにして、書き込み側をこのプロセスが持ち続ける。ワーカーが
-        # （強制終了も含めて）終わるとパイプが閉じ、子は EOF を受けて自分で終了する。
-        proc = subprocess.Popen(  # noqa: S603
-            cmd, env=child_env(), stdin=subprocess.PIPE, **new_group_kwargs()  # type: ignore[call-overload]
-        )
+        proc = start_bound_process(cmd)
         log.info("子プロセスを起動しました（job %d, pid %d）。", job_id, proc.pid)
         return proc
 
@@ -152,6 +138,7 @@ class Worker:
         poll_interval: float = POLL_INTERVAL_SEC,
         cancel_check_interval: float = CANCEL_CHECK_INTERVAL_SEC,
         stop_event: threading.Event | None = None,
+        stop_file: Path | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -159,6 +146,8 @@ class Worker:
         self.poll_interval = poll_interval
         self.cancel_check_interval = cancel_check_interval
         self.stop_event = stop_event or threading.Event()
+        # このファイルができたら止まる（`stemapp serve` からの停止の合図）
+        self.stop_file = stop_file
         self.current_job_id: int | None = None
         self.current_child: ChildHandle | None = None
 
@@ -171,6 +160,11 @@ class Worker:
     def stop(self) -> None:
         self.stop_event.set()
 
+    def should_stop(self) -> bool:
+        if self.stop_file is not None and self.stop_file.exists():
+            self.stop_event.set()
+        return self.stop_event.is_set()
+
     def _kill_child(self, child: ChildHandle) -> None:
         if child.poll() is None:
             child.kill()
@@ -178,15 +172,6 @@ class Worker:
             child.wait(timeout=KILL_WAIT_SEC)
         except subprocess.TimeoutExpired:
             log.error("子プロセスが終了しません。")
-
-    @staticmethod
-    def _close_stdin(child: ChildHandle) -> None:
-        stdin = getattr(child, "stdin", None)
-        if stdin is not None:
-            try:
-                stdin.close()
-            except OSError:
-                pass
 
     def _finish(self, job_id: int, status: str, message: str | None, stage: str | None) -> None:
         with self.session_factory() as session:
@@ -216,7 +201,6 @@ class Worker:
             self._finish(job_id, FAILED, INTERRUPTED_MESSAGE, None)
             raise
         finally:
-            self._close_stdin(child)
             self.current_job_id, self.current_child = None, None
         return job_id
 
@@ -226,7 +210,7 @@ class Worker:
             if rc is not None:
                 self._after_exit(job_id, rc)
                 return
-            if self.stop_event.is_set():
+            if self.should_stop():
                 log.warning("停止の指示で job %d を中断します。", job_id)
                 self._kill_child(child)
                 self._finish(job_id, FAILED, INTERRUPTED_MESSAGE, None)
@@ -263,25 +247,8 @@ class Worker:
         if recovered:
             log.warning("中断されたジョブを片付けました: %s", recovered)
         log.info("ワーカーを開始しました。")
-        while not self.stop_event.is_set():
+        while not self.should_stop():
             job_id = self.run_one()
             if job_id is None:
                 self.stop_event.wait(self.poll_interval)
         log.info("ワーカーを停止しました。")
-
-
-def stop_on_stdin_eof(event: threading.Event, stream: IO[bytes] | None = None) -> threading.Thread:
-    """標準入力が閉じられたら event を立てるスレッド（`stemapp serve` からの停止の合図）。"""
-    src = stream if stream is not None else sys.stdin.buffer
-
-    def reader() -> None:
-        try:
-            while src.read(4096):
-                pass
-        except (OSError, ValueError):
-            pass
-        event.set()
-
-    t = threading.Thread(target=reader, name="stdin-eof", daemon=True)
-    t.start()
-    return t
