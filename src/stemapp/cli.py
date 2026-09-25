@@ -363,7 +363,9 @@ def separate(
                 preset_code=preset,
                 force=force,
                 device=DEVICE_CPU if cpu else DEVICE_CUDA,
-                progress=lambda p, stage: console.print(f"[{p * 100:5.1f}%] {stage}"),
+                progress=lambda p, stage: console.print(
+                        f"[{p * 100:5.1f}%] {stage}", markup=False
+                    ),
                 started=t0,
                 postprocess=postprocess,
             )
@@ -519,6 +521,107 @@ def beats(
                 f"装置: {outcome.result.device}　解析: {outcome.result.seconds:.1f} 秒"
                 f"（読み込み等を含む全体 {outcome.seconds:.1f} 秒）"
             )
+
+
+# --- 書き出し ------------------------------------------------------------------------
+
+
+def _free_path(path: Path) -> Path:
+    """同じ名前のファイルがあれば「名前 (2).拡張子」のように空いている名前にする。"""
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        cand = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+@app.command("export")
+def export_cmd(
+    job_id: Annotated[int, typer.Argument(help="ジョブの番号（job_id）")],
+    export_type: Annotated[
+        str, typer.Option("--type", help="single（stem 1つ）/ all（全部を ZIP）/ mix（ミックス）")
+    ],
+    fmt: Annotated[str, typer.Option("--format", help="wav / flac / mp3")] = "wav",
+    stems: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--stem",
+            help="stem の code。single は1つ、mix は複数指定できる（--preset を使わないとき）",
+        ),
+    ] = None,
+    preset: Annotated[
+        str | None, typer.Option("--preset", help="mix に使う組み合わせプリセットの名前")
+    ] = None,
+    parents_only: Annotated[
+        bool, typer.Option("--parents-only", help="all: 子に分かれていても親の stem だけにする")
+    ] = False,
+    output: Annotated[
+        Path, typer.Option("-o", "--output", help="出力先フォルダ（無ければ作る）")
+    ] = Path("."),
+) -> None:
+    """分割した stem を書き出す（出力先はデータフォルダではなく -o のフォルダ）。"""
+    import tempfile
+
+    from stemapp.exports import ExportError, ExportRequest, plan_export
+    from stemapp.exports.service import render_plan
+    from stemapp.models import ListenPreset
+
+    _setup_logging()
+    settings = _settings()
+    console = Console()
+    codes = list(stems or [])
+    with _db_session(settings) as session:
+        preset_id: int | None = None
+        if preset is not None:
+            if export_type != "mix":
+                console.print("[bold red]--preset は --type mix のときだけ使えます。[/bold red]")
+                raise typer.Exit(1)
+            found = session.scalars(
+                select(ListenPreset).where(
+                    ListenPreset.name == preset, ListenPreset.hidden.is_(False)
+                )
+            ).first()
+            if found is None:
+                console.print(f"[bold red]組み合わせ「{preset}」が見つかりません。[/bold red]")
+                raise typer.Exit(1)
+            preset_id = found.listen_preset_id
+        if export_type == "single" and len(codes) != 1:
+            console.print("[bold red]single では --stem を1つ指定してください。[/bold red]")
+            raise typer.Exit(1)
+        req = ExportRequest(
+            export_type=export_type,
+            format=fmt,
+            stem_code=codes[0] if export_type == "single" else None,
+            parents_only=parents_only,
+            listen_preset_id=preset_id,
+            stems=[(c, 0.0) for c in codes] if export_type == "mix" else (),
+        )
+        try:
+            plan = plan_export(session, job_id, req)
+            # EXPORT の行は作らない（data/exports の書き出しとは別。片付けの対象にしない）
+            output.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=output, prefix=".stemapp-export-") as tmp:
+                result = render_plan(
+                    session, settings, plan, Path(tmp),
+                    progress=lambda p, stage: console.print(
+                        f"[{p * 100:5.1f}%] {stage}", markup=False
+                    ),
+                )
+                dst = _free_path(output / result.path.name)
+                result.path.replace(dst)
+        except ExportError as e:
+            console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
+            raise typer.Exit(1) from e
+        except Exception as e:
+            console.print(f"[bold red]書き出しに失敗しました: {e}[/bold red]", soft_wrap=True)
+            raise typer.Exit(1) from e
+    console.print(f"書き出しました: {dst}", markup=False, soft_wrap=True)
+    console.print(f"大きさ: {result.bytes / 1024 / 1024:.1f} MB")
+    if result.mix_gain_db:
+        console.print(f"音割れしないよう、全体を {result.mix_gain_db:.1f} dB 下げました。")
 
 
 def main() -> None:
