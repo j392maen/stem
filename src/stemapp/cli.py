@@ -162,12 +162,14 @@ def _import_target(
             return fetch_url(session, settings, target, make_ytdlp_runner(settings))
         return import_file(session, settings, Path(target))
     except UrlImportError as e:
-        console.print(f"[bold red]{e.message}[/bold red]（理由コード: {e.code}）")
+        console.print(
+            f"[bold red]{e.message}[/bold red]（理由コード: {e.code}）", soft_wrap=True
+        )
         if e.detail:
-            console.print(f"詳細:\n{e.detail}", markup=False)
+            console.print(f"詳細:\n{e.detail}", markup=False, soft_wrap=True)
         raise typer.Exit(1) from e
     except Exception as e:  # 正規化の失敗など
-        console.print(f"[bold red]取り込みに失敗しました: {e}[/bold red]")
+        console.print(f"[bold red]取り込みに失敗しました: {e}[/bold red]", soft_wrap=True)
         raise typer.Exit(1) from e
 
 
@@ -220,7 +222,7 @@ def separate(
         try:
             load_plan(session, preset)  # プリセットの誤りは取り込む前に知らせる
         except SeparationError as e:
-            console.print(f"[bold red]{e}[/bold red]")
+            console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         imported = _import_target(session, settings, target, console)
         try:
@@ -236,10 +238,10 @@ def separate(
                 started=t0,
             )
         except SeparationError as e:
-            console.print(f"[bold red]{e}[/bold red]")
+            console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         except Exception as e:
-            console.print(f"[bold red]失敗しました: {e}[/bold red]")
+            console.print(f"[bold red]失敗しました: {e}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         if result.skipped:
             console.print(
@@ -323,7 +325,7 @@ def bench(
                 device=DEVICE_CPU if cpu else DEVICE_CUDA,
             )
         except Exception as e:
-            console.print(f"[bold red]失敗しました: {e}[/bold red]")
+            console.print(f"[bold red]失敗しました: {e}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
     render_bench(report, console)
     path = save_report(settings, report)

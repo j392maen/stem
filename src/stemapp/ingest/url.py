@@ -242,6 +242,13 @@ ERROR_RULES: list[ErrorRule] = [
         r"HTTP Error 403",
         "ERROR: unable to download video data: HTTP Error 403: Forbidden",
     ),
+    # 国の指定が無い「見られない」（地域制限の規則より後に調べる。
+    # "Requested format is not available" は形式の問題なので除く）
+    ErrorRule(
+        PRIVATE_OR_REMOVED,
+        r"(?<!format )is not available|isn't available",
+        "ERROR: [youtube] abc: This video is not available",
+    ),
     # 通信
     ErrorRule(
         NETWORK,
@@ -354,8 +361,9 @@ def _str_or_none(v: object) -> str | None:
 
 
 def _record_failure(
-    session: Session, url: str, code: str, detail: str
+    session: Session, url: str, code: str, detail: str, attempted_at: datetime
 ) -> int | None:
+    """失敗した取得を INPUT_SOURCE に残す。fetched_at には取得を試みた時刻を入れる。"""
     session.rollback()
     src = InputSource(
         track_id=None,
@@ -365,6 +373,7 @@ def _record_failure(
         fetch_status=FETCH_FAILED,
         error_code=code,
         error_detail=detail or None,
+        fetched_at=attempted_at,
     )
     session.add(src)
     session.commit()
@@ -383,6 +392,7 @@ def fetch_url(
     timeout: float | None = DOWNLOAD_TIMEOUT_SEC,
 ) -> ImportResult:
     """URL の音声を取得して取り込む。失敗したら INPUT_SOURCE（failed）を残して UrlImportError。"""
+    attempted_at = datetime.now(UTC)
     out_dir = settings.cache_dir / "downloads" / uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -390,23 +400,23 @@ def fetch_url(
             proc = runner.run(download_args(url, out_dir), timeout=timeout)
         except subprocess.TimeoutExpired as e:
             detail = f"yt-dlp が {e.timeout:.0f} 秒で終わりませんでした。"
-            sid = _record_failure(session, url, NETWORK, detail)
+            sid = _record_failure(session, url, NETWORK, detail, attempted_at)
             raise UrlImportError(NETWORK, detail, sid) from e
         except OSError as e:
             detail = f"yt-dlp を起動できませんでした: {e}"
-            sid = _record_failure(session, url, UNKNOWN, detail)
+            sid = _record_failure(session, url, UNKNOWN, detail, attempted_at)
             raise UrlImportError(UNKNOWN, detail, sid) from e
 
         if proc.returncode != 0:
             code = classify_error(proc.stderr, proc.returncode)
             detail = error_detail(proc.stderr) or f"終了コード {proc.returncode}"
-            sid = _record_failure(session, url, code, detail)
+            sid = _record_failure(session, url, code, detail, attempted_at)
             raise UrlImportError(code, detail, sid)
 
         audio_file = find_downloaded_file(out_dir)
         if audio_file is None:
             detail = error_detail(proc.stderr) or "ダウンロードしたファイルが見つかりません。"
-            sid = _record_failure(session, url, UNKNOWN, detail)
+            sid = _record_failure(session, url, UNKNOWN, detail, attempted_at)
             raise UrlImportError(UNKNOWN, detail, sid)
 
         info = parse_info_json(proc.stdout)
@@ -432,7 +442,9 @@ def fetch_url(
             )
         except Exception as e:
             detail = f"取得した音声を取り込めませんでした: {type(e).__name__}: {e}"
-            sid = _record_failure(session, url, UNKNOWN, detail[-ERROR_DETAIL_MAX_CHARS:])
+            sid = _record_failure(
+                session, url, UNKNOWN, detail[-ERROR_DETAIL_MAX_CHARS:], attempted_at
+            )
             raise UrlImportError(UNKNOWN, detail, sid) from e
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)

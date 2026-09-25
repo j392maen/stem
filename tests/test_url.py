@@ -154,6 +154,7 @@ def test_fetch_failure_records_source(session: Session, settings: Settings) -> N
     assert (source.source_type, source.url, source.fetch_status) == ("url", URL, "failed")
     assert source.error_code == "private_or_removed"
     assert source.error_detail is not None and "Video unavailable" in source.error_detail
+    assert source.fetched_at is not None  # 失敗時は取得を試みた時刻
     assert not runner.out_dirs[0].exists()
 
 
@@ -271,6 +272,8 @@ REAL_MESSAGES: list[tuple[str, str]] = [
         "private_or_removed",
     ),
     ("ERROR: [youtube] xxxxxxxxxxx: Video unavailable", "private_or_removed"),
+    ("ERROR: [youtube] abc: This video is not available", "private_or_removed"),
+    ("ERROR: [Vimeo] 123: This content is not available", "private_or_removed"),
     # 2026-09 に存在しない ID で実際に出たメッセージ（yt-dlp 2026.08.19）
     ("ERROR: [youtube] xxxxxxxxxxx: This video is unavailable", "private_or_removed"),
     (
@@ -319,6 +322,11 @@ def test_every_code_has_message_and_example() -> None:
     assert set(ERROR_MESSAGES) == codes | {"unknown"}
     for rule in ERROR_RULES:
         assert classify_error(rule.example, 1) == rule.code, rule.example
+
+
+def test_requested_format_is_not_private() -> None:
+    stderr = "ERROR: [youtube] abc: Requested format is not available. Use --list-formats"
+    assert classify_error(stderr, 1) != "private_or_removed"
 
 
 def test_classify_unknown() -> None:

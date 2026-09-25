@@ -124,3 +124,14 @@ def test_ytdlp_update_command(
     res = runner.invoke(cli.app, ["ytdlp-update"])
     assert res.exit_code == code, res.output
     assert label in res.output and "detail" in res.output
+
+
+def test_error_message_is_not_wrapped(cli_env: None, ytdlp: FakeYtDlp) -> None:
+    from stemapp.ingest.url import ERROR_MESSAGES
+
+    ytdlp.returncode = 1
+    ytdlp.stderr = "ERROR: [youtube] xxxxxxxxxxx: Video unavailable\n"
+    res = runner.invoke(cli.app, ["import", URL], terminal_width=40)
+    assert res.exit_code == 1
+    line = f"{ERROR_MESSAGES['private_or_removed']}（理由コード: private_or_removed）"
+    assert line in res.output.splitlines()
