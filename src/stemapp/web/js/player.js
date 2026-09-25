@@ -1,6 +1,8 @@
-// プレイヤー画面: 波形、再生・シーク、stem の ON/OFF、グループ、組み合わせプリセット、キュー・ループ。
+// プレイヤー画面: 波形、再生・シーク、stem の ON/OFF、グループ、組み合わせプリセット、キュー・ループ、
+// 拍・小節線と再生位置の BPM。
 
 import { api, fetchBinary } from "./api.js";
+import { BeatGrid, formatBpm } from "./beats.js";
 import { Engine, clampTime } from "./engine.js";
 import { parsePeaks } from "./peaks.js";
 import * as S from "./selection.js";
@@ -57,6 +59,8 @@ export class PlayerView {
     // 「全部」にする直前の組み合わせ（0 キーで戻る）
     this.beforeAll = null;
     this.canOpenFolder = false;
+    this.beatGrid = null; // 拍が未解析なら null
+    this.tempoKey = "";
     this.onKey = (e) => this.handleKey(e);
   }
 
@@ -82,14 +86,18 @@ export class PlayerView {
       return;
     }
     try {
-      const [stems, types, groups, presets, cues, me] = await Promise.all([
+      const [stems, types, groups, presets, cues, me, beats] = await Promise.all([
         api(`/api/jobs/${jobId}/stems`),
         api("/api/stem-types"),
         api("/api/stem-groups"),
         api("/api/listen-presets"),
         api(`/api/tracks/${this.trackId}/cues`),
         api("/api/me").catch(() => ({})),
+        // 拍がまだ無い曲は 404（1秒目盛りのまま再生できる）
+        api(`/api/tracks/${this.trackId}/beats`).catch(() => null),
       ]);
+      this.beatGrid = beats ? new BeatGrid(beats) : null;
+      if (this.beatGrid && this.beatGrid.empty) this.beatGrid = null;
       this.canOpenFolder = !!me.can_open_folder;
       this.job = stems;
       this.stemTypes = types.stem_types;
@@ -237,6 +245,7 @@ export class PlayerView {
           loop: this.loopOn ? this.activeLoop() : null,
         }),
         onSeek: (t) => this.seek(t),
+        beatGrid: this.beatGrid,
       });
       this.applySelection(0);
       this.ready = true;
@@ -270,9 +279,33 @@ export class PlayerView {
     if (!this.alive || !this.engine) return;
     this.engine.tick();
     this.wave.draw();
+    const pos = this.wave.preview ?? this.engine.position;
     const t = this.root.querySelector("#time-now");
-    if (t) t.textContent = formatTime(this.wave.preview ?? this.engine.position, true);
+    if (t) t.textContent = formatTime(pos, true);
+    this.updateTempo(pos);
     this.raf = requestAnimationFrame(() => this.frame());
+  }
+
+  /** 再生位置の区間の BPM と拍子を表示する（変わったときだけ書き換える）。 */
+  updateTempo(pos) {
+    const grid = this.beatGrid;
+    const bpm = grid ? grid.bpmAt(pos) : null;
+    const key = `${formatBpm(bpm)}|${grid ? grid.timeSignature : ""}`;
+    if (key === this.tempoKey) return;
+    this.tempoKey = key;
+    const v = this.root.querySelector("#bpm-value");
+    const m = this.root.querySelector("#meter");
+    if (v) v.textContent = formatBpm(bpm);
+    if (m) {
+      m.textContent = grid ? `${grid.timeSignature}/4` : "";
+      m.hidden = !grid;
+    }
+  }
+
+  tempoTitle() {
+    if (this.beatGrid) return `再生位置の BPM と拍子（自動解析: ${this.beatGrid.analyzer}）`;
+    if (this.job.beat_warning) return this.job.beat_warning;
+    return "拍はまだ解析されていません";
   }
 
   async togglePlay() {
@@ -635,6 +668,10 @@ export class PlayerView {
       el("div", { class: "time" },
         el("span", { id: "time-now", text: formatTime(0, true) }),
         el("span", { class: "muted", text: ` / ${formatTime(duration, true)}` })),
+      el("div", { class: `tempo${this.beatGrid ? "" : " none"}`, id: "tempo", title: this.tempoTitle() },
+        el("span", { class: "bpm", id: "bpm-value", text: "—" }),
+        el("span", { class: "unit", text: "BPM" }),
+        el("span", { class: "meter", id: "meter", hidden: true })),
       el("button", { class: "btn", type: "button", text: `−${SEEK_STEP_SEC}秒`, onclick: () => this.ready && this.seek(this.engine.position - SEEK_STEP_SEC) }),
       el("button", { class: "btn", type: "button", text: `+${SEEK_STEP_SEC}秒`, onclick: () => this.ready && this.seek(this.engine.position + SEEK_STEP_SEC) }),
       el("button", { class: "btn", id: "loop-btn", type: "button", text: "ループ", "aria-pressed": "false", onclick: () => this.toggleLoop() }),
@@ -670,6 +707,8 @@ export class PlayerView {
     this.root.replaceChildren(el("div", { class: "player" },
       el("div", { class: "player-main" }, this.headEl(), wave, transport, stems),
       el("div", { class: "player-side" }, presets, cues, help)));
+    this.tempoKey = "";
+    this.updateTempo(0);
     this.updateTransport();
     this.renderStems();
     this.renderGroups();
