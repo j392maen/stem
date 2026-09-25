@@ -45,6 +45,7 @@
 - best: SW + ボーカル専用2種の平均 → karaoke 2種の平均、TTA
 - 仕上げ: backing = vocals − lead（残差）。最後に mixture − Σstems を other に足し戻し、全 stem の合計が元の曲に一致するようにする。
 - VRAM 8GB: モデルは1つずつロード→解放。fp16。OOM 時はチャンクを縮めて再試行、最後は CPU。
+- 聴き比べ用の実験プリセット（exp_*、T12）: 残差の行き先（other / vocals / split）と karaoke の入力（vocals / mixture）、karaoke モデルの組み合わせを変えたもの。同じ曲にプリセットごとのジョブを持ち、プレイヤーで切り替えられる。既定は standard のまま。
 
 audio-separator のモデル名（確認済み）:
 - `BS-Roformer-SW.ckpt`（6stem: vocals, drums, bass, guitar, piano, other）
