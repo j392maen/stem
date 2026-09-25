@@ -236,6 +236,26 @@ def test_full_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:
     page.click(".track-row .btn:has-text('再生')")
     page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
     assert page.locator(".stem-btn").count() == 8
+    # 再生ボタン: ▶ のアイコンが見え、赤の塗りつぶしではない
+    play = page.locator("#play-btn")
+    assert play.is_visible()
+    assert play.get_attribute("aria-label") == "再生"
+    assert play.locator("svg path").count() == 1
+    style = page.evaluate(
+        """() => { const s = getComputedStyle(document.querySelector("#play-btn"));
+            return [s.backgroundColor, s.backgroundImage, s.borderRadius]; }"""
+    )
+    assert "255, 59, 78" not in style[0] + style[1], style
+    assert style[2] != "50%", style
+
+    # 保存フォルダを開く（同じ PC からなので出る。エクスプローラーは開かず、呼ばれたことを確かめる）
+    folder_btn = page.locator("#open-folder-btn")
+    assert folder_btn.is_visible()
+    assert "FLAC（24bit）" in (folder_btn.get_attribute("title") or "")
+    folder_btn.click()
+    page.wait_for_selector("#toast:has-text('保存フォルダを開きました')")
+    assert len(server.opened_folders) == 1
+    assert (server.opened_folders[0] / "drums.flac").is_file()
 
     # 再生が始まる（AudioContext の時刻と再生位置が進む）
     # 二重の play()（resume を待つ間の2回目）でも、音源は stem ごとに1つだけ
@@ -293,6 +313,24 @@ def test_full_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:
     # 全部
     page.click("#all-btn")
     _wait_gains(page, dict.fromkeys(LEAVES, 1.0))
+    # 0 キー: 全部 ⇔ 直前の組み合わせ（ベースだけ）を行き来する
+    page.keyboard.press("0")
+    _wait_gains(page, {**dict.fromkeys(LEAVES, 0.0), "bass": 1.0})
+    page.keyboard.press("0")
+    _wait_gains(page, dict.fromkeys(LEAVES, 1.0))
+    assert "on" in (page.get_attribute("#all-btn", "class") or "")
+    page.keyboard.press("0")
+    _wait_gains(page, {**dict.fromkeys(LEAVES, 0.0), "bass": 1.0})
+    # 組み合わせを変えてから 0 → 全部 → 0 で、変えた後のものに戻る
+    page.click(".stem-btn[data-code='drums']")
+    _wait_gains(page, {"drums": 1.0, "bass": 1.0, "guitar": 0.0})
+    page.keyboard.press("0")
+    _wait_gains(page, dict.fromkeys(LEAVES, 1.0))
+    page.keyboard.press("0")
+    _wait_gains(page, {**dict.fromkeys(LEAVES, 0.0), "drums": 1.0, "bass": 1.0})
+    page.keyboard.press("0")
+    _wait_gains(page, dict.fromkeys(LEAVES, 1.0))
+    assert page.locator(".keys-help kbd", has_text="0").count() == 1
 
     # 組み合わせプリセット: ベースだけを保存 → 全部に戻す → 選ぶと切り替わる
     page.click(".stem-btn[data-code='bass']", modifiers=["Shift"])
@@ -460,3 +498,21 @@ def test_load_failure_aborts_rest(page: Any, server: LiveServer, tmp_path: Path)
     # 並行して取得していた分（最大 3）を除き、残りの stem は取りに行かない
     assert len(requested) <= 3, requested
     assert page.locator("#play-btn[disabled]").count() == 1
+
+
+def test_open_folder_hidden_for_remote(page: Any, server: LiveServer, tmp_path: Path) -> None:
+    """同じ PC 以外（/api/me が can_open_folder=false）では「保存フォルダを開く」を出さない。"""
+    track_id, _job_id = _done_track(server, tmp_path)
+
+    def remote_me(route: Any) -> None:
+        route.fulfill(
+            json={"authenticated": True, "passcode_required": False,
+                  "local_client": False, "can_open_folder": False}
+        )
+
+    page.route("**/api/me", remote_me)
+    page.goto(f"{server.base_url}/#/track/{track_id}")
+    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+    assert page.locator("#open-folder-btn").count() == 0
+    assert page.locator("#play-btn svg").count() == 1
+    assert not page.errors  # type: ignore[attr-defined]

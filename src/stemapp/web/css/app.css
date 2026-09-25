@@ -184,6 +184,8 @@ select:focus-visible, .play-btn:focus-visible {
   margin: 0; font-size: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .track-head .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-box { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
+.folder-note { font-size: 11px; color: var(--faint); white-space: nowrap; }
 
 .wave-wrap { position: relative; padding: 0; overflow: hidden; }
 .wave-overview, .wave-zoom { display: block; width: 100%; touch-action: none; cursor: pointer; }
@@ -202,13 +204,21 @@ select:focus-visible, .play-btn:focus-visible {
 .loading-cover .progress { width: min(320px, 80%); }
 
 .transport { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* 再生ボタン: 録音ボタンに見えないよう、暗い地の角丸四角に明るい枠と白い ▶ / ❚❚。
+   再生中は枠とアイコンが差し色の赤になる（赤の塗りつぶしの丸にはしない）。 */
 .play-btn {
-  width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
-  background: var(--accent); color: #fff; display: grid; place-items: center;
-  box-shadow: 0 0 0 4px var(--accent-soft), 0 0 18px rgba(255, 59, 78, 0.35);
+  width: 60px; height: 52px; border-radius: 10px; cursor: pointer;
+  border: 2px solid #d9d9e0; background: linear-gradient(#24242c, #17171c);
+  color: #fff; display: grid; place-items: center;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
-.play-btn:disabled { background: #3a3a46; box-shadow: none; cursor: default; }
-.play-btn svg { width: 24px; height: 24px; fill: currentColor; }
+.play-btn:hover:not(:disabled) { background: linear-gradient(#2c2c35, #1c1c22); }
+.play-btn.playing {
+  border-color: var(--accent); color: var(--accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 12px rgba(255, 59, 78, 0.28);
+}
+.play-btn:disabled { border-color: var(--line); color: var(--faint); background: #17171c; cursor: default; }
+.play-btn svg { width: 26px; height: 26px; fill: currentColor; }
 .time {
   font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; letter-spacing: 0.02em;
 }
@@ -302,6 +312,8 @@ select:focus-visible, .play-btn:focus-visible {
   .track-row .t-len { display: none; }
   .track-row .t-state { grid-column: 1 / -1; grid-row: 2; }
   .track-row .t-actions { grid-column: 2; grid-row: 1; }
+  .track-head { flex-wrap: wrap; }
+  .folder-box { margin-left: 0; }
   .stems { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
   .stem-btn { min-height: 52px; padding-left: 11px; }
   .stem-btn .name { font-size: 12px; }
