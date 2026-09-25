@@ -698,3 +698,26 @@ def test_each_type_and_format(
                 assert np.max(np.abs(data - guitar)) <= LSB24
             if export_type == "mix":
                 assert np.max(np.abs(data - expect_mix)) <= 2 * LSB24
+
+
+def test_old_db_gets_export_columns(tmp_path: Path) -> None:
+    """T08 より前の DB（EXPORT に状態などの列が無い）にも列が足される。"""
+    from sqlalchemy import inspect
+
+    from stemapp.db import init_db, make_engine
+
+    engine = make_engine(tmp_path / "old.db")
+    try:
+        init_db(engine)
+        new_cols = ["status", "progress", "stage", "error_message", "filename", "bytes",
+                    "mix_gain_db", "finished_at"]
+        with engine.begin() as conn:
+            for col in new_cols:
+                conn.exec_driver_sql(f"ALTER TABLE export DROP COLUMN {col}")
+            conn.exec_driver_sql("ALTER TABLE export_item DROP COLUMN gain_db")
+        init_db(engine)
+        cols = {c["name"] for c in inspect(engine).get_columns("export")}
+        assert set(new_cols) <= cols
+        assert "gain_db" in {c["name"] for c in inspect(engine).get_columns("export_item")}
+    finally:
+        engine.dispose()

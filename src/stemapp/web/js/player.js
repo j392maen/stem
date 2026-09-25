@@ -4,6 +4,7 @@
 import { api, fetchBinary } from "./api.js";
 import { BeatGrid, formatBpm } from "./beats.js";
 import { Engine, clampTime } from "./engine.js";
+import { Exporter } from "./export.js";
 import { parsePeaks } from "./peaks.js";
 import * as S from "./selection.js";
 import { confirmDialog, el, formatTime, icon, ICONS, promptDialog, toast } from "./ui.js";
@@ -272,6 +273,8 @@ export class PlayerView {
     if (this.engine) this.engine.close();
     this.engine = null;
     this.ready = false;
+    if (this.exporter) this.exporter.dispose();
+    this.exporter = null;
   }
 
   // --- 再生 -------------------------------------------------------------------
@@ -681,7 +684,18 @@ export class PlayerView {
       el("a", { class: "btn small", href: "#/library", text: "← ライブラリ" }),
       el("h1", { text: this.track.title, title: this.track.title }),
       el("span", { class: "muted", text: this.track.artist || "" }),
+      this.tree ? el("button", {
+        class: "btn small export-btn", id: "export-btn", type: "button", text: "書き出し",
+        title: "stem・全部（ZIP）・今の組み合わせを WAV / FLAC / MP3 で保存します",
+        onclick: () => this.openExport(),
+      }) : null,
       this.canOpenFolder ? this.folderEl() : null);
+  }
+
+  /** 書き出しメニュー（web/js/export.js）。 */
+  openExport() {
+    if (!this.exporter) this.exporter = new Exporter(this);
+    this.exporter.open();
   }
 
   /** 保存フォルダを開くボタン（サーバーと同じ PC のブラウザのときだけ出す）。 */
