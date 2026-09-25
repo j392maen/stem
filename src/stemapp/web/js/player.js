@@ -60,6 +60,7 @@ export class PlayerView {
     this.beforeAll = null;
     this.canOpenFolder = false;
     this.beatGrid = null; // 拍が未解析なら null
+    this.beatBusy = false; // 拍の解析を依頼して待っている
     this.tempoKey = "";
     this.onKey = (e) => this.handleKey(e);
   }
@@ -299,6 +300,69 @@ export class PlayerView {
     if (m) {
       m.textContent = grid ? `${grid.timeSignature}/4` : "";
       m.hidden = !grid;
+    }
+  }
+
+  /** 拍の結果を差し替える（波形・BPM 表示・ボタン）。再生は止めない。 */
+  setBeatGrid(grid) {
+    this.beatGrid = grid && !grid.empty ? grid : null;
+    if (this.wave) this.wave.setBeatGrid(this.beatGrid);
+    const box = this.root.querySelector("#tempo");
+    if (box) {
+      box.classList.toggle("none", !this.beatGrid);
+      box.title = this.tempoTitle();
+    }
+    this.tempoKey = "";
+    this.updateTempo(this.engine ? this.engine.position : 0);
+    this.renderBeatButton();
+  }
+
+  renderBeatButton() {
+    const btn = this.root.querySelector("#beats-btn");
+    if (!btn) return;
+    btn.disabled = this.beatBusy;
+    btn.textContent = this.beatBusy ? "拍を解析中…" : this.beatGrid ? "拍を再解析" : "拍を解析";
+    btn.title = this.beatBusy
+      ? "拍・小節の頭を解析しています"
+      : "拍・小節の頭を自動で解析します（GPU で数秒）";
+  }
+
+  /** 拍の解析（再解析）を依頼し、終わるまで待って表示を差し替える。 */
+  async requestBeats() {
+    if (this.beatBusy) return;
+    if (this.beatGrid) {
+      const ok = await confirmDialog("今の拍・小節線を消して、解析し直しますか？", { ok: "解析し直す" });
+      if (!ok || !this.alive) return;
+    }
+    try {
+      const res = await api(`/api/tracks/${this.trackId}/beats`, { method: "POST" });
+      if (!this.alive) return;
+      toast(res.message);
+      this.beatBusy = true;
+      this.setBeatGrid(null);
+      this.later(() => this.pollBeats(), POSTPROCESS_POLL_MS);
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async pollBeats() {
+    try {
+      const job = await api(`/api/jobs/${this.job.job_id}`);
+      if (!this.alive) return;
+      if (job.postprocess_status === "queued" || job.postprocess_status === "running") {
+        this.later(() => this.pollBeats(), POSTPROCESS_POLL_MS);
+        return;
+      }
+      this.job.beat_warning = job.beat_warning;
+      const beats = await api(`/api/tracks/${this.trackId}/beats`).catch(() => null);
+      if (!this.alive) return;
+      this.beatBusy = false;
+      this.setBeatGrid(beats ? new BeatGrid(beats) : null);
+      toast(this.beatGrid ? "拍を解析しました。" : (job.beat_warning || "拍を解析できませんでした。"));
+    } catch (e) {
+      toast(e.message);
+      this.later(() => this.pollBeats(), POSTPROCESS_POLL_MS * 2);
     }
   }
 
@@ -672,6 +736,9 @@ export class PlayerView {
         el("span", { class: "bpm", id: "bpm-value", text: "—" }),
         el("span", { class: "unit", text: "BPM" }),
         el("span", { class: "meter", id: "meter", hidden: true })),
+      el("button", {
+        class: "btn small", id: "beats-btn", type: "button", onclick: () => this.requestBeats(),
+      }),
       el("button", { class: "btn", type: "button", text: `−${SEEK_STEP_SEC}秒`, onclick: () => this.ready && this.seek(this.engine.position - SEEK_STEP_SEC) }),
       el("button", { class: "btn", type: "button", text: `+${SEEK_STEP_SEC}秒`, onclick: () => this.ready && this.seek(this.engine.position + SEEK_STEP_SEC) }),
       el("button", { class: "btn", id: "loop-btn", type: "button", text: "ループ", "aria-pressed": "false", onclick: () => this.toggleLoop() }),
@@ -709,6 +776,7 @@ export class PlayerView {
       el("div", { class: "player-side" }, presets, cues, help)));
     this.tempoKey = "";
     this.updateTempo(0);
+    this.renderBeatButton();
     this.updateTransport();
     this.renderStems();
     this.renderGroups();
