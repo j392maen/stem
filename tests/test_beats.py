@@ -115,13 +115,67 @@ def test_missing_and_extra_beats() -> None:
     assert len(cleaned) == len(noisy)
 
 
-def test_double_time_section_is_reported_as_is() -> None:
-    """ある区間ずっと倍で取れた（倍取り）場合は、その区間を倍の BPM として出す（補正は T10c）。"""
+def test_long_double_time_section_is_reported_as_is() -> None:
+    """長く（16 拍以上かつ 8 秒以上）倍で取れた区間は、倍の BPM として出す（補正は T10c）。"""
     first = np.arange(0, 30, 0.5)
     doubled = np.arange(30, 45, 0.25)
     last = np.arange(45, 60, 0.5)
     got = bpms(np.concatenate([first, doubled, last]))
     assert got == [120.0, 240.0, 120.0]
+
+
+@pytest.mark.parametrize(
+    ("interval", "seconds"),
+    [
+        (0.25, 3.0),  # 倍（12 拍・3 秒）
+        (1.0, 12.0),  # 半分（12 拍・12 秒。拍の数が 16 未満）
+        (0.375, 5.25),  # 4/3（3連のノリ。14 拍・5.25 秒）
+        (2 / 3, 7.33),  # 3/4（ハーフタイム寄り。11 拍・7.3 秒）
+    ],
+)
+def test_short_related_section_is_absorbed(interval: float, seconds: float) -> None:
+    """倍・半分・4/3・3/4 の関係にある短い区間は前後に吸収し、表示を 120 のままにする。"""
+    mid = np.arange(30, 30 + seconds, interval)
+    after = mid[-1] + interval
+    b = np.concatenate([np.arange(0, 30, 0.5), mid, np.arange(after, after + 30, 0.5)])
+    segs = tempo_segments(b)
+    assert [round(x.bpm, 1) for x in segs] == [120.0]
+    assert segs[0].start_sec == 0.0 and segs[0].end_sec == pytest.approx(b[-1])
+
+
+def test_short_unrelated_section_is_kept() -> None:
+    """関係の無い比（120→100）の変化は短くても残す（本当のテンポの変化かもしれない）。"""
+    mid = np.arange(30, 30 + 12 * 0.6, 0.6)
+    after = mid[-1] + 0.6
+    b = np.concatenate([np.arange(0, 30, 0.5), mid, np.arange(after, after + 30, 0.5)])
+    assert bpms(b) == [120.0, 100.0, 120.0]
+
+
+def test_mixed_half_intervals_are_not_filled() -> None:
+    """0.3 秒と 0.6 秒が混ざる所（曲の主な間隔 0.446 秒）で、0.6 秒を「抜け」として埋めない。"""
+    main = 60 / 134.5
+    b = list(np.arange(0, 30, main))
+    t = b[-1]
+    for gap in [0.3, 0.3, 0.6, 0.3, 0.3, 0.6, 0.3, 0.3, 0.6]:
+        t += gap
+        b.append(t)
+    b += list(np.arange(t + main, t + 30, main))
+    cleaned = clean_beats(b)
+    assert len(cleaned) == len(b)  # 仮の拍を足していない
+    assert np.all(np.diff(cleaned) > 0.25)
+
+
+def test_isolated_beats_do_not_make_a_segment() -> None:
+    """ブレイクの中の孤立した数拍は区間にしない（直前の区間の BPM のまま）。"""
+    b = np.concatenate([np.arange(0, 30.1, 0.5), [60.0, 60.3, 60.6], np.arange(90, 110, 0.5)])
+    segs = tempo_segments(b)
+    assert [round(x.bpm, 1) for x in segs] == [120.0]
+    assert segment_at(segs, 75).bpm == pytest.approx(120)
+    # 曲の頭の孤立した2拍（0.0, 0.7）も区間にしない
+    head = np.concatenate([[0.0, 0.7], np.arange(10, 40, 0.5)])
+    segs = tempo_segments(head)
+    assert [round(x.bpm, 2) for x in segs] == [120.0]
+    assert segs[0].start_sec == pytest.approx(10.0)
 
 
 def test_break_splits_runs() -> None:
@@ -139,8 +193,10 @@ def test_break_splits_runs() -> None:
 def test_short_inputs() -> None:
     assert tempo_segments([]) == []
     assert tempo_segments([1.0]) == []
-    assert bpms([0.0, 0.5]) == [120.0]
-    assert bpms([0.0, 0.5, 1.0, 1.5]) == [120.0]
+    # 拍の間隔が 8 未満の列は区間にしない
+    assert bpms([0.0, 0.5]) == []
+    assert bpms([0.5 * i for i in range(8)]) == []
+    assert bpms([0.5 * i for i in range(9)]) == [120.0]
     assert estimate_time_signature([], []) == 4
     assert estimate_time_signature([0, 0.5, 1.0], [0.0]) == 4  # 小節の頭が1つだけ
 
