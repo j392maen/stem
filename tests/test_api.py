@@ -503,3 +503,29 @@ def test_safe_filename() -> None:
     assert safe_filename("C:\\x\\a:b?.mp3") == "a_b_.mp3"
     assert safe_filename("") == "upload"
     assert safe_filename("..") == "upload"
+
+
+def test_non_ascii_cookie_is_401(settings: Settings) -> None:
+    assert not auth.verify_token(b"k" * 32, "p", "1.a.\xe9")
+    with TestClient(_app(settings, passcode=PASS)) as c:
+        res = c.get("/api/tracks", headers={"cookie": f"{auth.COOKIE_NAME}=1.a.%C3%A9"})
+        assert res.status_code == 401
+
+
+def test_docs_disabled_with_passcode(settings: Settings) -> None:
+    with TestClient(_app(settings, passcode=PASS)) as c:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert c.get(path).status_code == 404, path
+    with TestClient(_app(settings)) as c:
+        assert c.get("/openapi.json").status_code == 200
+        assert c.get("/docs").status_code == 200
+
+
+def test_upload_too_large(settings: Settings) -> None:
+    small = settings.model_copy(update={"max_upload_mb": 1})
+    with TestClient(_app(small)) as c:
+        res = c.post("/api/imports", files={"file": ("big.wav", b"\0" * (1024 * 1024 + 10))})
+        assert res.status_code == 413 and "上限 1 MB" in res.json()["detail"]
+        assert not list((small.cache_dir / "uploads").glob("*"))
+        with c.app.state.session_factory() as s:  # type: ignore[attr-defined]
+            assert s.scalars(select(InputSource)).all() == []

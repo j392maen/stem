@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     port: int = 8000
     passcode: str | None = None
     ytdlp_path: Path = DEFAULT_YTDLP_PATH
+    # アップロードできるファイルの大きさの上限（MB）
+    max_upload_mb: int = 1024
 
     @property
     def data_root(self) -> Path:

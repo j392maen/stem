@@ -283,6 +283,14 @@ async def create_import(request: Request) -> JSONResponse:
     task: dict[str, Any]
     dest_dir: Path | None = None
     if ctype.startswith("multipart/form-data"):
+        limit = settings.max_upload_mb * 1024 * 1024
+        too_large = HTTPException(
+            status_code=413,
+            detail=f"ファイルが大きすぎます（上限 {settings.max_upload_mb} MB）。",
+        )
+        length = request.headers.get("content-length")
+        if length and length.isdigit() and int(length) > limit:
+            raise too_large
         form = await request.form()
         upload = form.get("file")
         if not isinstance(upload, UploadFile) or not upload.filename:
@@ -291,12 +299,23 @@ async def create_import(request: Request) -> JSONResponse:
         dest_dir = settings.cache_dir / "uploads" / uuid.uuid4().hex
         dest = dest_dir / safe_filename(upload.filename)
 
-        def save() -> None:
+        def save() -> bool:
+            """保存する。上限を超えたら途中で消して False。"""
             dest_dir.mkdir(parents=True, exist_ok=True)
+            total = 0
             with open(dest, "wb") as fh:
-                shutil.copyfileobj(upload.file, fh, length=1024 * 1024)
+                while chunk := upload.file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > limit:
+                        break
+                    fh.write(chunk)
+            if total > limit:
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                return False
+            return True
 
-        await run_in_threadpool(save)
+        if not await run_in_threadpool(save):
+            raise too_large
         task = {
             "source_type": SOURCE_FILE,
             "file_path": dest,

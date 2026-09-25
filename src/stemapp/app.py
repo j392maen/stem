@@ -78,7 +78,16 @@ def create_app(
             manager.stop()
             engine.dispose()
 
-    app = FastAPI(title="stemapp", version=__version__, lifespan=lifespan)
+    # パスコードを設定しているときは API の説明ページ（/docs 等）を出さない
+    docs_enabled = auth.passcode_of(settings) is None
+    app = FastAPI(
+        title="stemapp",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
     app.state.settings = settings
     app.state.login_limiter = auth.LoginLimiter()
     app.middleware("http")(auth.auth_middleware)

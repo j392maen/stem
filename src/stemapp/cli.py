@@ -111,8 +111,19 @@ def serve() -> None:
     import uvicorn
 
     from stemapp.app import create_app
+    from stemapp.db import init_db, make_engine, make_session_factory
+    from stemapp.seed import seed
 
     settings = _settings()
+    # DB の作成・列の追加・初期データ投入は、ワーカーを起動する前にここで済ませる
+    # （サーバーとワーカーが同時に初回作成・列追加をして競合しないように）
+    engine = make_engine(settings.db_path)
+    try:
+        init_db(engine)
+        with make_session_factory(engine)() as session:
+            seed(session)
+    finally:
+        engine.dispose()
     worker_proc = _start_worker_process()
     try:
         uvicorn.run(
