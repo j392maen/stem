@@ -5,7 +5,7 @@
 
 | ID | タスク | 主な成果物 | 完了条件 | 状態 |
 | --- | --- | --- | --- | --- |
-| T01 | 基盤 | リポジトリ骨格、設定、DB モデル全実体、初期データ投入、`stemapp doctor`、Windows 用 setup/start スクリプト | Linux で `uv run pytest` と `uv run ruff check` が通る。PC で doctor が GPU を認識 | 未着手 |
+| T01 | 基盤 | リポジトリ骨格、設定、DB モデル全実体、初期データ投入、`stemapp doctor`、Windows 用 setup/start スクリプト | `uv run pytest`（GPU テスト含む）と `uv run ruff check` が通る。doctor で GPU・ffmpeg・yt-dlp.exe・deno が OK | 未着手 |
 | T02 | 分離パイプライン（CLI） | 音声正規化、Separator 抽象、audio-separator 実装、Fake 実装、fast/standard/best、残差補正、OOM 再試行、`stemapp separate` / `stemapp bench` | Fake で合計一致テスト。PC で4分の曲が standard で完走し時間を記録 | 未着手 |
 | T03 | 取り込み | ファイル取り込み（重複検出）、URL 取得（yt-dlp）と失敗理由の分類 | 分類ロジックのテスト。PC で URL 取得を確認 | 未着手 |
 | T04 | ジョブと API | ワーカープロセス、進捗配信、キャンセル、後処理（Opus・波形 peaks）、REST API、パスコード認証 | API テスト。PC で分割→API で stem 取得 | 未着手 |
