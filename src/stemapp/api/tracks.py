@@ -46,6 +46,7 @@ from stemapp.models import (
     Waveform,
 )
 from stemapp.separation.pipeline import SeparationError
+from stemapp.stem_folders import remove_job_dir
 
 log = logging.getLogger(__name__)
 
@@ -170,11 +171,12 @@ def delete_track(
             detail="分割待ち・分割中のジョブがあるため削除できません。キャンセルしてから削除してください。",
         )
     job_ids = [j.job_id for j in jobs]
+    job_dirs = [(j.job_id, j.output_dir) for j in jobs]
     session.delete(track)  # JOB・STEM・INPUT_SOURCE などは外部キーの CASCADE で消える
     session.commit()
     shutil.rmtree(settings.tracks_dir / str(track_id), ignore_errors=True)
-    for job_id in job_ids:
-        shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
+    for job_id, output_dir in job_dirs:
+        remove_job_dir(settings, job_id, output_dir)
     log.info("曲を削除しました（track %d, job %s）。", track_id, job_ids)
     return {"deleted": True, "track_id": track_id, "job_ids": job_ids}
 

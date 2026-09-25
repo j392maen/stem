@@ -521,6 +521,67 @@ def beats(
             )
 
 
+def _size(n: int) -> str:
+    return f"{n / 1024 / 1024:,.1f} MB"
+
+
+@app.command("migrate-folders")
+def migrate_folders_cmd(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="移さずに予定だけ表示する")
+    ] = False,
+) -> None:
+    """古い保存フォルダ（data/stems/<job_id>）を data/stems/<曲>/<分け方> へ移す。
+
+    サーバーとワーカーを止めてから実行する。何度実行しても同じ結果になる。
+    """
+    from stemapp.folder_migration import FAILED, MOVED, PLANNED, SKIPPED, migrate_folders
+
+    _setup_logging()
+    settings = _settings()
+    console = Console()
+    with _db_session(settings) as session:
+        report = migrate_folders(session, settings, dry_run=dry_run)
+    if not report.items:
+        console.print("移すフォルダはありません（移行済みです）。")
+        return
+    labels = {PLANNED: "予定", MOVED: "移動済み", SKIPPED: "対象外", FAILED: "失敗（元に戻した）"}
+    table = Table(title="保存フォルダの移行" + ("（予定・dry-run）" if dry_run else ""))
+    table.add_column("job", justify="right")
+    table.add_column("track", justify="right")
+    table.add_column("今のフォルダ")
+    table.add_column("新しいフォルダ")
+    table.add_column("ファイル", justify="right")
+    table.add_column("サイズ", justify="right")
+    table.add_column("DB のパス", justify="right")
+    table.add_column("結果")
+    for i in report.items:
+        result = labels[i.status] + (f": {i.message}" if i.message else "")
+        table.add_row(
+            str(i.job_id), str(i.track_id), i.old_dir, i.new_dir or "-", str(i.files),
+            _size(i.bytes), str(i.db_paths), result,
+        )
+    console.print(table)
+    files, total = report.before
+    console.print(f"移行前: {files} ファイル・{total:,} バイト（{_size(total)}）")
+    if dry_run:
+        console.print("dry-run のため何も変えていません。実行するには --dry-run を外してください。")
+        return
+    a_files, a_total = report.after
+    console.print(f"移行後: {a_files} ファイル・{a_total:,} バイト（{_size(a_total)}）")
+    same = (files, total) == (a_files, a_total)
+    if same:
+        console.print("ファイル数と合計サイズは同じです。")
+    else:
+        console.print("[bold red]ファイル数か合計サイズが違います。[/bold red]")
+    console.print(
+        f"移動 {report.count(MOVED)} 件・失敗 {report.count(FAILED)} 件・"
+        f"対象外 {report.count(SKIPPED)} 件"
+    )
+    if report.count(FAILED) or not same:
+        raise typer.Exit(1)
+
+
 def main() -> None:
     app()
 
