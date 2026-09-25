@@ -187,6 +187,21 @@ select:focus-visible, .play-btn:focus-visible {
 .folder-box { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
 .folder-note { font-size: 11px; color: var(--faint); white-space: nowrap; }
 
+/* 分け方（ジョブ）の切り替えと、聴き比べ用の数値 */
+.job-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.job-bar .select { max-width: 100%; }
+.job-metric { font-size: 12px; color: var(--muted); }
+.levels-box { flex-basis: 100%; font-size: 12px; color: var(--muted); }
+.levels-box summary { cursor: pointer; width: max-content; }
+.levels-scroll { overflow-x: auto; margin-top: 6px; }
+.levels { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.levels th, .levels td { padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.levels td { text-align: right; }
+.levels thead th { font-weight: normal; color: var(--faint); }
+.levels tbody th { text-align: left; font-weight: normal; }
+.levels tr.current th, .levels tr.current td { color: var(--text); }
+.exp-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+
 .wave-wrap { position: relative; padding: 0; overflow: hidden; }
 .wave-overview, .wave-zoom { display: block; width: 100%; touch-action: none; cursor: pointer; }
 .wave-overview { height: 64px; border-bottom: 1px solid var(--line); }

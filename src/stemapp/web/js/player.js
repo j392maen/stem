@@ -11,6 +11,8 @@ const SEEK_STEP_SEC = 5;
 const LOAD_CONCURRENCY = 3;
 const POSTPROCESS_POLL_MS = 1500;
 const VOLUME_KEY = "stemapp.volume";
+// 曲ごとに最後に選んだ分け方（ジョブ）。無い・消えたときは新しい完了済みジョブ
+const JOB_KEY_PREFIX = "stemapp.job.";
 // キューの色。stem・グループの色と重ならないよう、差し色の赤2色と白だけにする
 export const CUE_COLORS = ["#FF3B4E", "#F5F5F4", "#FF8A95"];
 
@@ -19,6 +21,18 @@ function loadVolume() {
     const v = Number(localStorage.getItem(VOLUME_KEY));
     return Number.isFinite(v) && localStorage.getItem(VOLUME_KEY) !== null ? v : 0.9;
   } catch { return 0.9; }
+}
+
+function loadJobChoice(trackId) {
+  try { return Number(localStorage.getItem(JOB_KEY_PREFIX + trackId)) || null; } catch { return null; }
+}
+
+function saveJobChoice(trackId, jobId) {
+  try { localStorage.setItem(JOB_KEY_PREFIX + trackId, String(jobId)); } catch { /* 保存できなくても動く */ }
+}
+
+function formatDb(v) {
+  return v === null || v === undefined ? "-" : v.toFixed(1).replace("-", "−");
 }
 
 /** items を最大 limit 個ずつ並行して処理する。signal が中断されたら新しい項目を始めない。 */
@@ -57,6 +71,9 @@ export class PlayerView {
     // 「全部」にする直前の組み合わせ（0 キーで戻る）
     this.beforeAll = null;
     this.canOpenFolder = false;
+    // 再生する分け方（ジョブ）。切り替えたときは restore に再生位置・選択を持って読み直す
+    this.jobId = null;
+    this.restore = null;
     this.onKey = (e) => this.handleKey(e);
   }
 
@@ -76,7 +93,11 @@ export class PlayerView {
       return;
     }
     if (!this.alive) return;
-    const jobId = this.track.playable_job_id;
+    this.doneJobs = (this.track.jobs || []).filter((j) => j.job_kind === "full" && j.status === "done");
+    const isDone = (id) => this.doneJobs.some((j) => j.job_id === id);
+    const saved = loadJobChoice(this.trackId);
+    const jobId = [this.jobId, saved].find((id) => id && isDone(id)) || this.track.playable_job_id;
+    this.jobId = jobId;
     if (!jobId) {
       this.showMessage("この曲はまだ分割されていません。ライブラリで分割してください。");
       return;
@@ -130,6 +151,7 @@ export class PlayerView {
     });
     this.root.replaceChildren(el("div", { class: "player-main" },
       this.headEl(),
+      this.jobBarEl(),
       el("div", { class: "notice", id: "delivery-notice" },
         el("strong", { text: "配信用データがありません" }),
         el("span", { class: "muted", text: busy
@@ -243,6 +265,7 @@ export class PlayerView {
       cover.hidden = true;
       this.root.querySelector("#play-btn").disabled = false;
       this.frame();
+      await this.applyRestore();
     } catch (e) {
       if (!this.alive) return;
       if (e.name === "AbortError") return;
@@ -250,6 +273,102 @@ export class PlayerView {
       label.classList.add("error-text");
       cover.querySelector(".progress").hidden = true;
     }
+  }
+
+  // --- 分け方（ジョブ）の切り替え ------------------------------------------------------
+
+  /** 別の分け方に切り替える。再生位置・stem の選択・ループをなるべく保つ。 */
+  switchJob(jobId) {
+    if (!jobId || jobId === this.jobId) return;
+    const engine = this.engine;
+    this.restore = {
+      position: engine ? engine.position : 0,
+      playing: !!(engine && engine.playing),
+      sel: new Set(this.sel),
+      gainsDb: new Map(this.gainsDb),
+      presetId: this.activePresetId,
+      beforeAll: this.beforeAll,
+      soloMode: this.soloMode,
+      loopCueId: this.loopCueId,
+      loopOn: this.loopOn,
+      zoom: this.wave ? this.wave.zoomSeconds : null,
+    };
+    saveJobChoice(this.trackId, jobId);
+    this.jobId = jobId;
+    this.remount();
+  }
+
+  async applyRestore() {
+    const r = this.restore;
+    this.restore = null;
+    if (!r || !this.alive || !this.engine) return;
+    // 新しいジョブに無い stem は外す（全部外れたら全部 ON）
+    const leaves = new Set(this.tree.leaves);
+    const sel = new Set([...r.sel].filter((c) => leaves.has(c)));
+    this.soloMode = r.soloMode;
+    this.beforeAll = r.beforeAll;
+    this.sel = sel.size ? sel : S.allOn(this.tree);
+    this.gainsDb = r.gainsDb;
+    this.activePresetId = sel.size ? r.presetId : null;
+    this.applySelection(0);
+    this.renderPresets();
+    this.loopCueId = r.loopCueId;
+    this.loopOn = r.loopOn && !!this.activeLoop();
+    this.engine.setLoop(this.loopOn ? this.activeLoop() : null);
+    this.renderCues();
+    if (r.zoom && this.wave) this.wave.setZoom(r.zoom);
+    this.engine.seek(clampTime(r.position, this.engine.duration));
+    if (r.playing) await this.engine.play();
+    this.updateTransport();
+  }
+
+  jobLabel(j) {
+    const name = j.preset_name || j.preset || "不明";
+    return `${j.preset_experimental ? "実験: " : ""}${name}（#${j.job_id}）`;
+  }
+
+  /** 分け方の切り替えと、聴き比べ用の数値（stem ごとの RMS、補正前の残差）。 */
+  jobBarEl() {
+    if (!this.doneJobs || !this.doneJobs.length) return null;
+    const current = this.doneJobs.find((j) => j.job_id === this.jobId);
+    const select = el("select", {
+      class: "select", id: "job-select", "aria-label": "分け方",
+      disabled: this.doneJobs.length < 2,
+      onchange: (e) => this.switchJob(Number(e.target.value)),
+    }, this.doneJobs.map((j) => el("option", {
+      value: String(j.job_id), text: this.jobLabel(j), selected: j.job_id === this.jobId,
+    })));
+    const resid = current && current.residual_rms_db !== null && current.residual_rms_db !== undefined
+      ? `補正前の残差 ${formatDb(current.residual_rms_db)} dB（元の曲 ${formatDb(current.mixture_rms_db)} dB）`
+      : "";
+    return el("div", { class: "job-bar", id: "job-bar" },
+      el("label", { class: "muted", for: "job-select", text: "分け方" }), select,
+      el("span", { class: "job-metric", id: "job-metric", text: resid }),
+      this.doneJobs.length > 1 || current ? this.levelsEl() : null);
+  }
+
+  /** 完了したジョブを行、stem を列にした RMS（dBFS）の表（開いたときだけ見える）。 */
+  levelsEl() {
+    const codes = [];
+    for (const j of this.doneJobs) {
+      for (const c of Object.keys(j.stem_rms_db || {})) if (!codes.includes(c)) codes.push(c);
+    }
+    const nameOf = (c) => {
+      const t = (this.stemTypes || []).find((x) => x.code === c);
+      return t ? t.display_name : c;
+    };
+    const table = el("table", { class: "levels" },
+      el("thead", {}, el("tr", {},
+        el("th", { text: "分け方" }),
+        ...codes.map((c) => el("th", { text: nameOf(c) })),
+        el("th", { text: "残差" }))),
+      el("tbody", {}, ...this.doneJobs.map((j) => el("tr", { class: j.job_id === this.jobId ? "current" : "" },
+        el("th", { text: this.jobLabel(j) }),
+        ...codes.map((c) => el("td", { text: formatDb((j.stem_rms_db || {})[c]) })),
+        el("td", { text: formatDb(j.residual_rms_db) })))));
+    return el("details", { class: "levels-box" },
+      el("summary", { text: "数値で比較（RMS dB）" }),
+      el("div", { class: "levels-scroll" }, table));
   }
 
   unmount() {
@@ -668,7 +787,7 @@ export class PlayerView {
       ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ");
 
     this.root.replaceChildren(el("div", { class: "player" },
-      el("div", { class: "player-main" }, this.headEl(), wave, transport, stems),
+      el("div", { class: "player-main" }, this.headEl(), this.jobBarEl(), wave, transport, stems),
       el("div", { class: "player-side" }, presets, cues, help)));
     this.updateTransport();
     this.renderStems();

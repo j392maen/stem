@@ -516,3 +516,84 @@ def test_open_folder_hidden_for_remote(page: Any, server: LiveServer, tmp_path: 
     assert page.locator("#open-folder-btn").count() == 0
     assert page.locator("#play-btn svg").count() == 1
     assert not page.errors  # type: ignore[attr-defined]
+
+
+def _wait_jobs_done(server: LiveServer, track_id: int, count: int) -> list[dict[str, Any]]:
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        deadline = time.monotonic() + 90
+        while True:
+            jobs = c.get(f"/api/tracks/{track_id}").json()["jobs"]
+            done = [j for j in jobs if j["status"] == "done"]
+            if len(done) >= count:
+                return done
+            assert not any(j["status"] == "failed" for j in jobs), jobs
+            assert time.monotonic() < deadline, "分割が終わりません"
+            time.sleep(0.2)
+
+
+def test_switch_separation_job(page: Any, server: LiveServer, tmp_path: Path) -> None:
+    """同じ曲を別の分け方（実験プリセット）で分割し、プレイヤーで切り替えて聴き比べる。"""
+    track_id, fast_job = _done_track(server, tmp_path)
+    page.goto(server.base_url + "/#/library")
+    row = f".track-row[data-track-id='{track_id}']"
+    page.wait_for_selector(row)
+    # 実験プリセットは通常隠れていて、「実験を表示」で出る
+    exp_opt = "#preset-select optgroup option[value='exp_resid_vocals']"
+    assert page.locator(exp_opt).count() == 0
+    page.check("#show-experimental")
+    assert page.locator(exp_opt).count() == 1
+    page.select_option("#preset-select", "exp_resid_vocals")
+    page.click(f"{row} .btn:has-text('別の分け方で分割')")
+    page.wait_for_selector("#toast:has-text('分割ジョブを登録しました')")
+    done = _wait_jobs_done(server, track_id, 2)
+    exp_job = next(j["job_id"] for j in done if j["preset"] == "exp_resid_vocals")
+
+    page.goto(f"{server.base_url}/#/track/{track_id}")
+    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+    view = "window.__stemapp.view"
+    # 新しい方（実験）が選ばれ、切り替えの選択肢は2つ
+    assert page.evaluate(f"() => {view}.jobId") == exp_job
+    assert page.locator("#job-select option").count() == 2
+    assert page.input_value("#job-select") == str(exp_job)
+    assert "実験: 残差をボーカルへ" in page.inner_text("#job-select")
+    assert "補正前の残差" in page.inner_text("#job-metric")
+
+    # ドラムを OFF、1.5 秒から再生してから、分け方を切り替える
+    page.click(".stem-btn[data-code='drums']")
+    _wait_gains(page, {"drums": 0.0, "bass": 1.0})
+    page.evaluate(f"() => {view}.seek(1.5)")
+    page.click("#play-btn")
+    page.wait_for_function(f"() => {view}.engine.playing")
+    page.select_option("#job-select", str(fast_job))
+    page.wait_for_function(
+        f"() => {view}.jobId === {fast_job} && {view}.ready && {view}.engine.playing",
+        timeout=60_000,
+    )
+    pos = page.evaluate(f"() => {view}.engine.position")
+    assert 1.4 < pos < 3.0, pos  # 再生位置を保つ（読み込みの間は止まっている）
+    _wait_gains(page, {"drums": 0.0, "bass": 1.0, "lead_vocal": 1.0})  # 選択を保つ
+    assert page.input_value("#job-select") == str(fast_job)
+    page.click("#play-btn")  # 止める
+
+    # 数値の比較（stem ごとの RMS と残差）
+    page.click(".levels-box summary")
+    assert page.locator(".levels tbody tr").count() == 2
+    assert page.locator(".levels tr.current").count() == 1
+    _shot(page, "player_job_switch_pc.png")
+    page.set_viewport_size(PHONE)
+    _shot(page, "player_job_switch_phone.png")
+    page.set_viewport_size(DESKTOP)
+
+    # 選んだ分け方は覚えている（読み直しても同じ）
+    page.reload()
+    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+    assert page.evaluate(f"() => {view}.jobId") == fast_job
+    assert not page.errors  # type: ignore[attr-defined]
+
+    # ジョブを消したら、残った方を再生する
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        assert c.delete(f"/api/jobs/{fast_job}").status_code == 200
+    page.reload()
+    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+    assert page.evaluate(f"() => {view}.jobId") == exp_job
+    assert page.locator("#job-select[disabled]").count() == 1
