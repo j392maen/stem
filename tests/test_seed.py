@@ -111,22 +111,58 @@ def test_models_and_presets(session: Session) -> None:
     assert set(presets) == {"fast", "standard", "best"}
     assert [c for c, p in presets.items() if p.is_default] == ["standard"]
 
+    sw = "BS-Roformer-SW.ckpt"
+    kim = "vocals_mel_band_roformer.ckpt"
+    kim_unwa = "mel_band_roformer_kim_ft_unwa.ckpt"
+    kara_mel = "mel_band_roformer_karaoke_becruily.ckpt"
+    kara_bs = "bs_roformer_karaoke_frazer_becruily.ckpt"
+    expected = {
+        "fast": [
+            (sw, "mixture", "multistem"),
+            (kara_mel, "vocals", "karaoke"),
+        ],
+        "standard": [
+            (sw, "mixture", "multistem"),
+            (kim, "mixture", "vocals"),
+            (kara_bs, "vocals", "karaoke"),
+        ],
+        "best": [
+            (sw, "mixture", "multistem"),
+            (kim, "mixture", "vocals"),
+            (kim_unwa, "mixture", "vocals"),
+            (kara_mel, "vocals", "karaoke"),
+            (kara_bs, "vocals", "karaoke"),
+        ],
+    }
+
+    steps: dict[str, list[PresetStep]] = {}
     for code, p in presets.items():
-        steps = list(
+        steps[code] = list(
             session.scalars(
                 select(PresetStep)
                 .where(PresetStep.preset_id == p.preset_id)
                 .order_by(PresetStep.step_order)
             )
         )
-        roles = [s.role for s in steps]
-        assert roles[0] == "multistem", code
-        assert models[steps[0].model_id].filename == "BS-Roformer-SW.ckpt"
-        assert roles[-1] == "karaoke", code
-        assert all(s.input == "vocals" for s in steps if s.role == "karaoke")
-        n_vocal = roles.count("vocals")
-        n_karaoke = roles.count("karaoke")
-        assert (n_vocal, n_karaoke) == {"fast": (0, 1), "standard": (1, 1), "best": (2, 2)}[code]
+        actual = [(models[s.model_id].filename, s.input, s.role) for s in steps[code]]
+        assert actual == expected[code], code
+        assert [s.step_order for s in steps[code]] == list(range(1, len(actual) + 1))
+
+    # best は全ステップ TTA、fast は standard より overlap が小さい（以下）
+    assert all(s.options_json.get("tta") is True for s in steps["best"])
+    assert not any(s.options_json.get("tta") for s in steps["fast"] + steps["standard"])
+    fast_overlap = max(s.options_json["overlap"] for s in steps["fast"])
+    std_overlap = min(s.options_json["overlap"] for s in steps["standard"])
+    assert fast_overlap <= std_overlap
+
+
+def test_aspiration_outputs_not_confused_with_other(session: Session) -> None:
+    seed(session)
+    m = session.scalar(
+        select(Model).where(Model.filename == "aspiration_mel_band_roformer_sdr_18.9845.ckpt")
+    )
+    assert m is not None
+    assert m.output_stems_json == ["breath", "no_breath"]
 
 
 def _members(session: Session, code: str) -> set[str]:
