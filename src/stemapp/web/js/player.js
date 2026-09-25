@@ -54,6 +54,9 @@ export class PlayerView {
     this.loopCueId = null;
     this.loopOn = false;
     this.ready = false;
+    // 「全部」にする直前の組み合わせ（0 キーで戻る）
+    this.beforeAll = null;
+    this.canOpenFolder = false;
     this.onKey = (e) => this.handleKey(e);
   }
 
@@ -79,13 +82,15 @@ export class PlayerView {
       return;
     }
     try {
-      const [stems, types, groups, presets, cues] = await Promise.all([
+      const [stems, types, groups, presets, cues, me] = await Promise.all([
         api(`/api/jobs/${jobId}/stems`),
         api("/api/stem-types"),
         api("/api/stem-groups"),
         api("/api/listen-presets"),
         api(`/api/tracks/${this.trackId}/cues`),
+        api("/api/me").catch(() => ({})),
       ]);
+      this.canOpenFolder = !!me.can_open_folder;
       this.job = stems;
       this.stemTypes = types.stem_types;
       this.groups = groups.stem_groups;
@@ -293,9 +298,11 @@ export class PlayerView {
 
   updateTransport() {
     const btn = this.root.querySelector("#play-btn");
-    if (btn && this.engine) {
-      btn.innerHTML = this.engine.playing ? ICONS.pause : ICONS.play;
-      btn.setAttribute("aria-label", this.engine.playing ? "一時停止" : "再生");
+    if (btn) {
+      const playing = !!(this.engine && this.engine.playing);
+      btn.innerHTML = playing ? ICONS.pause : ICONS.play;
+      btn.setAttribute("aria-label", playing ? "一時停止" : "再生");
+      btn.classList.toggle("playing", playing);
     }
     const loopBtn = this.root.querySelector("#loop-btn");
     if (loopBtn) {
@@ -313,7 +320,15 @@ export class PlayerView {
     this.renderSelectionState();
   }
 
+  isAll(sel = this.sel) {
+    return S.sameSelection(sel, S.allOn(this.tree));
+  }
+
   setSelection(sel, { gainsDb = null, presetId = null } = {}) {
+    if (this.isAll(sel) && !this.isAll()) {
+      // 「全部」にする前の組み合わせを覚えておく（0 キーで戻る）
+      this.beforeAll = { sel: this.sel, gainsDb: this.gainsDb, presetId: this.activePresetId };
+    }
     this.sel = sel;
     if (gainsDb) this.gainsDb = gainsDb;
     this.activePresetId = presetId;
@@ -335,6 +350,17 @@ export class PlayerView {
 
   pressAll() {
     this.setSelection(S.allOn(this.tree), { gainsDb: new Map() });
+  }
+
+  /** 0 キー: 「全部（元の曲）」と、その直前の組み合わせを行き来する。 */
+  toggleAll() {
+    if (this.isAll() && this.beforeAll) {
+      const { sel, gainsDb, presetId } = this.beforeAll;
+      this.beforeAll = null;
+      this.setSelection(new Set(sel), { gainsDb: new Map(gainsDb), presetId });
+    } else if (!this.isAll()) {
+      this.pressAll();
+    }
   }
 
   toggleSolo() {
@@ -533,6 +559,9 @@ export class PlayerView {
     if (e.code === "Space" || e.key === " ") {
       e.preventDefault();
       if (!e.repeat) this.togglePlay(); // 押しっぱなしの繰り返しは無視する
+    } else if (e.key === "0") {
+      e.preventDefault();
+      this.toggleAll();
     } else if (/^[1-9]$/.test(e.key)) {
       const code = this.tree.order[Number(e.key) - 1];
       if (code) { e.preventDefault(); this.pressStem(code, e.shiftKey); }
@@ -554,7 +583,27 @@ export class PlayerView {
     return el("div", { class: "track-head" },
       el("a", { class: "btn small", href: "#/library", text: "← ライブラリ" }),
       el("h1", { text: this.track.title, title: this.track.title }),
-      el("span", { class: "muted", text: this.track.artist || "" }));
+      el("span", { class: "muted", text: this.track.artist || "" }),
+      this.canOpenFolder ? this.folderEl() : null);
+  }
+
+  /** 保存フォルダを開くボタン（サーバーと同じ PC のブラウザのときだけ出す）。 */
+  folderEl() {
+    const note = "stem は FLAC（24bit）で保存されています";
+    return el("div", { class: "folder-box" },
+      el("button", {
+        class: "btn small", id: "open-folder-btn", type: "button", text: "保存フォルダを開く",
+        title: `${note}（ファイル名は stem の名前.flac）。エクスプローラーで開きます。`,
+        onclick: () => this.openFolder(),
+      }),
+      el("span", { class: "folder-note", text: "FLAC 24bit" }));
+  }
+
+  async openFolder() {
+    try {
+      await api(`/api/jobs/${this.job.job_id}/open-folder`, { method: "POST" });
+      toast("エクスプローラーで保存フォルダを開きました。");
+    } catch (e) { toast(e.message); }
   }
 
   render() {
@@ -595,7 +644,7 @@ export class PlayerView {
       el("h2", { text: "STEM" }),
       el("div", { class: "stems", id: "stems" }),
       el("div", { class: "mode-row", style: { marginTop: "10px" } },
-        el("button", { class: "btn", id: "all-btn", type: "button", text: "全部（元の曲）", onclick: () => this.pressAll() }),
+        el("button", { class: "btn", id: "all-btn", type: "button", text: "全部（元の曲）", title: "全部の stem を鳴らします（0 キーで直前の組み合わせと切り替え）", onclick: () => this.pressAll() }),
         el("button", { class: "btn", id: "solo-btn", type: "button", text: "ソロ", "aria-pressed": "false", title: "ON にすると、押した stem だけを鳴らします（Shift＋クリックでも同じ）", onclick: () => this.toggleSolo() }),
         el("span", { class: "muted", text: "グループ:" }),
         el("div", { class: "mode-row", id: "groups" })));
@@ -613,7 +662,8 @@ export class PlayerView {
         el("button", { class: "btn", id: "add-cue-btn", type: "button", text: "＋ 今の位置にキュー", onclick: () => this.addCue() })));
 
     const help = el("p", { class: "keys-help" },
-      el("kbd", { text: "Space" }), " 再生/停止　", el("kbd", { text: "1" }), "〜", el("kbd", { text: "9" }),
+      el("kbd", { text: "Space" }), " 再生/停止　", el("kbd", { text: "0" }),
+      " 全部（元の曲）⇔ 直前の組み合わせ　", el("kbd", { text: "1" }), "〜", el("kbd", { text: "9" }),
       " stem の ON/OFF（Shift でソロ）　", el("kbd", { text: "←" }), el("kbd", { text: "→" }),
       ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ");
 

@@ -13,7 +13,8 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import uvicorn
 from sqlalchemy.orm import Session, sessionmaker
@@ -43,6 +44,8 @@ class LiveServer:
     base_url: str
     settings: Settings
     session_factory: sessionmaker[Session]
+    # 「保存フォルダを開く」で開こうとしたフォルダ（実際にはエクスプローラーを開かない）
+    opened_folders: list[Path] = field(default_factory=list)
 
 
 @contextmanager
@@ -57,6 +60,8 @@ def run_server(
 
     app = create_app(settings, import_deps=ImportDeps(threads=1))
     app.state.sse_poll_sec = 0.1
+    opened: list[Path] = []
+    app.state.folder_opener = opened.append
     port = free_port()
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on")
@@ -82,7 +87,7 @@ def run_server(
         worker_thread = threading.Thread(target=worker.run_forever, name="test-worker", daemon=True)
         worker_thread.start()
     try:
-        yield LiveServer(f"http://127.0.0.1:{port}", settings, factory)
+        yield LiveServer(f"http://127.0.0.1:{port}", settings, factory, opened)
     finally:
         if worker is not None and worker_thread is not None:
             worker.stop()
