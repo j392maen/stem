@@ -405,3 +405,22 @@ def test_stop_on_stdin_eof() -> None:
     t = stop_on_stdin_eof(ev, io.BytesIO(b"abc"))
     t.join(5)
     assert ev.is_set()
+
+
+def test_worker_process_stops_when_stdin_closes(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`stemapp serve` と同じ方法でワーカーを起動し、標準入力を閉じると止まる。"""
+    from stemapp import cli
+
+    monkeypatch.setenv("STEMAPP_DATA_DIR", str(settings.data_dir))
+    proc = cli._start_worker_process()
+    try:
+        _wait_for(lambda: (settings.data_dir / "worker.lock").exists(), 60)
+        time.sleep(1.0)
+        assert proc.poll() is None  # 動き続けている
+        cli._stop_worker_process(proc)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
