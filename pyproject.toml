@@ -1,0 +1,80 @@
+[project]
+name = "stemapp"
+version = "0.1.0"
+description = "個人用の楽曲 stem 分割・再生アプリ"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "pydantic-settings>=2.4",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "audio-separator[gpu]>=0.30",
+    "torch>=2.7",
+    # onnx2torch 経由で入る torchvision も torch と同じ CUDA 版 index から取る
+    "torchvision",
+]
+url = [
+    "yt-dlp",
+]
+
+[project.scripts]
+stemapp = "stemapp.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stemapp"]
+
+[tool.uv]
+# 開発・実行は Windows、CI 相当は Linux。macOS 用の解決は行わない。
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not gpu'"
+markers = [
+    "gpu: 実 GPU（CUDA）が必要なテスト。`uv run pytest -m gpu` で実行する",
+    "ffmpeg: ffmpeg コマンドが必要なテスト",
+]
