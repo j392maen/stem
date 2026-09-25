@@ -47,6 +47,8 @@ KARAOKE_MEL_BECRUILY = "mel_band_roformer_karaoke_becruily.ckpt"
 KARAOKE_BS_FRAZER = "bs_roformer_karaoke_frazer_becruily.ckpt"
 KARAOKE_BS_ANVUEW = "bs_roformer_karaoke_anvuew.ckpt"
 KARAOKE_MEL_AUFR33 = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+KARAOKE_MEL_GABOX = "mel_band_roformer_karaoke_gabox.ckpt"
+KARAOKE_MEL_GABOX_V2 = "mel_band_roformer_karaoke_gabox_v2.ckpt"
 DRUMSEP = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
 MALE_FEMALE = "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt"
 ASPIRATION = "aspiration_mel_band_roformer_sdr_18.9845.ckpt"
@@ -67,8 +69,12 @@ MODELS: list[ModelDef] = [
     ModelDef(KARAOKE_BS_FRAZER, "BS-RoFormer カラオケ（frazer/becruily）", "bs_roformer",
              KARAOKE_OUT),
     ModelDef(KARAOKE_BS_ANVUEW, "BS-RoFormer カラオケ（anvuew）", "bs_roformer",
-             KARAOKE_OUT),
+             KARAOKE_OUT, license="GPL-3.0"),
     ModelDef(KARAOKE_MEL_AUFR33, "Mel-RoFormer カラオケ（aufr33/viperx）", "mel_band_roformer",
+             KARAOKE_OUT),
+    ModelDef(KARAOKE_MEL_GABOX, "Mel-RoFormer カラオケ（gabox）", "mel_band_roformer",
+             KARAOKE_OUT),
+    ModelDef(KARAOKE_MEL_GABOX_V2, "Mel-RoFormer カラオケ（gabox v2）", "mel_band_roformer",
              KARAOKE_OUT),
     ModelDef(DRUMSEP, "MDX23C ドラム分割", "mdx23c",
              ["kick", "snare", "toms", "hihat", "ride", "crash"]),
@@ -164,6 +170,10 @@ class PresetDef:
     display_name: str
     is_default: bool
     steps: list[StepDef]
+    # 聴き比べ用の実験プリセット（画面では通常隠す）
+    experimental: bool = False
+    # パイプライン全体の選択肢（pipeline.PRESET_OPTION_KEYS）。例: {"residual_to": "vocals"}
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 # 数値（overlap 等）は仮の値。T02/T09 で実測して調整する。
@@ -184,6 +194,48 @@ PRESETS: list[PresetDef] = [
         StepDef(KARAOKE_MEL_BECRUILY, "vocals", "karaoke", options={"overlap": 4, "tta": True}),
         StepDef(KARAOKE_BS_FRAZER, "vocals", "karaoke", options={"overlap": 4, "tta": True}),
     ]),
+]
+
+# 聴き比べ用（T12、docs/research/R01 の D 章）。どれも standard（SW＋Kim の平均）を元にする。
+# 既定は変えない。ユーザーが聴いて良いものを選んだら、standard / best に取り込む。
+_SW4 = StepDef(SW, "mixture", "multistem", options={"overlap": 4})
+_KIM4 = StepDef(KIM_VOCALS, "mixture", "vocals", options={"overlap": 4})
+
+
+def _kara(model: str, source: str) -> StepDef:
+    return StepDef(model, source, "karaoke", options={"overlap": 4})
+
+
+RESID_VOCALS = {"residual_to": "vocals"}
+EXPERIMENTAL_PRESETS: list[PresetDef] = [
+    # 残差を vocals に足す。vocals = 元の曲 − SW の楽器 stem の合計 になり、ボーカル専用モデル
+    # （Kim）の出力は結果に効かないので使わない（validate_plan も弾く）
+    PresetDef("exp_resid_vocals", "ボーカル＝元の曲−楽器", False,
+              [_SW4, _kara(KARAOKE_BS_FRAZER, "vocals")],
+              experimental=True, options=RESID_VOCALS),
+    # 対照: SW だけ（Kim の平均なし）。standard と比べて Kim が役立っているかを確かめる。
+    # （残差の split はボーカル専用モデルが無いと other と同じなので、選択肢は既定のまま）
+    PresetDef("exp_resid_split", "SW のみ（対照）", False,
+              [_SW4, _kara(KARAOKE_BS_FRAZER, "vocals")],
+              experimental=True),
+    # karaoke を元の曲にかける（lead = karaoke の出力、backing = vocals − lead）
+    PresetDef("exp_kara_mix", "カラオケを元の曲に", False,
+              [_SW4, _KIM4, _kara(KARAOKE_BS_FRAZER, "mixture")],
+              experimental=True),
+    # karaoke を anvuew ＋ frazer の平均に（vocals にかける）
+    PresetDef("exp_kara_anvuew", "カラオケ2種（anvuew＋frazer）", False,
+              [_SW4, _KIM4, _kara(KARAOKE_BS_ANVUEW, "vocals"),
+               _kara(KARAOKE_BS_FRAZER, "vocals")],
+              experimental=True),
+    # vocals = 元の曲 − 楽器 ＋ karaoke（anvuew ＋ frazer）を元の曲に
+    PresetDef("exp_combo", "ボーカル＝元の曲−楽器＋カラオケ2種を元の曲に", False,
+              [_SW4, _kara(KARAOKE_BS_ANVUEW, "mixture"), _kara(KARAOKE_BS_FRAZER, "mixture")],
+              experimental=True, options=RESID_VOCALS),
+    # exp_combo に gabox v2（Mel-RoFormer）を足した 3 種の平均（系統の違うモデルを混ぜる）
+    PresetDef("exp_combo_gabox", "ボーカル＝元の曲−楽器＋カラオケ3種を元の曲に", False,
+              [_SW4, _kara(KARAOKE_BS_ANVUEW, "mixture"),
+               _kara(KARAOKE_BS_FRAZER, "mixture"), _kara(KARAOKE_MEL_GABOX_V2, "mixture")],
+              experimental=True, options=RESID_VOCALS),
 ]
 
 # --- STEM_GROUP --------------------------------------------------------------
@@ -266,13 +318,15 @@ def _seed_stem_types(session: Session, models: dict[str, Model]) -> dict[str, St
 
 def _seed_presets(session: Session, models: dict[str, Model]) -> None:
     existing = {p.code: p for p in session.scalars(select(SeparationPreset))}
-    for d in PRESETS:
+    for d in [*PRESETS, *EXPERIMENTAL_PRESETS]:
         p = existing.get(d.code)
         if p is None:
             p = SeparationPreset(code=d.code)
             session.add(p)
         p.display_name = d.display_name
         p.is_default = d.is_default
+        p.is_experimental = d.experimental
+        p.options_json = dict(d.options)
         session.flush()
 
         steps = {

@@ -26,8 +26,11 @@ from stemapp.jobs import (
     ACTIVE_STATUSES,
     DONE,
     FINISHED_STATUSES,
+    QUEUED,
+    RUNNING,
     JobConflict,
     JobNotFound,
+    delete_job,
     enqueue_full_job,
     request_cancel,
     request_postprocess,
@@ -36,6 +39,7 @@ from stemapp.models import (
     BeatGrid,
     InputSource,
     SeparationJob,
+    SeparationPreset,
     Stem,
     StemRendition,
     StemType,
@@ -64,10 +68,21 @@ def _jobs_by_track(session: Session) -> dict[int, list[SeparationJob]]:
 
 
 def _track_summary(
-    track: Track, jobs: list[SeparationJob], presets: dict[int, str]
+    track: Track, jobs: list[SeparationJob], presets: dict[int, SeparationPreset]
 ) -> dict[str, Any]:
     """jobs はその曲のジョブ（新しい順）。"""
-    playable = next((j for j in jobs if j.job_kind == "full" and j.status == "done"), None)
+    done = [j for j in jobs if j.job_kind == "full" and j.status == "done"]
+
+    def experimental(j: SeparationJob) -> bool:
+        p = presets.get(j.preset_id) if j.preset_id is not None else None
+        return bool(p is not None and p.is_experimental)
+
+    # 実験プリセット（聴き比べ用）のジョブは、ほかに完了したジョブがあれば既定にしない
+    playable = next((j for j in done if not experimental(j)), done[0] if done else None)
+    # 分割中のもの、無ければ次に分割されるもの（いちばん古い分割待ち）
+    running = [j for j in jobs if j.status == RUNNING]
+    queued = [j for j in jobs if j.status == QUEUED]
+    active = running[0] if running else (queued[-1] if queued else None)
     return {
         "track_id": track.track_id,
         "title": track.title,
@@ -75,8 +90,11 @@ def _track_summary(
         "duration_sec": track.duration_sec,
         "created_at": iso(track.created_at),
         "latest_job": job_to_dict(jobs[0], presets) if jobs else None,
-        # 再生に使うジョブ（完了した full ジョブのうち新しいもの）
+        # 再生に使う既定のジョブ（完了した full ジョブのうち新しいもの。実験プリセットは後回し）
         "playable_job_id": playable.job_id if playable is not None else None,
+        # 分割待ち・分割中のジョブ（同じ曲に複数の分け方があるとき、一覧はこれを優先して出す）
+        "active_job": job_to_dict(active, presets) if active is not None else None,
+        "active_count": len(running) + len(queued),
     }
 
 
@@ -105,7 +123,10 @@ def get_track(track_id: int, session: SessionDep) -> dict[str, Any]:
         .order_by(InputSource.source_id)
     ).all()
     out = _track_summary(track, list(jobs), presets)
-    out["jobs"] = [job_to_dict(j, presets) for j in jobs]
+    levels = _stem_levels(session, [j.job_id for j in jobs if j.status == "done"])
+    out["jobs"] = [
+        {**job_to_dict(j, presets), "stem_rms_db": levels.get(j.job_id, {})} for j in jobs
+    ]
     out["sources"] = [
         {
             "source_id": s.source_id,
@@ -116,6 +137,22 @@ def get_track(track_id: int, session: SessionDep) -> dict[str, Any]:
         }
         for s in sources
     ]
+    return out
+
+
+def _stem_levels(session: Session, job_ids: list[int]) -> dict[int, dict[str, float | None]]:
+    """ジョブごとの stem の RMS（dBFS）。{job_id: {stem の code: rms_db}}（表示順）。"""
+    out: dict[int, dict[str, float | None]] = {}
+    if not job_ids:
+        return out
+    rows = session.execute(
+        select(Stem.job_id, StemType.code, Stem.rms_db)
+        .join(StemType, StemType.stem_type_id == Stem.stem_type_id)
+        .where(Stem.job_id.in_(job_ids))
+        .order_by(Stem.job_id, StemType.display_order)
+    ).all()
+    for job_id, code, level in rows:
+        out.setdefault(job_id, {})[code] = round(level, 2) if level is not None else None
     return out
 
 
@@ -229,8 +266,8 @@ class JobRequest(BaseModel):
 
 ENQUEUE_MESSAGES = {
     None: "分割ジョブを登録しました。",
-    "active": "この曲は分割待ち・分割中です。",
-    "done": "この曲は分割済みです（分割し直すには force を指定してください）。",
+    "active": "この曲はこの分け方で分割待ち・分割中です。",
+    "done": "この曲はこの分け方で分割済みです（分割し直すには force を指定してください）。",
 }
 
 
@@ -278,6 +315,22 @@ def cancel_job(job_id: int, session: SessionDep) -> dict[str, Any]:
     except JobConflict as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return job_to_dict(job, preset_codes(session))
+
+
+@router.delete("/jobs/{job_id}")
+def delete_job_api(job_id: int, request: Request, session: SessionDep) -> dict[str, Any]:
+    """ジョブ（1つの分け方）を消す。stem のファイルも消える。曲とほかのジョブは残る。
+
+    分割待ち・分割中（配信用データの作成中を含む）は 409。
+    """
+    settings: Settings = request.app.state.settings
+    try:
+        job = delete_job(session, settings, job_id)
+    except JobNotFound as e:
+        raise not_found("ジョブ") from e
+    except JobConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"deleted": True, "job_id": job_id, "track_id": job.track_id}
 
 
 POSTPROCESS_MESSAGES = {

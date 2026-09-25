@@ -25,14 +25,18 @@ def resolve_data_path(settings: Settings, stored: str) -> Path:
     return p if p.is_absolute() else settings.data_dir / p
 
 
-def find_done_job(session: Session, track_id: int) -> SeparationJob | None:
-    """その曲の完了済み full ジョブ（新しいもの）。無ければ None。"""
-    return session.scalars(
-        select(SeparationJob)
-        .where(
-            SeparationJob.track_id == track_id,
-            SeparationJob.job_kind == "full",
-            SeparationJob.status == "done",
-        )
-        .order_by(SeparationJob.job_id.desc())
-    ).first()
+def find_done_job(
+    session: Session, track_id: int, preset_id: int | None = None
+) -> SeparationJob | None:
+    """その曲の完了済み full ジョブ（新しいもの）。無ければ None。
+
+    preset_id を渡すと、そのプリセットで分割したものだけを探す。
+    """
+    stmt = select(SeparationJob).where(
+        SeparationJob.track_id == track_id,
+        SeparationJob.job_kind == "full",
+        SeparationJob.status == "done",
+    )
+    if preset_id is not None:
+        stmt = stmt.where(SeparationJob.preset_id == preset_id)
+    return session.scalars(stmt.order_by(SeparationJob.job_id.desc())).first()

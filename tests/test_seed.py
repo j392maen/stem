@@ -107,9 +107,15 @@ def test_models_and_presets(session: Session) -> None:
     assert "BS-Roformer-SW.ckpt" in {m.filename for m in models.values()}
     assert all(m.license for m in models.values())
 
-    presets = {p.code: p for p in session.scalars(select(SeparationPreset))}
+    all_presets = {p.code: p for p in session.scalars(select(SeparationPreset))}
+    presets = {c: p for c, p in all_presets.items() if not p.is_experimental}
     assert set(presets) == {"fast", "standard", "best"}
-    assert [c for c, p in presets.items() if p.is_default] == ["standard"]
+    assert [c for c, p in all_presets.items() if p.is_default] == ["standard"]
+    # 実験プリセット（聴き比べ用）は印付きで別にある
+    experimental = {c for c, p in all_presets.items() if p.is_experimental}
+    assert {"exp_resid_vocals", "exp_kara_mix", "exp_kara_anvuew", "exp_combo"} <= experimental
+    assert all(c.startswith("exp_") for c in experimental)
+    assert all(not p.options_json for p in presets.values())
 
     sw = "BS-Roformer-SW.ckpt"
     kim = "vocals_mel_band_roformer.ckpt"

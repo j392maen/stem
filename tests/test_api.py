@@ -372,8 +372,10 @@ def test_master_endpoints(client: TestClient) -> None:
     items = presets[0]["items"]
     assert all((i["stem_type_code"] is None) != (i["group_code"] is None) for i in items)
     sep = client.get("/api/presets").json()["presets"]
-    assert {p["code"] for p in sep} == {"fast", "standard", "best"}
+    assert {p["code"] for p in sep if not p["experimental"]} == {"fast", "standard", "best"}
     assert [p["code"] for p in sep if p["is_default"]] == ["standard"]
+    exp = {p["code"] for p in sep if p["experimental"]}
+    assert {"exp_resid_vocals", "exp_kara_mix", "exp_kara_anvuew", "exp_combo"} <= exp
 
 
 # --- 取り込み ----------------------------------------------------------------------------
@@ -535,3 +537,68 @@ def test_upload_too_large(settings: Settings) -> None:
         assert not list((small.cache_dir / "uploads").glob("*"))
         with c.app.state.session_factory() as s:  # type: ignore[attr-defined]
             assert s.scalars(select(InputSource)).all() == []
+
+
+# --- 分け方の聴き比べ（T12） -------------------------------------------------------------
+
+
+def test_multiple_jobs_per_track_and_delete_job(
+    client: TestClient, done_job: tuple[int, int]
+) -> None:
+    track_id, fast_job = done_job
+    settings = client.app.state.settings  # type: ignore[attr-defined]
+    # 別の分け方なら force なしで登録できる
+    res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_resid_vocals"})
+    assert res.status_code == 201 and res.json()["created"] is True
+    exp_job = res.json()["job"]["job_id"]
+    # 一覧: 分割待ちのジョブを active_job で返す（latest_job は新しいもの）
+    two = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_kara_mix"}).json()
+    summary = next(t for t in client.get("/api/tracks").json()["tracks"]
+                   if t["track_id"] == track_id)
+    assert summary["latest_job"]["job_id"] == two["job"]["job_id"]
+    assert summary["active_job"]["job_id"] == exp_job  # 次に分割される古い方
+    assert summary["active_count"] == 2
+    client.post(f"/api/jobs/{two['job']['job_id']}/cancel")
+    summary = client.get(f"/api/tracks/{track_id}").json()
+    assert summary["latest_job"]["status"] == "canceled"
+    assert summary["active_job"]["job_id"] == exp_job and summary["active_count"] == 1
+    assert res.json()["job"]["preset_experimental"] is True
+    assert res.json()["job"]["preset_name"] == "ボーカル＝元の曲−楽器"
+    # 分割待ちは消せない
+    busy = client.delete(f"/api/jobs/{exp_job}")
+    assert busy.status_code == 409 and "キャンセル" in busy.json()["detail"]
+    assert _run_worker_once(client) == exp_job
+    # 同じ分け方は分割済み
+    again = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_resid_vocals"})
+    assert again.status_code == 200 and again.json()["reason"] == "done"
+    assert "この分け方" in again.json()["message"]
+
+    track = client.get(f"/api/tracks/{track_id}").json()
+    assert track["playable_job_id"] == fast_job  # 実験のジョブは既定にしない
+    assert track["active_job"] is None and track["active_count"] == 0
+    jobs = {j["job_id"]: j for j in track["jobs"] if j["status"] == "done"}
+    assert set(jobs) == {fast_job, exp_job}
+    for j in jobs.values():
+        assert j["status"] == "done"
+        assert j["residual_rms_db"] is not None and j["mixture_rms_db"] is not None
+        levels = j["stem_rms_db"]
+        assert list(levels)[:3] == ["vocals", "lead_vocal", "backing_vocal"]
+        assert all(isinstance(v, float) for v in levels.values())
+    assert jobs[fast_job]["preset"] == "fast" and jobs[fast_job]["preset_experimental"] is False
+
+    # ジョブ単位で消す（曲とほかのジョブは残る）
+    res = client.delete(f"/api/jobs/{exp_job}")
+    assert res.status_code == 200
+    assert res.json() == {"deleted": True, "job_id": exp_job, "track_id": track_id}
+    assert not (settings.stems_dir / str(exp_job)).exists()
+    assert (settings.stems_dir / str(fast_job)).is_dir()
+    track = client.get(f"/api/tracks/{track_id}").json()
+    assert track["playable_job_id"] == fast_job
+    assert exp_job not in [j["job_id"] for j in track["jobs"]]
+    # 実験のジョブしか無ければそれを再生する
+    assert client.delete(f"/api/jobs/{fast_job}").status_code == 200
+    res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_kara_mix"})
+    only_exp = res.json()["job"]["job_id"]
+    assert _run_worker_once(client) == only_exp
+    assert client.get(f"/api/tracks/{track_id}").json()["playable_job_id"] == only_exp
+    assert client.delete(f"/api/jobs/{exp_job}").status_code == 404
