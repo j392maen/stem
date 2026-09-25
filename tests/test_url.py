@@ -271,6 +271,8 @@ REAL_MESSAGES: list[tuple[str, str]] = [
         "private_or_removed",
     ),
     ("ERROR: [youtube] xxxxxxxxxxx: Video unavailable", "private_or_removed"),
+    # 2026-09 に存在しない ID で実際に出たメッセージ（yt-dlp 2026.08.19）
+    ("ERROR: [youtube] xxxxxxxxxxx: This video is unavailable", "private_or_removed"),
     (
         "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader",
         "private_or_removed",
