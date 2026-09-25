@@ -35,3 +35,5 @@
 - 随時（T04 より）: ワーカーが落ちても serve は動き続ける。/api/health にワーカー状態を出すか、serve が再起動する。外部コマンドは必ず proc.run_bound / popen_bound で起動する。
 - 随時（T04 より）: ログアウトは Cookie を消すだけ（トークンは30日有効。パスコード変更で全無効）。
 - 任意（T05 より）: グループ色「伴奏」と「ボーカル」がややに似る。キュー色の赤が再生位置の線と同じ。PC では 4 分の曲で約 700MB のメモリを使う（iPhone は T06 で選択中 stem のみ読み込み）。配信用データの作り直しは途中キャンセル不可。
+- T05b: 再生ボタンの見た目、0 キー、保存フォルダを開く（完了 2026-09-25）。
+- T06（T05b レビューより）: Host ヘッダーの許可リスト（TrustedHostMiddleware。localhost・127.0.0.1・Tailscale のホスト名）で DNS リバインディングを防ぐ。open-folder は explorer を完全パスで起動、中継ヘッダーに x-forwarded-proto・x-real-ip・via も追加。Tailscale の TCP 転送では使わない旨を README に書く。
