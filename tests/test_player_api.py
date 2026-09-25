@@ -18,12 +18,14 @@ from stemapp.jobs.queue import recover_interrupted_jobs
 from stemapp.jobs.worker import Worker
 from stemapp.models import (
     CuePoint,
+    ListenPreset,
     ListenPresetItem,
     SeparationJob,
     Stem,
     StemRendition,
     Waveform,
 )
+from stemapp.seed import seed
 from test_api import PASS, _app
 
 
@@ -146,6 +148,34 @@ def test_listen_preset_crud(client: TestClient) -> None:
             .where(ListenPresetItem.listen_preset_id == pid)
         )
         assert count == 0  # 中身も消える
+
+
+def test_delete_builtin_preset_hides_it(client: TestClient) -> None:
+    """組み込みを削除すると隠す（再起動の seed で復活しない）。ユーザー作成は行ごと消す。"""
+    listed = client.get("/api/listen-presets").json()["listen_presets"]
+    builtin = next(p for p in listed if p["name"] == "サブボーカルのみ")
+    assert builtin["builtin"] is True
+    pid = builtin["listen_preset_id"]
+    assert client.delete(f"/api/listen-presets/{pid}").status_code == 204
+    def listed_presets() -> list[dict[str, Any]]:
+        return client.get("/api/listen-presets").json()["listen_presets"]
+
+    assert pid not in [p["listen_preset_id"] for p in listed_presets()]
+    assert client.put(f"/api/listen-presets/{pid}", json={"name": "x"}).status_code == 404
+    assert client.delete(f"/api/listen-presets/{pid}").status_code == 404
+    with _factory(client)() as s:
+        row = s.get(ListenPreset, pid)
+        assert row is not None and row.hidden and row.seed_code == "backing_only"
+        seed(s)  # 次の起動
+    after = listed_presets()
+    assert pid not in [p["listen_preset_id"] for p in after]
+    assert "サブボーカルのみ" not in [p["name"] for p in after]
+
+    user = client.post("/api/listen-presets", json={"name": "自作", "items": []}).json()
+    assert user["builtin"] is False
+    assert client.delete(f"/api/listen-presets/{user['listen_preset_id']}").status_code == 204
+    with _factory(client)() as s:
+        assert s.get(ListenPreset, user["listen_preset_id"]) is None
 
 
 def test_listen_preset_validation(client: TestClient) -> None:

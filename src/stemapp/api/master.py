@@ -77,7 +77,9 @@ def listen_presets(session: SessionDep) -> dict[str, Any]:
     for it in session.scalars(select(ListenPresetItem).order_by(ListenPresetItem.item_id)):
         items.setdefault(it.listen_preset_id, []).append(_item_dict(it, codes, group_codes))
     presets = session.scalars(
-        select(ListenPreset).order_by(ListenPreset.sort_order, ListenPreset.listen_preset_id)
+        select(ListenPreset)
+        .where(ListenPreset.hidden.is_(False))
+        .order_by(ListenPreset.sort_order, ListenPreset.listen_preset_id)
     ).all()
     return {
         "listen_presets": [
@@ -104,6 +106,7 @@ def _preset_dict(p: ListenPreset, items: list[dict[str, Any]]) -> dict[str, Any]
         "listen_preset_id": p.listen_preset_id,
         "name": p.name,
         "sort_order": p.sort_order,
+        "builtin": p.seed_code is not None,
         "items": items,
     }
 
@@ -165,10 +168,16 @@ def _replace_items(session: Session, preset_id: int, items: list[ListenItemIn]) 
         )
 
 
-def _load_preset(session: Session, preset_id: int) -> dict[str, Any]:
+def _visible_preset(session: Session, preset_id: int) -> ListenPreset:
+    """隠した（削除した組み込みの）組み合わせは無いものとして扱う。"""
     p = session.get(ListenPreset, preset_id)
-    if p is None:
+    if p is None or p.hidden:
         raise not_found("組み合わせ")
+    return p
+
+
+def _load_preset(session: Session, preset_id: int) -> dict[str, Any]:
+    p = _visible_preset(session, preset_id)
     codes = _type_codes(session)
     group_codes = {g.group_id: g.code for g in session.scalars(select(StemGroup))}
     rows = session.scalars(
@@ -195,9 +204,7 @@ def create_listen_preset(body: ListenPresetCreate, session: SessionDep) -> dict[
 def update_listen_preset(
     preset_id: int, body: ListenPresetUpdate, session: SessionDep
 ) -> dict[str, Any]:
-    p = session.get(ListenPreset, preset_id)
-    if p is None:
-        raise not_found("組み合わせ")
+    p = _visible_preset(session, preset_id)
     if body.name is not None:
         p.name = body.name
     if body.sort_order is not None:
@@ -211,10 +218,12 @@ def update_listen_preset(
 
 @router.delete("/listen-presets/{preset_id}", status_code=204)
 def delete_listen_preset(preset_id: int, session: SessionDep) -> Response:
-    p = session.get(ListenPreset, preset_id)
-    if p is None:
-        raise not_found("組み合わせ")
-    session.delete(p)  # 中身（LISTEN_PRESET_ITEM）は外部キーの CASCADE で消える
+    p = _visible_preset(session, preset_id)
+    if p.seed_code is not None:
+        # 組み込みは行を残して隠す（起動時の seed が作り直さないように）
+        p.hidden = True
+    else:
+        session.delete(p)  # 中身（LISTEN_PRESET_ITEM）は外部キーの CASCADE で消える
     session.commit()
     return Response(status_code=204)
 

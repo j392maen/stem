@@ -2,11 +2,13 @@
 //
 // - 全 stem の AudioBuffer を同じ AudioContext の同じ時刻で start する。
 // - stem の ON/OFF は GainNode を 15ms のランプで 0/1 にする（再生は止めない）。
-// - シークは全 stem を止めて、同じ時刻から同時に start し直す。
+// - シークは全 stem を止めて、同じ時刻から同時に start し直す。止める前に全体の音量（fade）を
+//   8ms で 0 にし、start と同時に 8ms で戻す（全 stem 共通の GainNode なので同期は崩れない）。
 // - A-B ループは AudioBufferSourceNode の loop / loopStart / loopEnd を全 stem に同じ値で設定する
 //   （同じ描画単位で折り返すので stem 同士はずれない）。
 
 export const RAMP_SEC = 0.015;
+export const FADE_SEC = 0.008; // 一時停止・シークの前後のフェード（クリック音を減らす）
 const START_DELAY_SEC = 0.03; // start までの余裕（全 stem の start を同じ時刻に揃えるため）
 
 /**
@@ -35,6 +37,10 @@ export class Engine {
     this.ctx = contextFactory();
     this.master = this.ctx.createGain();
     this.master.connect(this.ctx.destination);
+    this.fade = this.ctx.createGain(); // 全 stem 共通のフェード用
+    this.fade.connect(this.master);
+    this._wantPlay = false;
+    this._starting = null;
     this.tracks = new Map(); // code → { buffer, gain, source }
     this.playing = false;
     this.startCtxTime = 0;
@@ -49,7 +55,7 @@ export class Engine {
   addTrack(code, buffer, gainValue = 0) {
     const gain = this.ctx.createGain();
     gain.gain.value = gainValue;
-    gain.connect(this.master);
+    gain.connect(this.fade);
     this.tracks.set(code, { buffer, gain, source: null });
     if (buffer) this.duration = Math.max(this.duration, buffer.duration);
   }
@@ -90,8 +96,20 @@ export class Engine {
     g.linearRampToValueAtTime(Math.max(0, Math.min(1, value)), now + RAMP_SEC);
   }
 
+  _fadeOut() {
+    const now = this.ctx.currentTime;
+    const g = this.fade.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(0, now + FADE_SEC);
+    return now + FADE_SEC;
+  }
+
   _startSources(offset) {
     const when = this.ctx.currentTime + START_DELAY_SEC;
+    const g = this.fade.gain;
+    g.setValueAtTime(0, when);
+    g.linearRampToValueAtTime(1, when + FADE_SEC);
     for (const t of this.tracks.values()) {
       if (!t.buffer) continue;
       const src = this.ctx.createBufferSource();
@@ -109,19 +127,31 @@ export class Engine {
     this.startOffset = offset;
   }
 
-  _stopSources() {
+  /** 鳴っている音源を止める。at（AudioContext の時刻）を渡すとその時刻に止める。 */
+  _stopSources(at = 0) {
     for (const t of this.tracks.values()) {
-      if (t.source) {
-        try { t.source.stop(); } catch { /* 既に止まっている */ }
-        t.source.disconnect();
-        t.source = null;
-      }
+      const src = t.source;
+      if (!src) continue;
+      t.source = null;
+      src.onended = () => src.disconnect();
+      try { src.stop(at); } catch { src.disconnect(); }
     }
   }
 
-  async play() {
-    if (this.playing) return;
+  /** 再生を始める。始める途中（resume を待つ間）に呼ばれた2回目は同じ Promise を返す。 */
+  play() {
+    this._wantPlay = true;
+    if (this.playing) return Promise.resolve();
+    if (!this._starting) {
+      this._starting = this._start().finally(() => { this._starting = null; });
+    }
+    return this._starting;
+  }
+
+  async _start() {
     if (this.ctx.state !== "running") await this.ctx.resume();
+    // 待つ間に pause() された・既に鳴っているときは始めない
+    if (!this._wantPlay || this.playing) return;
     let offset = this.pausedAt;
     if (offset >= this.duration - 0.01) offset = 0;
     this._startSources(offset);
@@ -129,16 +159,24 @@ export class Engine {
   }
 
   pause() {
+    this._wantPlay = false;
     if (!this.playing) return;
     this.pausedAt = this.position;
-    this._stopSources();
+    this._stopSources(this._fadeOut());
     this.playing = false;
+  }
+
+  /** 鳴っている音源の数（テスト・確認用）。 */
+  activeSources() {
+    let n = 0;
+    for (const t of this.tracks.values()) if (t.source) n++;
+    return n;
   }
 
   seek(t) {
     const target = clampTime(t, this.duration);
     if (this.playing) {
-      this._stopSources();
+      this._stopSources(this._fadeOut());
       this._startSources(target);
     } else {
       this.pausedAt = target;
@@ -182,6 +220,7 @@ export class Engine {
   }
 
   async close() {
+    this._wantPlay = false;
     this._stopSources();
     this.playing = false;
     this.tracks.clear();

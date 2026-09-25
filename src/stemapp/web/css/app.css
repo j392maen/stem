@@ -220,7 +220,7 @@ select:focus-visible, .play-btn:focus-visible {
 .stem-btn {
   --c: #888;
   position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
-  min-height: 58px; padding: 8px 24px 8px 14px; border-radius: 6px; cursor: pointer;
+  min-height: 58px; padding: 8px 8px 8px 14px; border-radius: 6px; cursor: pointer; min-width: 0;
   text-align: left; background: #111115; border: 1px solid var(--line); color: var(--muted);
   overflow: hidden;
 }
@@ -228,10 +228,17 @@ select:focus-visible, .play-btn:focus-visible {
   content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 5px;
   background: var(--c); opacity: 0.35;
 }
-.stem-btn .name { font-weight: 700; font-size: 13px; }
-.stem-btn .sub { font-size: 11px; color: var(--faint); }
+/* 名前は1行に収める（入らないときは末尾を「…」にし、全文は title で見られる） */
+.stem-btn .name {
+  font-weight: 700; font-size: 13px; max-width: 100%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.stem-btn .sub {
+  font-size: 11px; color: var(--faint); max-width: 100%; padding-right: 16px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .stem-btn .key {
-  position: absolute; right: 6px; top: 5px; font-size: 10px; color: var(--faint);
+  position: absolute; right: 6px; bottom: 5px; font-size: 10px; color: var(--faint);
   border: 1px solid var(--line); border-radius: 3px; padding: 0 4px;
 }
 .stem-btn.on {
@@ -295,8 +302,9 @@ select:focus-visible, .play-btn:focus-visible {
   .track-row .t-len { display: none; }
   .track-row .t-state { grid-column: 1 / -1; grid-row: 2; }
   .track-row .t-actions { grid-column: 2; grid-row: 1; }
-  .stems { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); }
-  .stem-btn { min-height: 52px; }
+  .stems { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .stem-btn { min-height: 52px; padding-left: 11px; }
+  .stem-btn .name { font-size: 12px; }
   .wave-zoom { height: 130px; }
   .volume { margin-left: 0; width: 100%; }
   .volume input { flex: 1; }

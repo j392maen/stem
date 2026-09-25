@@ -11,8 +11,8 @@ const SEEK_STEP_SEC = 5;
 const LOAD_CONCURRENCY = 3;
 const POSTPROCESS_POLL_MS = 1500;
 const VOLUME_KEY = "stemapp.volume";
-// キューの色（差し色の赤＋stem 色と紛れにくい無彩色・原色寄り）
-export const CUE_COLORS = ["#FF3B4E", "#F5F5F4", "#FACC15", "#38BDF8", "#4ADE80"];
+// キューの色。stem・グループの色と重ならないよう、差し色の赤2色と白だけにする
+export const CUE_COLORS = ["#FF3B4E", "#F5F5F4", "#FF8A95"];
 
 function loadVolume() {
   try {
@@ -21,11 +21,13 @@ function loadVolume() {
   } catch { return 0.9; }
 }
 
-async function mapLimit(items, limit, fn) {
+/** items を最大 limit 個ずつ並行して処理する。signal が中断されたら新しい項目を始めない。 */
+async function mapLimit(items, limit, fn, signal) {
   const out = new Array(items.length);
   let next = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (next < items.length) {
+      if (signal && signal.aborted) throw new DOMException("中断しました", "AbortError");
       const i = next++;
       out[i] = await fn(items[i], i);
     }
@@ -67,9 +69,10 @@ export class PlayerView {
     try {
       this.track = await api(`/api/tracks/${this.trackId}`);
     } catch (e) {
-      this.showMessage(e.status === 404 ? "曲が見つかりません。" : e.message);
+      if (this.alive) this.showMessage(e.status === 404 ? "曲が見つかりません。" : e.message);
       return;
     }
+    if (!this.alive) return;
     const jobId = this.track.playable_job_id;
     if (!jobId) {
       this.showMessage("この曲はまだ分割されていません。ライブラリで分割してください。");
@@ -102,6 +105,7 @@ export class PlayerView {
     this.render();
     document.addEventListener("keydown", this.onKey);
     await this.loadMedia();
+    if (!this.alive) return;
   }
 
   showMessage(text) {
@@ -135,6 +139,7 @@ export class PlayerView {
   async requestPostprocess() {
     try {
       const res = await api(`/api/jobs/${this.job.job_id}/postprocess`, { method: "POST" });
+      if (!this.alive) return;
       toast(res.message);
       this.job.postprocess_status = res.job.postprocess_status;
       if (res.reason === "ready") { this.remount(); return; }
@@ -147,6 +152,7 @@ export class PlayerView {
   async pollPostprocess() {
     try {
       const job = await api(`/api/jobs/${this.job.job_id}`);
+      if (!this.alive) return;
       this.job.postprocess_status = job.postprocess_status;
       if (job.postprocess_status === "queued" || job.postprocess_status === "running") {
         this.later(() => this.pollPostprocess(), POSTPROCESS_POLL_MS);
@@ -179,9 +185,13 @@ export class PlayerView {
       label.textContent = `音声と波形を読み込み中… ${done}/${total}`;
       bar.style.width = `${Math.round((done / total) * 100)}%`;
     };
+    // 1つでも失敗したら残りの取得を中断する（画面を離れたときの中断にも従う）
+    const loading = new AbortController();
+    const onLeave = () => loading.abort();
+    this.abort.signal.addEventListener("abort", onLeave);
     try {
       this.engine = new Engine();
-      const signal = this.abort.signal;
+      const signal = loading.signal;
       const loaded = await mapLimit(leaves, LOAD_CONCURRENCY, async (stem) => {
         const stream = stem.renditions.find((r) => r.purpose === "stream");
         const peaks = new Map();
@@ -189,9 +199,13 @@ export class PlayerView {
         stem.peaks.forEach((p, i) => peaks.set(p.samples_per_px, parsePeaks(peakBufs[i])));
         step();
         const audio = await fetchBinary(stream.url, signal);
+        if (signal.aborted) throw new DOMException("中断しました", "AbortError");
         const buffer = await this.engine.decode(audio);
         step();
         return { stem, buffer, peaks };
+      }, signal).catch((e) => {
+        loading.abort();
+        throw e;
       });
       if (!this.alive) return;
       for (const code of this.tree.order) {
@@ -225,7 +239,8 @@ export class PlayerView {
       this.root.querySelector("#play-btn").disabled = false;
       this.frame();
     } catch (e) {
-      if (e.name === "AbortError" || !this.alive) return;
+      if (!this.alive) return;
+      if (e.name === "AbortError") return;
       label.textContent = `読み込めませんでした: ${e.message}`;
       label.classList.add("error-text");
       cover.querySelector(".progress").hidden = true;
@@ -341,7 +356,9 @@ export class PlayerView {
   }
 
   async reloadPresets() {
-    this.presets = (await api("/api/listen-presets")).listen_presets;
+    const presets = (await api("/api/listen-presets")).listen_presets;
+    if (!this.alive) return;
+    this.presets = presets;
     this.renderPresets();
   }
 
@@ -515,7 +532,7 @@ export class PlayerView {
     if (["INPUT", "TEXTAREA", "SELECT"].includes(tag) || document.querySelector(".modal-back")) return;
     if (e.code === "Space" || e.key === " ") {
       e.preventDefault();
-      this.togglePlay();
+      if (!e.repeat) this.togglePlay(); // 押しっぱなしの繰り返しは無視する
     } else if (/^[1-9]$/.test(e.key)) {
       const code = this.tree.order[Number(e.key) - 1];
       if (code) { e.preventDefault(); this.pressStem(code, e.shiftKey); }
@@ -622,7 +639,7 @@ export class PlayerView {
     box.replaceChildren(...this.tree.order.map((code, i) => {
       const s = this.tree.byCode.get(code);
       const parent = S.isParent(this.tree, code);
-      const sub = parent ? "子をまとめて切替" : "";
+      const sub = parent ? "子をまとめて" : "";
       return el("button", {
         class: `stem-btn${s.parent_code ? " child" : ""}${s.is_silent ? " silent" : ""}`,
         type: "button", dataset: { code },

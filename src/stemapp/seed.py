@@ -3,7 +3,9 @@
 - STEM_TYPE / MODEL / SEPARATION_PRESET / STEM_GROUP は一意キー（code, filename）で
   作成または更新する。
 - PRESET_STEP と STEM_GROUP_MEMBER（組み込みのみ）は定義どおりに揃える。
-- LISTEN_PRESET は名前で探し、無いときだけ作る（ユーザーが編集した中身は上書きしない）。
+- LISTEN_PRESET は seed_code（組み込みの識別子）で探し、無いときだけ作る（ユーザーが編集した
+  名前・中身は上書きしない。ユーザーが削除した組み込みは hidden で残っているので作り直さない）。
+  seed_code を持たない古い DB では、同じ名前の行に seed_code を付けて組み込みとみなす。
 """
 
 from __future__ import annotations
@@ -94,16 +96,16 @@ BASE_STEM_CODES: tuple[str, ...] = (
 
 # 並び順＝表示順。親は必ず子より前に置く。
 # 色は暗い背景で見分けやすく、画面の差し色（赤系統）と紛れないよう、赤〜ピンクの色相を避ける。
-# 基本 stem は色相を離し（紫・黄・緑・青緑・水色・赤紫）、詳細 stem は親と同じ系統で明るさを変える。
+# 基本 stem は色相を離し（紫・黄・緑・シアン・青・赤紫）、詳細 stem は親と同じ系統で明るさを変える。
 STEM_TYPES: list[StemTypeDef] = [
     # 基本（分割時に必ず作る）
     StemTypeDef("vocals", "ボーカル", None, "base", "#A78BFA"),
     StemTypeDef("lead_vocal", "メインボーカル", "vocals", "base", "#E9D5FF"),
-    StemTypeDef("backing_vocal", "サブボーカル", "vocals", "base", "#818CF8"),
+    StemTypeDef("backing_vocal", "サブボーカル", "vocals", "base", "#6366F1"),
     StemTypeDef("drums", "ドラム", None, "base", "#FACC15"),
     StemTypeDef("bass", "ベース", None, "base", "#4ADE80"),
-    StemTypeDef("guitar", "ギター", None, "base", "#2DD4BF"),
-    StemTypeDef("piano", "ピアノ", None, "base", "#38BDF8"),
+    StemTypeDef("guitar", "ギター", None, "base", "#22D3EE"),
+    StemTypeDef("piano", "ピアノ", None, "base", "#60A5FA"),
     StemTypeDef("other", "その他", None, "base", "#E879F9"),
     # ボーカルの詳細（紫の系統）
     StemTypeDef("male", "男声", "vocals", "detail", "#7C3AED", refine_model=MALE_FEMALE),
@@ -119,9 +121,9 @@ STEM_TYPES: list[StemTypeDef] = [
                 refine_model=DRUMSEP),
     StemTypeDef("crash", "クラッシュ", "drums", "detail", "#FEF9C3", experimental=True,
                 refine_model=DRUMSEP),
-    # ギターの詳細（青緑の系統）
-    StemTypeDef("acoustic_guitar", "アコースティックギター", "guitar", "detail", "#99F6E4"),
-    StemTypeDef("electric_guitar", "エレキギター", "guitar", "detail", "#14B8A6"),
+    # ギターの詳細（シアンの系統）
+    StemTypeDef("acoustic_guitar", "アコースティックギター", "guitar", "detail", "#A5F3FC"),
+    StemTypeDef("electric_guitar", "エレキギター", "guitar", "detail", "#0891B2"),
     # その他の詳細（赤紫・水色・黄緑・灰色など、基本 stem と重ならないもの）
     StemTypeDef("wind", "管楽器", "other", "detail", "#67E8F9", experimental=True),
     StemTypeDef("saxophone", "サックス", "other", "detail", "#06B6D4"),
@@ -200,7 +202,7 @@ GROUPS: list[GroupDef] = [
     GroupDef("vocals_all", "ボーカル", "#FB923C", ["lead_vocal", "backing_vocal"]),
     GroupDef("chords", "コード", "#A3E635", ["guitar", "piano", "other"]),
     GroupDef("rhythm", "リズム", "#94A3B8", ["drums", "bass"]),
-    GroupDef("accompaniment", "伴奏", "#F5F5F4", ["drums", "bass", "guitar", "piano", "other"]),
+    GroupDef("accompaniment", "伴奏", "#D4A373", ["drums", "bass", "guitar", "piano", "other"]),
 ]
 
 # --- LISTEN_PRESET -----------------------------------------------------------
@@ -208,16 +210,19 @@ GROUPS: list[GroupDef] = [
 
 @dataclass(frozen=True)
 class ListenDef:
+    code: str  # LISTEN_PRESET.seed_code
     name: str
     stem_types: list[str]
     groups: list[str]
 
 
 LISTEN_PRESETS: list[ListenDef] = [
-    ListenDef("ベース＋コード", ["bass"], ["chords"]),
-    ListenDef("ドラム＋ボーカル＋コード", ["drums"], ["vocals_all", "chords"]),
-    ListenDef("カラオケ（伴奏）", [], ["accompaniment"]),
-    ListenDef("サブボーカルのみ", ["backing_vocal"], []),
+    ListenDef("bass_chords", "ベース＋コード", ["bass"], ["chords"]),
+    ListenDef(
+        "drums_vocals_chords", "ドラム＋ボーカル＋コード", ["drums"], ["vocals_all", "chords"]
+    ),
+    ListenDef("karaoke", "カラオケ（伴奏）", [], ["accompaniment"]),
+    ListenDef("backing_only", "サブボーカルのみ", ["backing_vocal"], []),
 ]
 
 
@@ -324,11 +329,18 @@ def _seed_groups(session: Session, types: dict[str, StemType]) -> dict[str, Stem
 def _seed_listen_presets(
     session: Session, types: dict[str, StemType], groups: dict[str, StemGroup]
 ) -> None:
-    existing = {p.name: p for p in session.scalars(select(ListenPreset))}
+    rows = session.scalars(select(ListenPreset).order_by(ListenPreset.listen_preset_id)).all()
+    by_code = {p.seed_code: p for p in rows if p.seed_code}
     for order, d in enumerate(LISTEN_PRESETS, start=1):
-        if d.name in existing:
+        if d.code in by_code:
             continue
-        p = ListenPreset(name=d.name, sort_order=order * 10)
+        # 移行: seed_code を持たない同じ名前の行（以前の seed が作ったもの）を組み込みとみなす
+        legacy = next((p for p in rows if p.seed_code is None and p.name == d.name), None)
+        if legacy is not None:
+            legacy.seed_code = d.code
+            by_code[d.code] = legacy
+            continue
+        p = ListenPreset(name=d.name, sort_order=order * 10, seed_code=d.code)
         session.add(p)
         session.flush()
         for code in d.stem_types:

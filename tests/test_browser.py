@@ -14,13 +14,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import delete, select
 
 from audio_helpers import synth_mix, write_source
 from browser_helpers import EDGE_ARGS, SCREENS_DIR, LiveServer, run_server
 from stemapp.config import Settings
-from stemapp.models import ListenPreset, SeparationJob, Stem, StemRendition, Track
+from stemapp.models import ListenPreset, Stem, StemRendition, Track
 
 pytestmark = [
     pytest.mark.browser,
@@ -33,12 +34,35 @@ DESKTOP = {"width": 1440, "height": 900}
 PHONE = {"width": 390, "height": 844}
 
 
-@pytest.fixture(scope="module")
-def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveServer]:
-    data = tmp_path_factory.mktemp("browser") / "data"
-    settings = Settings(_env_file=None, data_dir=data)  # type: ignore[call-arg]
+@pytest.fixture
+def server(tmp_path: Path) -> Iterator[LiveServer]:
+    """テストごとに空のデータフォルダで起動する（テストの順序に依存しない）。"""
+    settings = Settings(_env_file=None, data_dir=tmp_path / "data")  # type: ignore[call-arg]
     with run_server(settings, fake_delay=0.8) as srv:
         yield srv
+
+
+def _done_track(server: LiveServer, tmp_path: Path, name: str = "用意した曲") -> tuple[int, int]:
+    """API で曲を取り込み・分割し、終わるまで待つ（track_id, job_id）。"""
+    src = write_source(tmp_path / f"{name}.wav", synth_mix(3.0), subtype="PCM_16")
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        res = c.post(
+            "/api/imports",
+            files={"file": (src.name, src.read_bytes(), "audio/wav")},
+            data={"separate": "true", "preset": "fast"},
+        )
+        assert res.status_code == 202, res.text
+        source_id = res.json()["source_id"]
+        deadline = time.monotonic() + 90
+        while True:
+            imp = c.get(f"/api/imports/{source_id}").json()
+            if imp["status"] == "done" and imp["job_id"]:
+                job = c.get(f"/api/jobs/{imp['job_id']}").json()
+                if job["status"] == "done":
+                    return imp["track_id"], job["job_id"]
+            assert imp["status"] != "failed", imp
+            assert time.monotonic() < deadline, "分割が終わりません"
+            time.sleep(0.2)
 
 
 @pytest.fixture(scope="module")
@@ -214,6 +238,25 @@ def test_full_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:
     assert page.locator(".stem-btn").count() == 8
 
     # 再生が始まる（AudioContext の時刻と再生位置が進む）
+    # 二重の play()（resume を待つ間の2回目）でも、音源は stem ごとに1つだけ
+    counts = page.evaluate(
+        """async () => {
+        const e = window.__stemapp.view.engine;
+        await Promise.all([e.play(), e.play(), e.play()]);
+        const playing = e.activeSources();
+        e.pause();
+        return [playing, e.activeSources(), e.playing];
+    }"""
+    )
+    assert counts == [len(LEAVES), 0, False]
+    # play() の直後に pause() したら鳴らさない
+    page.evaluate(
+        """async () => {
+        const e = window.__stemapp.view.engine;
+        const p = e.play(); e.pause(); await p;
+    }"""
+    )
+    assert page.evaluate("() => window.__stemapp.view.engine.activeSources()") == 0
     page.click("#play-btn")
     page.wait_for_function(
         "() => window.__stemapp.view.engine.playing && window.__stemapp.view.engine.position > 0.3",
@@ -323,6 +366,13 @@ def test_full_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:
     page.wait_for_function("() => !window.__stemapp.view.engine.playing")
     page.wait_for_timeout(100)
     assert _gains(page)["drums"] == before
+    # Space の押しっぱなし（repeat）は無視する
+    page.evaluate(
+        """() => document.dispatchEvent(new KeyboardEvent("keydown",
+            { key: " ", code: "Space", repeat: true, bubbles: true }))"""
+    )
+    page.wait_for_timeout(100)
+    assert page.evaluate("() => window.__stemapp.view.engine.playing") is False
 
     page.set_viewport_size(PHONE)
     page.wait_for_timeout(300)
@@ -331,22 +381,9 @@ def test_full_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:
     assert not page.errors  # type: ignore[attr-defined]
 
 
-def _only_track(server: LiveServer) -> tuple[int, int]:
-    with server.session_factory() as s:
-        track = s.scalars(select(Track).order_by(Track.track_id)).first()
-        assert track is not None
-        job = s.scalars(
-            select(SeparationJob).where(
-                SeparationJob.track_id == track.track_id, SeparationJob.status == "done"
-            )
-        ).first()
-        assert job is not None
-        return track.track_id, job.job_id
-
-
-def test_rebuild_delivery(page: Any, server: LiveServer) -> None:
+def test_rebuild_delivery(page: Any, server: LiveServer, tmp_path: Path) -> None:
     """配信用データが無いと知らせ、「作り直す」でワーカーが作り、再生できるようになる。"""
-    track_id, job_id = _only_track(server)
+    track_id, job_id = _done_track(server, tmp_path)
     with server.session_factory() as s:
         ids = select(Stem.stem_id).where(Stem.job_id == job_id)
         s.execute(
@@ -362,8 +399,8 @@ def test_rebuild_delivery(page: Any, server: LiveServer) -> None:
     assert not page.errors  # type: ignore[attr-defined]
 
 
-def test_delete_track(page: Any, server: LiveServer) -> None:
-    track_id, _ = _only_track(server)
+def test_delete_track(page: Any, server: LiveServer, tmp_path: Path) -> None:
+    track_id, _ = _done_track(server, tmp_path)
     page.goto(server.base_url + "/#/library")
     row = f".track-row[data-track-id='{track_id}']"
     page.wait_for_selector(row)
@@ -373,7 +410,7 @@ def test_delete_track(page: Any, server: LiveServer) -> None:
     assert page.locator(row).count() == 1
     page.click(f"{row} .btn:has-text('削除')")
     page.click(".modal .btn:has-text('削除する')")
-    page.wait_for_selector("text=まだ曲がありません")
+    page.wait_for_selector(row, state="detached")
     with server.session_factory() as s:
         assert s.get(Track, track_id) is None
 
@@ -398,3 +435,28 @@ def test_login_screen(browser: Any, tmp_path: Path) -> None:
         page.click("text=ログアウト")
         page.wait_for_selector("#passcode")
         ctx.close()
+
+
+def test_load_failure_aborts_rest(page: Any, server: LiveServer, tmp_path: Path) -> None:
+    """1つの stem の音声が読めなければ、残りの取得を中断して理由を出す。"""
+    track_id, _ = _done_track(server, tmp_path)
+    requested: list[str] = []
+    failed_once: list[str] = []
+
+    def handle(route: Any) -> None:
+        requested.append(route.request.url)
+        if not failed_once:
+            failed_once.append(route.request.url)
+            route.fulfill(status=500, content_type="application/json",
+                          body='{"detail": "テスト用の失敗"}')
+        else:
+            route.continue_()
+
+    page.route("**/api/files/renditions/*", handle)
+    page.goto(f"{server.base_url}/#/track/{track_id}")
+    page.wait_for_selector("text=読み込めませんでした", timeout=30_000)
+    assert "テスト用の失敗" in page.inner_text("#loading")
+    page.wait_for_timeout(500)
+    # 並行して取得していた分（最大 3）を除き、残りの stem は取りに行かない
+    assert len(requested) <= 3, requested
+    assert page.locator("#play-btn[disabled]").count() == 1

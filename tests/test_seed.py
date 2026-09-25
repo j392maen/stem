@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from stemapp import seed as seed_mod
@@ -224,6 +224,75 @@ def test_listen_preset_user_edits_kept(session: Session) -> None:
     seed(session)
     session.expire_all()
     assert session.get(ListenPresetItem, item.item_id).gain_db == -6.0  # type: ignore[union-attr]
+
+
+def _visible_presets(session: Session) -> list[ListenPreset]:
+    return list(
+        session.scalars(
+            select(ListenPreset)
+            .where(ListenPreset.hidden.is_(False))
+            .order_by(ListenPreset.listen_preset_id)
+        )
+    )
+
+
+def test_builtin_listen_presets_have_seed_code(session: Session) -> None:
+    seed(session)
+    codes = {p.seed_code: p.name for p in _visible_presets(session)}
+    assert codes == {d.code: d.name for d in seed_mod.LISTEN_PRESETS}
+
+
+def test_renamed_builtin_is_not_duplicated(session: Session) -> None:
+    """組み込みの名前を変えても、次の起動（seed）で同じものを作り直さない。"""
+    seed(session)
+    p = session.scalar(select(ListenPreset).where(ListenPreset.seed_code == "karaoke"))
+    assert p is not None
+    p.name = "わたしのカラオケ"
+    session.commit()
+    seed(session)
+    session.expire_all()
+    names = [x.name for x in _visible_presets(session)]
+    assert "わたしのカラオケ" in names and "カラオケ（伴奏）" not in names
+    assert len(names) == len(seed_mod.LISTEN_PRESETS)
+
+
+def test_hidden_builtin_is_not_restored(session: Session) -> None:
+    """削除（hidden）した組み込みは、次の起動で復活しない。"""
+    seed(session)
+    p = session.scalar(select(ListenPreset).where(ListenPreset.seed_code == "backing_only"))
+    assert p is not None
+    p.hidden = True
+    session.commit()
+    seed(session)
+    session.expire_all()
+    visible = [x.seed_code for x in _visible_presets(session)]
+    assert "backing_only" not in visible
+    count = session.scalar(
+        select(func.count())
+        .select_from(ListenPreset)
+        .where(ListenPreset.seed_code == "backing_only")
+    )
+    assert count == 1
+
+
+def test_legacy_presets_get_seed_code(session: Session) -> None:
+    """seed_code の無い古い DB: 同じ名前の行に seed_code を付け、重複して作らない。"""
+    seed(session)
+    for p in session.scalars(select(ListenPreset)):
+        p.seed_code = None
+    # 古い DB でユーザーが消していた組み込み（名前の行が無い）は、この移行で1度だけ作り直される
+    karaoke = session.scalar(select(ListenPreset).where(ListenPreset.name == "カラオケ（伴奏）"))
+    session.delete(karaoke)
+    user = ListenPreset(name="ユーザーの組み合わせ", sort_order=99)
+    session.add(user)
+    session.commit()
+    seed(session)
+    session.expire_all()
+    rows = _visible_presets(session)
+    assert sorted(p.seed_code or "" for p in rows) == sorted(
+        [d.code for d in seed_mod.LISTEN_PRESETS] + [""]
+    )
+    assert session.get(ListenPreset, user.listen_preset_id).seed_code is None  # type: ignore[union-attr]
 
 
 def _hue(color: str) -> float:

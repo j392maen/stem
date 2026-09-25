@@ -18,6 +18,9 @@ def test_old_db_gets_new_columns_and_keeps_rows(tmp_path: Path) -> None:
             conn.exec_driver_sql("ALTER TABLE separation_job DROP COLUMN cancel_requested")
             conn.exec_driver_sql("ALTER TABLE separation_job DROP COLUMN output_gain_db")
             conn.exec_driver_sql("ALTER TABLE separation_job DROP COLUMN postprocess_status")
+            conn.exec_driver_sql("DROP INDEX ux_listen_preset_seed_code")
+            conn.exec_driver_sql("ALTER TABLE listen_preset DROP COLUMN seed_code")
+            conn.exec_driver_sql("ALTER TABLE listen_preset DROP COLUMN hidden")
             conn.exec_driver_sql(
                 "INSERT INTO track (track_id, title, audio_hash, created_at) "
                 "VALUES (1, '古い曲', 'h1', '2026-01-01 00:00:00')"
@@ -34,6 +37,10 @@ def test_old_db_gets_new_columns_and_keeps_rows(tmp_path: Path) -> None:
 
         cols = {c["name"] for c in inspect(engine).get_columns("separation_job")}
         assert {"cancel_requested", "output_gain_db", "postprocess_status"} <= cols
+        lp_cols = {c["name"] for c in inspect(engine).get_columns("listen_preset")}
+        assert {"seed_code", "hidden"} <= lp_cols
+        indexes = {i["name"]: i for i in inspect(engine).get_indexes("listen_preset")}
+        assert indexes["ux_listen_preset_seed_code"]["unique"]
         with engine.connect() as conn:
             row = conn.execute(
                 text(
