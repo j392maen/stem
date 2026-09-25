@@ -23,8 +23,8 @@
 | CUE_POINT | cue_id PK, track_id FK, position_sec, loop_end_sec(null可), label, color |
 | BEAT_GRID | track_id PK FK, analyzer(解析器の名前と版。例 beat_this 1.1.0 final0), beats_json(拍の時刻・秒の配列), downbeats_json(小節の頭の時刻・秒の配列), time_signature(推定の拍子。1小節の拍数), created_at |
 | BEAT_ANCHOR | anchor_id PK, track_id FK, position_sec, kind(downbeat/beat), bar_number(null可), bpm(null可), created_at |
-| EXPORT | export_id PK, job_id FK, listen_preset_id FK(mix のみ), export_type(single/all/mix), format(wav/flac/mp3/zip), output_path, created_at |
-| EXPORT_ITEM | export_id PK FK, stem_id PK FK |
+| EXPORT | export_id PK, job_id FK, listen_preset_id FK(mix のみ), export_type(single/all/mix), format(wav/flac/mp3。all は ZIP にまとめ中身がこの形式), output_path, created_at, status(queued/running/done/failed), progress, stage, error_message, filename, bytes, mix_gain_db(mix で ±1 を超えたとき全体にかけた dB), finished_at |
+| EXPORT_ITEM | export_id PK FK, stem_id PK FK, gain_db(mix の音量) |
 | OFFLINE_CACHE | device_id PK FK, track_id PK FK, cached_at, bytes |
 
 制約:
