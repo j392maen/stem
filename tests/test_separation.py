@@ -26,8 +26,8 @@ from stemapp.seed import (
     SW,
     seed,
 )
-from stemapp.separation import FakeSeparator, is_oom_error
-from stemapp.separation.audio_separator_backend import map_outputs
+from stemapp.separation import FakeSeparator, is_oom_error, pipeline
+from stemapp.separation.audio_separator_backend import map_outputs, tta_combine
 from stemapp.separation.base import DEVICE_CPU, DEVICE_CUDA, OPT_CHUNK_SCALE
 from stemapp.separation.pipeline import (
     OomPolicy,
@@ -381,3 +381,62 @@ def test_map_outputs() -> None:
     assert set(map_outputs("multistem", {k: a for k in TOP})) == set(TOP)
     with pytest.raises(RuntimeError, match="対応づけられません"):
         map_outputs("multistem", {"kazoo": a})
+    # yaml で確認できていない名前は受け付けない
+    with pytest.raises(RuntimeError, match="対応づけられません"):
+        map_outputs("karaoke", {"Karaoke": a, "Instrumental": a})
+
+
+def test_tta_combine_undoes_inversion_and_swap(mix: np.ndarray) -> None:
+    # 左右で係数が違う偽の demix。左右入れ替えを戻し忘れると結果が変わる。
+    cl, cr = 0.2, 0.7
+    calls: list[np.ndarray] = []
+
+    def demix(x: np.ndarray) -> dict[str, np.ndarray]:
+        calls.append(x)
+        coef = np.array([cl, cr], dtype=np.float32)
+        return {"a": x * coef, "b": x * coef[::-1]}
+
+    out = tta_combine(demix, mix)
+    assert len(calls) == 3
+    np.testing.assert_array_equal(calls[1], -mix)
+    np.testing.assert_array_equal(calls[2], mix[:, ::-1])
+    # 元: (L*cl, R*cr)、反転を戻す: 同じ、入替を戻す: (L*cr, R*cl) → 平均
+    expect_a = mix * np.array([(2 * cl + cr) / 3, (2 * cr + cl) / 3])
+    expect_b = mix * np.array([(2 * cr + cl) / 3, (2 * cl + cr) / 3])
+    np.testing.assert_allclose(out["a"], expect_a, atol=1e-6)
+    np.testing.assert_allclose(out["b"], expect_b, atol=1e-6)
+    assert out["a"].dtype == np.float32
+
+    # 左右対称な demix なら TTA しても結果は同じ
+    same = tta_combine(lambda x: {"a": x * 0.5}, mix)
+    np.testing.assert_allclose(same["a"], mix * 0.5, atol=1e-6)
+
+
+def test_residual_before_correction_is_recorded(
+    seeded: Session, tmp_path: Path, mix: np.ndarray, caplog: pytest.LogCaptureFixture
+) -> None:
+    from stemapp.audio import rms_db
+
+    with caplog.at_level("INFO"):
+        out = run_plan(mix, load_plan(seeded, "fast"), FakeSeparator(), workdir=tmp_path)
+    # Fake の multistem 係数の合計は 0.97 → 残差は mixture の 0.03 倍
+    assert out.mixture_rms_db == pytest.approx(rms_db(mix), abs=1e-4)
+    assert out.residual_rms_db == pytest.approx(
+        out.mixture_rms_db + 20 * np.log10(0.03), abs=1e-3
+    )
+    assert "補正前の残差" in caplog.text
+
+
+def test_oom_frees_gpu_memory_before_retry(
+    seeded: Session, tmp_path: Path, mix: np.ndarray, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    freed: list[int] = []
+    sep = FakeSeparator(oom_times=3)
+    # 解放は例外ブロックを抜けたあと・次の呼び出しの前に行う
+    monkeypatch.setattr(pipeline, "free_gpu_memory", lambda: freed.append(len(sep.calls)))
+    run_plan(mix, load_plan(seeded, "fast"), sep, workdir=tmp_path)
+    assert freed == [1, 2, 3]
+
+
+def test_free_gpu_memory_runs() -> None:
+    pipeline.free_gpu_memory()  # torch の有無・GPU の有無にかかわらず例外を出さない

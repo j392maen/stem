@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,14 @@ from stemapp.separation.base import (
 log = logging.getLogger(__name__)
 
 # audio-separator の出力名（ファイル名の "(Vocals)" の部分。小文字で比較）→ stem 名。
-# role ごとに持つ。karaoke は "(Vocals)"=lead、"(Instrumental)"=それ以外。
+# role ごとに持つ。モデルの yaml（training.instruments）で確認できた名前だけを載せる。
+# - multistem: BS-Roformer-SW.yaml → bass, drums, other, vocals, guitar, piano
+# - vocals:    vocals_mel_band_roformer.yaml → vocals, other
+#              （mel_band_roformer_kim_ft_unwa も --list_models の stems は vocals, other）
+# - karaoke:   config_mel_band_roformer_karaoke_becruily.yaml /
+#              config_bs_roformer_karaoke_frazer_becruily.yaml → Vocals, Instrumental
+#              karaoke は "(Vocals)"=lead、"(Instrumental)"=それ以外。
+# 表に無い名前が出たらエラーにする（新しいモデルを足すときに yaml を見て追記する）。
 OUTPUT_NAME_MAP: dict[str, dict[str, str]] = {
     "multistem": {
         "vocals": "vocals",
@@ -45,17 +52,11 @@ OUTPUT_NAME_MAP: dict[str, dict[str, str]] = {
     },
     "vocals": {
         "vocals": "vocals",
-        "instrumental": "instrumental",
         "other": "instrumental",
-        "no vocals": "instrumental",
     },
     "karaoke": {
         "vocals": "lead_vocal",
-        "lead vocals": "lead_vocal",
-        "karaoke": "lead_vocal",
         "instrumental": "backing_vocal",
-        "other": "backing_vocal",
-        "no vocals": "backing_vocal",
     },
 }
 
@@ -79,6 +80,22 @@ def map_outputs(role: str, outputs: Mapping[str, np.ndarray]) -> dict[str, np.nd
             raise RuntimeError(f"出力「{name}」が {key} に重複して対応づけられました。")
         mapped[key] = arr
     return mapped
+
+
+Demix = Callable[[np.ndarray], dict[str, np.ndarray]]
+
+
+def tta_combine(demix: Demix, mix: np.ndarray) -> dict[str, np.ndarray]:
+    """TTA: 元の音・位相反転・左右入れ替えの3通りで分け、元に戻して平均する。
+
+    demix は (samples, 2) を受け取り {名前: (samples, 2)} を返す関数。
+    """
+    base = demix(mix)
+    inv = demix(-mix)
+    swp = demix(np.ascontiguousarray(mix[:, ::-1]))
+    return {
+        k: ((v - inv[k] + swp[k][:, ::-1]) / 3.0).astype(np.float32) for k, v in base.items()
+    }
 
 
 class AudioSeparatorBackend:
@@ -195,14 +212,7 @@ class AudioSeparatorBackend:
                     src = {target: src}
                 return {k: np.asarray(v, dtype=np.float32).T for k, v in src.items()}
 
-            outputs = demix(mix)
-            if options.get(OPT_TTA):
-                # TTA: 位相反転と左右入れ替えでも分け、元に戻して平均する
-                inv = demix(-mix)
-                swp = demix(mix[:, ::-1])
-                outputs = {
-                    k: (v - inv[k] + swp[k][:, ::-1]) / 3.0 for k, v in outputs.items()
-                }
+            outputs = tta_combine(demix, mix) if options.get(OPT_TTA) else demix(mix)
             mapped = map_outputs(role, outputs)
             return {k: _fit(v, n) for k, v in mapped.items()}
         finally:

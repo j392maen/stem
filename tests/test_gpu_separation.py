@@ -48,3 +48,40 @@ def test_fast_preset_on_gpu(session: Session, settings: Settings, tmp_path: Path
     assert np.max(np.abs(lb - audio["vocals"])) < 1e-4
     for r in res.steps:
         assert r.peak_memory_mb is not None and r.peak_memory_mb > 0
+
+
+@pytest.fixture
+def backend(settings: Settings):  # type: ignore[no-untyped-def]
+    from stemapp.separation.audio_separator_backend import AudioSeparatorBackend
+
+    return AudioSeparatorBackend(
+        models_dir=Settings().models_dir, work_dir=settings.cache_dir / "audio-separator"
+    )
+
+
+def test_residual_before_correction_is_small(
+    session: Session, backend: object, tmp_path: Path
+) -> None:
+    from stemapp.separation.pipeline import load_plan, run_plan
+
+    seed(session)
+    mix = synth_mix(12.0, amp=0.5)
+    out = run_plan(mix, load_plan(session, "fast"), backend, workdir=tmp_path)  # type: ignore[arg-type]
+    print(f"残差 {out.residual_rms_db:.1f} dBFS / mixture {out.mixture_rms_db:.1f} dBFS")
+    assert out.residual_rms_db <= out.mixture_rms_db - 15.0
+
+
+def test_silent_right_channel_stays_silent(
+    session: Session, backend: object, tmp_path: Path
+) -> None:
+    from stemapp.audio import rms_db
+    from stemapp.separation.pipeline import load_plan, run_plan
+
+    seed(session)
+    mix = synth_mix(12.0, amp=0.5)
+    mix[:, 1] = 0.0
+    out = run_plan(mix, load_plan(session, "fast"), backend, workdir=tmp_path)  # type: ignore[arg-type]
+    for code, arr in out.stems.items():
+        right = np.abs(arr[:, 1]).max()
+        print(f"{code}: 右 max {right:.2e} / 左 {rms_db(arr[:, 0]):.1f} dBFS")
+        assert right < 1e-4, f"{code} の右チャンネルに音が漏れている（max {right:.2e}）"

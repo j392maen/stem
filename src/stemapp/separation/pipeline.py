@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import shutil
 import time
@@ -30,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from stemapp.audio import (
+    SILENCE_FLOOR_DB,
     FfmpegRunner,
     count_clipped,
     normalize_audio,
@@ -180,6 +182,17 @@ class StepResult:
     attempts: list[str] = field(default_factory=list)  # やり直しの記録（日本語）
 
 
+def free_gpu_memory() -> None:
+    """使われなくなった GPU メモリを解放する（torch が無い環境では gc だけ）。"""
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def run_step(
     separator: Separator,
     step: StepSpec,
@@ -198,12 +211,14 @@ def run_step(
         opts = dict(step.options)
         if scale != 1.0:
             opts[OPT_CHUNK_SCALE] = scale
+        oom = False
         try:
             out = separator.separate(wav_path, step.model_filename, opts, dev, step.role)
             break
         except Exception as e:
             if not is_oom_error(e) or dev != DEVICE_CUDA:
                 raise
+            oom = True
             if shrinks < policy.max_shrinks:
                 shrinks += 1
                 new_scale = scale * policy.shrink_factor
@@ -223,6 +238,9 @@ def run_step(
                 raise
             log.warning(msg)
             attempts.append(msg)
+        if oom:
+            # 例外（とその traceback が持つ GPU テンソル）を手放してから解放する
+            free_gpu_memory()
     result = StepResult(
         order=step.order,
         model_filename=step.model_filename,
@@ -246,6 +264,9 @@ class SeparationOutput:
     top_level: list[str]  # 上位 stem の名前（合計が mixture になるもの）
     steps: list[StepResult]
     seconds: float
+    # 補正前の残差（mixture − 上位 stem の生出力の合計）と mixture の RMS（dBFS）
+    residual_rms_db: float = SILENCE_FLOOR_DB
+    mixture_rms_db: float = SILENCE_FLOOR_DB
 
     @property
     def peak_memory_mb(self) -> float | None:
@@ -357,7 +378,15 @@ def run_plan(
     top: dict[str, np.ndarray] = {name: multi[name].mean() for name in multi_order}
     top[VOCALS] = vocals_sum.mean()
     # 残差補正: 上位 stem の合計を元の曲に一致させる
-    top[OTHER] = top[OTHER] + (mix64 - sum(top.values()))
+    residual = mix64 - sum(top.values())
+    residual_db = rms_db(residual)
+    mixture_db = rms_db(mix64)
+    log.info(
+        "補正前の残差: %.1f dBFS（mixture %.1f dBFS、差 %.1f dB）。other に足します。",
+        residual_db, mixture_db, mixture_db - residual_db,
+    )
+    top[OTHER] = top[OTHER] + residual
+    del residual
     lead = lead_sum.mean()
     stems: dict[str, np.ndarray] = {name: arr.astype(np.float32) for name, arr in top.items()}
     stems[LEAD] = lead.astype(np.float32)
@@ -367,6 +396,8 @@ def run_plan(
         top_level=list(multi_order),
         steps=results,
         seconds=time.perf_counter() - t0,
+        residual_rms_db=residual_db,
+        mixture_rms_db=mixture_db,
     )
 
 
