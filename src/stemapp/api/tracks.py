@@ -18,10 +18,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from stemapp.api.common import SessionDep, iso, job_to_dict, not_found, preset_codes
+from stemapp.beats.service import beats_payload, get_grid
 from stemapp.config import Settings
 from stemapp.delivery import missing_delivery
 from stemapp.jobs import (
     ACTIVE_STATUSES,
+    DONE,
     FINISHED_STATUSES,
     QUEUED,
     RUNNING,
@@ -33,6 +35,7 @@ from stemapp.jobs import (
     request_postprocess,
 )
 from stemapp.models import (
+    BeatGrid,
     InputSource,
     SeparationJob,
     SeparationPreset,
@@ -176,6 +179,80 @@ def delete_track(
     return {"deleted": True, "track_id": track_id, "job_ids": job_ids}
 
 
+# --- 拍 ---------------------------------------------------------------------------
+
+# 作り直し（postprocess）の「欠けているもの」に入れる、拍が無いことの印
+MISSING_BEATS = "beats"
+
+
+@router.get("/tracks/{track_id}/beats")
+def get_beats(track_id: int, session: SessionDep) -> dict[str, Any]:
+    """拍・小節の頭・拍子・区間ごとの BPM。まだ解析していなければ 404。"""
+    if session.get(Track, track_id) is None:
+        raise not_found("曲")
+    grid = get_grid(session, track_id)
+    if grid is None:
+        raise HTTPException(status_code=404, detail="この曲の拍はまだ解析されていません。")
+    return beats_payload(grid)
+
+
+BEATS_MESSAGES = {
+    None: "拍の解析を登録しました。",
+    "active": "配信用データ・拍を作成待ち・作成中です。",
+}
+
+
+@router.post("/tracks/{track_id}/beats")
+def reanalyze_beats(track_id: int, response: Response, session: SessionDep) -> dict[str, Any]:
+    """拍を解析し直す（ワーカーが「作り直し」として処理する）。登録したら 202。
+
+    今の結果は消してから登録する（解析が終わるまで拍の無い曲として表示される）。
+    作り直しが作成待ち・作成中のときも拍は消す（ワーカーは作り直しの最後に拍の有無を見るので、
+    その作り直しの中で解析される）。分割が終わっていない曲は 409。
+    """
+    if session.get(Track, track_id) is None:
+        raise not_found("曲")
+    job = session.scalars(
+        select(SeparationJob)
+        .where(
+            SeparationJob.track_id == track_id,
+            SeparationJob.job_kind == "full",
+            SeparationJob.status == DONE,
+        )
+        .order_by(SeparationJob.job_id.desc())
+    ).first()
+    if job is None:
+        raise HTTPException(
+            status_code=409, detail="分割が終わっていない曲です。分割が終わると拍も解析されます。"
+        )
+    grid = session.get(BeatGrid, track_id)
+    if grid is not None:
+        session.delete(grid)
+        session.commit()
+    if job.postprocess_status in ACTIVE_STATUSES:
+        res_job, created, reason = job, False, "active"
+    else:
+        res = request_postprocess(session, job.job_id, [MISSING_BEATS])
+        res_job, created, reason = res.job, res.created, res.reason
+    response.status_code = 202 if created else 200
+    return {
+        "created": created,
+        "reason": reason,
+        "message": BEATS_MESSAGES.get(reason, ""),
+        "job": job_to_dict(res_job, preset_codes(session)),
+    }
+
+
+def _missing_for_postprocess(session: Session, job: SeparationJob) -> list[str]:
+    """作り直しで作るもの（配信用データが欠けた stem と、拍が無ければ "beats"）。"""
+    if job.status != DONE:
+        return []
+    missing = missing_delivery(session, job.job_id)
+    if get_grid(session, job.track_id) is None:
+        missing.append(MISSING_BEATS)
+    return missing
+
+
 # --- ジョブ -------------------------------------------------------------------------
 
 
@@ -262,12 +339,13 @@ POSTPROCESS_MESSAGES = {
 
 @router.post("/jobs/{job_id}/postprocess")
 def postprocess_job(job_id: int, response: Response, session: SessionDep) -> dict[str, Any]:
-    """配信用データ（stream rendition・peaks）が欠けているとき、ワーカーで作り直す。
+    """配信用データ（stream rendition・peaks）や拍が欠けているとき、ワーカーで作り直す。
 
     登録したら 202、欠けていない・作成待ちなら 200。done 以外のジョブは 409。
+    missing には欠けている stem の code と、拍が無ければ "beats" が入る。
     """
     job = _get_job(session, job_id)
-    missing = missing_delivery(session, job_id) if job.status == "done" else []
+    missing = _missing_for_postprocess(session, job)
     try:
         res = request_postprocess(session, job_id, missing)
     except JobNotFound as e:
@@ -398,6 +476,7 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
         "status": job.status,
         "output_gain_db": job.output_gain_db,
         "postprocess_status": job.postprocess_status,
+        "beat_warning": job.beat_warning,
         # 配信用データ（stream と全解像度の peaks）がそろっているか
         "delivery_ready": job.status == "done" and not missing,
         "delivery_missing": missing,

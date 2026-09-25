@@ -238,6 +238,19 @@ select:focus-visible, .play-btn:focus-visible {
   font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; letter-spacing: 0.02em;
 }
 .time .muted { font-size: 14px; font-weight: 400; }
+/* 再生位置の BPM と拍子。数字は白、単位と拍子は控えめに（差し色の赤は使わない） */
+.tempo {
+  display: flex; align-items: baseline; gap: 5px; padding: 4px 10px;
+  border: 1px solid var(--line); border-radius: 6px; background: #111115;
+  font-variant-numeric: tabular-nums; cursor: default;
+}
+.tempo .bpm { font-size: 18px; font-weight: 600; min-width: 4.2ch; text-align: right; }
+.tempo .unit { font-size: 10px; letter-spacing: 0.12em; color: var(--muted); }
+.tempo .meter {
+  font-size: 11px; color: var(--muted); margin-left: 4px; padding-left: 7px;
+  border-left: 1px solid var(--line);
+}
+.tempo.none .bpm { color: var(--faint); }
 .volume { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .volume input { width: 120px; accent-color: var(--accent); }
 
@@ -336,5 +349,6 @@ select:focus-visible, .play-btn:focus-visible {
   .volume { margin-left: 0; width: 100%; }
   .volume input { flex: 1; }
   .time { font-size: 17px; }
+  .tempo .bpm { font-size: 16px; }
   .keys-help { display: none; }
 }
