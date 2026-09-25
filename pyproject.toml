@@ -77,8 +77,9 @@ select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not gpu'"
+addopts = "-m 'not gpu and not browser'"
 markers = [
     "gpu: 実 GPU（CUDA）が必要なテスト。`uv run pytest -m gpu` で実行する",
     "ffmpeg: ffmpeg コマンドが必要なテスト",
+    "browser: PC の Microsoft Edge（Playwright）で画面を動かすテスト。`uv run pytest -m browser` で実行する",
 ]
