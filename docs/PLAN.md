@@ -8,7 +8,7 @@
 | T01 | 基盤 | リポジトリ骨格、設定、DB モデル全実体、初期データ投入、`stemapp doctor`、Windows 用 setup/start スクリプト | `uv run pytest`（GPU テスト含む）と `uv run ruff check` が通る。doctor で GPU・ffmpeg・yt-dlp.exe・deno が OK | 完了（2026-09-25） |
 | T02 | 分離パイプライン（CLI） | 音声正規化、Separator 抽象、audio-separator 実装、Fake 実装、fast/standard/best、残差補正、OOM 再試行、`stemapp separate` / `stemapp bench` | Fake で合計一致テスト。PC で4分の曲が standard で完走し時間を記録 | 完了（2026-09-25） |
 | T03 | 取り込み | ファイル取り込み（重複検出）、URL 取得（yt-dlp）と失敗理由の分類 | 分類ロジックのテスト。PC で URL 取得を確認 | 完了（2026-09-25） |
-| T04 | ジョブと API | ワーカープロセス、進捗配信、キャンセル、後処理（Opus・波形 peaks）、REST API、パスコード認証 | API テスト。PC で分割→API で stem 取得 | 実装中 |
+| T04 | ジョブと API | ワーカープロセス、進捗配信、キャンセル、後処理（Opus・波形 peaks）、REST API、パスコード認証 | API テスト。PC で分割→API で stem 取得 | 完了（2026-09-25） |
 | T05 | 再生 UI | ライブラリ、マルチトラック再生、組み合わせ切替、グループ・組み合わせプリセット、DJ 風波形、キュー・ループ | ブラウザで同期再生と即時切替 | 未着手 |
 | T06 | iPhone・外出先 | PWA、Tailscale 手順、通知、続きから再生、オフライン保存、ロック画面モード | iPhone 実機で外出先から再生 | 未着手 |
 | T07 | 詳細分割 | refine ジョブ（DrumSep、男女、息、Mega 53）、「もっと分ける」UI | 子 stem の合計一致。PC で実行 | 未着手 |
@@ -29,3 +29,8 @@
 - T04（T03 レビューより）: 同じ音を同時に取り込むと audio_hash の一意制約違反になる。IntegrityError なら探し直して既存扱いにする。
 - T04/T05: 同じ URL の失敗が INPUT_SOURCE に溜まる。UI での見せ方（まとめるか）を決める。曲の削除機能では tracks/<id> フォルダも消す。
 - 随時: URL 失敗の理由分類で誤りが見つかったら規則を足す（"is not available" は広めの規則）。
+- T05（T04 より）: Opus の先頭の無音（pre-skip）で stem 同士がずれないか確かめる。SSE は終わった状態を受けたら EventSource.close()。/api/me の 401 でログイン画面を出す。
+- T05 以降（T04 より）: CLI の `stemapp separate` は配信用データ（Opus・peaks）を作らない。CLI もジョブ登録に揃えるか決める（CLI とワーカーの同時実行は前提にしない）。
+- T05 以降（T04 より）: 曲・ジョブ削除後に SQLite が番号を再利用する（stems/<id> の混在の恐れ）。AUTOINCREMENT 化を検討。
+- 随時（T04 より）: ワーカーが落ちても serve は動き続ける。/api/health にワーカー状態を出すか、serve が再起動する。外部コマンドは必ず proc.run_bound / popen_bound で起動する。
+- 随時（T04 より）: ログアウトは Cookie を消すだけ（トークンは30日有効。パスコード変更で全無効）。
