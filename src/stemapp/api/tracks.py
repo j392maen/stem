@@ -33,6 +33,7 @@ from stemapp.jobs import (
 from stemapp.models import (
     InputSource,
     SeparationJob,
+    SeparationPreset,
     Stem,
     StemRendition,
     StemType,
@@ -61,10 +62,17 @@ def _jobs_by_track(session: Session) -> dict[int, list[SeparationJob]]:
 
 
 def _track_summary(
-    track: Track, jobs: list[SeparationJob], presets: dict[int, str]
+    track: Track, jobs: list[SeparationJob], presets: dict[int, SeparationPreset]
 ) -> dict[str, Any]:
     """jobs はその曲のジョブ（新しい順）。"""
-    playable = next((j for j in jobs if j.job_kind == "full" and j.status == "done"), None)
+    done = [j for j in jobs if j.job_kind == "full" and j.status == "done"]
+
+    def experimental(j: SeparationJob) -> bool:
+        p = presets.get(j.preset_id) if j.preset_id is not None else None
+        return bool(p is not None and p.is_experimental)
+
+    # 実験プリセット（聴き比べ用）のジョブは、ほかに完了したジョブがあれば既定にしない
+    playable = next((j for j in done if not experimental(j)), done[0] if done else None)
     return {
         "track_id": track.track_id,
         "title": track.title,
@@ -72,7 +80,7 @@ def _track_summary(
         "duration_sec": track.duration_sec,
         "created_at": iso(track.created_at),
         "latest_job": job_to_dict(jobs[0], presets) if jobs else None,
-        # 再生に使うジョブ（完了した full ジョブのうち新しいもの）
+        # 再生に使う既定のジョブ（完了した full ジョブのうち新しいもの。実験プリセットは後回し）
         "playable_job_id": playable.job_id if playable is not None else None,
     }
 

@@ -551,10 +551,10 @@ def test_switch_separation_job(page: Any, server: LiveServer, tmp_path: Path) ->
     page.goto(f"{server.base_url}/#/track/{track_id}")
     page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
     view = "window.__stemapp.view"
-    # 新しい方（実験）が選ばれ、切り替えの選択肢は2つ
-    assert page.evaluate(f"() => {view}.jobId") == exp_job
+    # 既定は実験でない方。切り替えの選択肢は2つ
+    assert page.evaluate(f"() => {view}.jobId") == fast_job
     assert page.locator("#job-select option").count() == 2
-    assert page.input_value("#job-select") == str(exp_job)
+    assert page.input_value("#job-select") == str(fast_job)
     assert "実験: 残差をボーカルへ" in page.inner_text("#job-select")
     assert "補正前の残差" in page.inner_text("#job-metric")
 
@@ -564,15 +564,15 @@ def test_switch_separation_job(page: Any, server: LiveServer, tmp_path: Path) ->
     page.evaluate(f"() => {view}.seek(1.5)")
     page.click("#play-btn")
     page.wait_for_function(f"() => {view}.engine.playing")
-    page.select_option("#job-select", str(fast_job))
+    page.select_option("#job-select", str(exp_job))
     page.wait_for_function(
-        f"() => {view}.jobId === {fast_job} && {view}.ready && {view}.engine.playing",
+        f"() => {view}.jobId === {exp_job} && {view}.ready && {view}.engine.playing",
         timeout=60_000,
     )
     pos = page.evaluate(f"() => {view}.engine.position")
     assert 1.4 < pos < 3.0, pos  # 再生位置を保つ（読み込みの間は止まっている）
     _wait_gains(page, {"drums": 0.0, "bass": 1.0, "lead_vocal": 1.0})  # 選択を保つ
-    assert page.input_value("#job-select") == str(fast_job)
+    assert page.input_value("#job-select") == str(exp_job)
     page.click("#play-btn")  # 止める
 
     # 数値の比較（stem ごとの RMS と残差）
@@ -587,13 +587,13 @@ def test_switch_separation_job(page: Any, server: LiveServer, tmp_path: Path) ->
     # 選んだ分け方は覚えている（読み直しても同じ）
     page.reload()
     page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
-    assert page.evaluate(f"() => {view}.jobId") == fast_job
+    assert page.evaluate(f"() => {view}.jobId") == exp_job
     assert not page.errors  # type: ignore[attr-defined]
 
-    # ジョブを消したら、残った方を再生する
+    # 選んでいたジョブを消したら、残った方を再生する
     with httpx.Client(base_url=server.base_url, timeout=30) as c:
-        assert c.delete(f"/api/jobs/{fast_job}").status_code == 200
+        assert c.delete(f"/api/jobs/{exp_job}").status_code == 200
     page.reload()
     page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
-    assert page.evaluate(f"() => {view}.jobId") == exp_job
+    assert page.evaluate(f"() => {view}.jobId") == fast_job
     assert page.locator("#job-select[disabled]").count() == 1
