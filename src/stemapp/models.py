@@ -60,6 +60,7 @@ class InputSource(Base):
     # network / needs_update / unknown
     error_code: Mapped[str | None] = mapped_column(String(40))
     error_detail: Mapped[str | None] = mapped_column(Text)
+    # 成功時は取得（取り込み）した時刻、失敗時は取得を試みた時刻
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 

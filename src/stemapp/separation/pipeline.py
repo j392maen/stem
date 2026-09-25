@@ -9,8 +9,9 @@
 3. backing = vocals − lead（残差）。
 4. other += mixture − Σ上位 stem。これで上位 stem の合計が元の曲に一致する。
 
-`run_plan` は DB を触らない計算部分（bench でも使う）。`separate_file` が正規化・DB 登録・
-ファイル保存まで行う。
+`run_plan` は DB を触らない計算部分（bench でも使う）。`separate_track` が取り込み済みの曲を
+分割して DB 登録・ファイル保存まで行う。`separate_file` は取り込み（`stemapp.ingest`）→
+`separate_track` を順に呼ぶ。
 """
 
 from __future__ import annotations
@@ -34,12 +35,14 @@ from stemapp.audio import (
     SILENCE_FLOOR_DB,
     FfmpegRunner,
     count_clipped,
-    normalize_audio,
+    read_audio,
     rms_db,
     write_flac24,
     write_wav_float,
 )
 from stemapp.config import Settings
+from stemapp.ingest.service import TagReader, import_file
+from stemapp.library import data_relative, find_done_job, resolve_data_path
 from stemapp.models import (
     Model,
     PresetStep,
@@ -426,31 +429,8 @@ class SeparateResult:
     steps: list[StepResult] = field(default_factory=list)
 
 
-def data_relative(settings: Settings, path: Path) -> str:
-    """DB に保存するパス（データフォルダからの相対、/ 区切り）。"""
-    return path.resolve().relative_to(settings.data_dir.resolve()).as_posix()
-
-
-def resolve_data_path(settings: Settings, stored: str) -> Path:
-    """DB に保存したパスを実際のパスにする（相対ならデータフォルダ基準）。"""
-    p = Path(stored)
-    return p if p.is_absolute() else settings.data_dir / p
-
-
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-def find_done_job(session: Session, track_id: int) -> SeparationJob | None:
-    return session.scalars(
-        select(SeparationJob)
-        .where(
-            SeparationJob.track_id == track_id,
-            SeparationJob.job_kind == "full",
-            SeparationJob.status == "done",
-        )
-        .order_by(SeparationJob.job_id.desc())
-    ).first()
 
 
 def stems_of_job(session: Session, settings: Settings, job_id: int) -> list[StemInfo]:
@@ -569,45 +549,77 @@ def separate_file(
     progress: ProgressCallback | None = None,
     oom_policy: OomPolicy | None = None,
     ffmpeg_runner: FfmpegRunner | None = None,
+    tag_reader: TagReader | None = None,
 ) -> SeparateResult:
-    """1曲を正規化・分割し、ファイルと DB に保存する。
+    """1曲を取り込み（`import_file`）、分割してファイルと DB に保存する。
 
     同じ audio_hash の TRACK に完了済みの full ジョブがあれば、force でない限り分割しない。
     失敗したら JOB を failed にして SeparationError を投げる。
     """
     t0 = time.perf_counter()
+    load_plan(session, preset_code)  # プリセットの誤りは取り込む前に知らせる
+    imported = import_file(
+        session,
+        settings,
+        src,
+        title=title,
+        ffmpeg_runner=ffmpeg_runner,
+        tag_reader=tag_reader,
+    )
+    return separate_track(
+        session,
+        settings,
+        imported.track_id,
+        separator,
+        preset_code=preset_code,
+        force=force,
+        device=device,
+        progress=progress,
+        oom_policy=oom_policy,
+        started=t0,
+    )
+
+
+def separate_track(
+    session: Session,
+    settings: Settings,
+    track_id: int,
+    separator: Separator,
+    *,
+    preset_code: str | None = None,
+    force: bool = False,
+    device: str = DEVICE_CUDA,
+    progress: ProgressCallback | None = None,
+    oom_policy: OomPolicy | None = None,
+    started: float | None = None,
+) -> SeparateResult:
+    """取り込み済みの曲を分割する。完了済みの full ジョブがあれば、force でない限り分割しない。"""
+    t0 = time.perf_counter() if started is None else started
     plan = load_plan(session, preset_code)
+    track = session.get(Track, track_id)
+    if track is None:
+        raise SeparationError(f"曲が見つかりません（track {track_id}）。")
+    if not force:
+        done = find_done_job(session, track.track_id)
+        if done is not None:
+            log.info("分割済みの曲です（track %d, job %d）。", track.track_id, done.job_id)
+            return SeparateResult(
+                track_id=track.track_id,
+                job_id=done.job_id,
+                skipped=True,
+                stems=stems_of_job(session, settings, done.job_id),
+                seconds=time.perf_counter() - t0,
+            )
+    if not track.normalized_path:
+        raise SeparationError(f"正規化した音声がありません（track {track_id}）。")
+    normalized_path = resolve_data_path(settings, track.normalized_path)
+    try:
+        mix = read_audio(normalized_path)
+    except Exception as e:
+        raise SeparationError(f"正規化した音声を読めません: {normalized_path}: {e}") from e
 
     tmp_dir = settings.cache_dir / "tmp" / uuid.uuid4().hex
     try:
-        norm = normalize_audio(src, tmp_dir / "normalized.wav", runner=ffmpeg_runner)
-        track = session.scalars(select(Track).where(Track.audio_hash == norm.audio_hash)).first()
-        if track is not None and not force:
-            done = find_done_job(session, track.track_id)
-            if done is not None:
-                log.info("分割済みの曲です（track %d, job %d）。", track.track_id, done.job_id)
-                return SeparateResult(
-                    track_id=track.track_id,
-                    job_id=done.job_id,
-                    skipped=True,
-                    stems=stems_of_job(session, settings, done.job_id),
-                    seconds=time.perf_counter() - t0,
-                )
-
-        if track is None:
-            track = Track(
-                title=title or src.stem,
-                audio_hash=norm.audio_hash,
-                duration_sec=norm.duration_sec,
-            )
-            session.add(track)
-            session.flush()
-        track_dir = settings.tracks_dir / str(track.track_id)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        normalized_path = track_dir / "normalized.wav"
-        shutil.move(str(norm.path), str(normalized_path))
-        track.normalized_path = data_relative(settings, normalized_path)
-
         job = SeparationJob(
             track_id=track.track_id,
             job_kind="full",
@@ -631,7 +643,7 @@ def separate_file(
         try:
             set_progress(0.02, "分離の準備中")
             output = run_plan(
-                norm.data,
+                mix,
                 plan,
                 separator,
                 workdir=tmp_dir,
