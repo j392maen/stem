@@ -1,6 +1,7 @@
 // 画面の入口: ログインの確認と、ハッシュでの画面切り替え（#/library, #/track/<id>）。
 
 import { api, onUnauthorized } from "./api.js";
+import * as beatsMod from "./beats.js";
 import * as engineMod from "./engine.js";
 import { LibraryView } from "./library.js";
 import * as peaksMod from "./peaks.js";
@@ -16,7 +17,7 @@ let passcodeRequired = false;
 // テスト・動作確認用（ブラウザのテストが状態を読む）
 window.__stemapp = {
   get view() { return current; },
-  modules: { peaks: peaksMod, selection: selectionMod, engine: engineMod },
+  modules: { peaks: peaksMod, selection: selectionMod, engine: engineMod, beats: beatsMod },
 };
 
 function renderNav() {

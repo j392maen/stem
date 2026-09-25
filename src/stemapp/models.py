@@ -1,4 +1,4 @@
-"""DB モデル（docs/ER.md の全20実体）。
+"""DB モデル（docs/ER.md の全22実体）。
 
 列挙的な値（status 等）は文字列で保存し、取りうる値はコメントに書く。
 """
@@ -181,6 +181,9 @@ class SeparationJob(Base):
     # 補正前の残差（mixture − 上位 stem の生出力の合計）と mixture の RMS（dBFS）。聴き比べの参考
     residual_rms_db: Mapped[float | None] = mapped_column(Float)
     mixture_rms_db: Mapped[float | None] = mapped_column(Float)
+    # 拍の解析に失敗したときの警告（画面に出す）。拍が無くても再生はできるのでジョブは done のまま。
+    # 解析に成功すると NULL に戻す
+    beat_warning: Mapped[str | None] = mapped_column(Text)
 
 
 class Stem(Base):
@@ -316,6 +319,44 @@ class CuePoint(Base):
     color: Mapped[str | None] = mapped_column(String(7))
 
 
+# --- 拍・小節 --------------------------------------------------------------------
+
+
+class BeatGrid(Base):
+    """曲の拍・小節の頭の自動解析の結果（再解析で上書きする）。
+
+    区間ごとの BPM は保存せず、beats から毎回計算する（`stemapp.beats.tempo`）。
+    ユーザーの補正は BEAT_ANCHOR に別に持つ（再解析で消さない）。
+    """
+
+    __tablename__ = "beat_grid"
+
+    track_id: Mapped[int] = mapped_column(
+        ForeignKey("track.track_id", ondelete="CASCADE"), primary_key=True
+    )
+    analyzer: Mapped[str] = mapped_column(String(100))  # 名前と版（例 "beat_this 1.1.0 final0"）
+    beats_json: Mapped[Any] = mapped_column(JSON)  # 拍の時刻（秒）の配列
+    downbeats_json: Mapped[Any] = mapped_column(JSON)  # 小節の頭の時刻（秒）の配列
+    time_signature: Mapped[int | None] = mapped_column(Integer)  # 推定の拍子（1小節の拍数。例 4）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BeatAnchor(Base):
+    """拍の手動補正の目印（T10c で使う。ワープマーカーと同じ考え方）。"""
+
+    __tablename__ = "beat_anchor"
+
+    anchor_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    track_id: Mapped[int] = mapped_column(
+        ForeignKey("track.track_id", ondelete="CASCADE"), index=True
+    )
+    position_sec: Mapped[float] = mapped_column(Float)
+    kind: Mapped[str] = mapped_column(String(10))  # downbeat / beat
+    bar_number: Mapped[int | None] = mapped_column(Integer)
+    bpm: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class OfflineCache(Base):
     __tablename__ = "offline_cache"
 
@@ -377,6 +418,8 @@ ALL_MODELS: tuple[type[Base], ...] = (
     ListenPresetItem,
     PlaybackState,
     CuePoint,
+    BeatGrid,
+    BeatAnchor,
     Export,
     ExportItem,
     OfflineCache,

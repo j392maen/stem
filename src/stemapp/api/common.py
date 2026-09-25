@@ -61,6 +61,7 @@ def job_to_dict(job: SeparationJob, presets: dict[int, SeparationPreset]) -> dic
         "output_gain_db": job.output_gain_db,
         "error_message": job.error_message,
         "postprocess_status": job.postprocess_status,
+        "beat_warning": job.beat_warning,
         "created_at": iso(job.created_at),
         "started_at": iso(job.started_at),
         "finished_at": iso(job.finished_at),

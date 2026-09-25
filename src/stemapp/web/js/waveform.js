@@ -2,7 +2,11 @@
 // - 概観: 曲全体。選択中の stem を stem 色で重ね、非選択は暗い灰色。再生済みの部分は暗くする。
 // - 拡大: 再生位置を中央に固定して流れる。表示の秒数は変えられる（zoomSeconds）。
 // 解像度（samples_per_px）は表示の幅に合わせて選ぶ（peaks.js）。
+// 拍が解析済みなら、拡大の目盛りを拍の線（細く暗め）と小節線（やや太く明るめ＋小節番号）にし、
+// 概観にも小節線を間引いて描く。拍が無ければ拡大は1秒目盛りのまま。
+// 線は stem の波形より先に描き（波形が上）、差し色の赤（再生位置・ループ）は使わない。
 
+import { thinStep } from "./beats.js";
 import { chooseOverviewLevel, chooseZoomLevel, rangeMinMax } from "./peaks.js";
 
 const COLORS = {
@@ -14,7 +18,18 @@ const COLORS = {
   loop: "rgba(158, 27, 44, 0.32)",
   loopEdge: "#9e1b2c",
   center: "rgba(255, 255, 255, 0.06)",
+  beat: "#202029",
+  bar: "rgba(196, 198, 214, 0.30)",
+  barNumber: "rgba(196, 198, 214, 0.62)",
+  overviewBar: "rgba(196, 198, 214, 0.16)",
 };
+
+// 線どうしの最小の間隔（CSS px）。これより狭くなるなら間引く
+const MIN_BEAT_GAP_PX = 6;
+const MIN_BAR_NUMBER_GAP_PX = 34;
+const MIN_OVERVIEW_BAR_GAP_PX = 22;
+// 概観の小節線の間引きの単位（小節）
+const OVERVIEW_BAR_STEPS = [8, 16, 32, 64, 128];
 
 export const ZOOM_STEPS = [2, 4, 8, 16, 32];
 
@@ -58,8 +73,9 @@ export class WaveformView {
    * layers: [{ code, color, peaks: Map(spp → parsed) }]（葉の stem だけ。表示順）
    * getState(): { position, duration, sel: Set, cues: [], loop: {start,end}|null, preview: 秒|null }
    * onSeek(sec): シークの確定
+   * beatGrid: BeatGrid（beats.js）。無ければ null（1秒目盛り）
    */
-  constructor({ overview, zoom, layers, sampleRate, totalSamples, getState, onSeek }) {
+  constructor({ overview, zoom, layers, sampleRate, totalSamples, getState, onSeek, beatGrid = null }) {
     this.overview = overview;
     this.zoom = zoom;
     this.layers = layers;
@@ -67,6 +83,7 @@ export class WaveformView {
     this.totalSamples = totalSamples;
     this.getState = getState;
     this.onSeek = onSeek;
+    this.beatGrid = beatGrid && !beatGrid.empty ? beatGrid : null;
     this.zoomSeconds = 8;
     this.overviewCache = document.createElement("canvas");
     this.overviewKey = "";
@@ -82,6 +99,11 @@ export class WaveformView {
 
   setZoom(seconds) {
     this.zoomSeconds = seconds;
+  }
+
+  setBeatGrid(grid) {
+    this.beatGrid = grid && !grid.empty ? grid : null;
+    this.overviewKey = ""; // 概観を描き直す
   }
 
   // --- 描画 ------------------------------------------------------------------
@@ -117,7 +139,54 @@ export class WaveformView {
     ctx.fillRect(0, 0, c.width, c.height);
     const spp = chooseOverviewLevel(this.levels, this.totalSamples, c.width);
     const secPerPx = this.duration / c.width;
+    this.overviewBarStep = this.beatGrid ? this._drawOverviewBars(ctx, c.width, c.height, secPerPx) : 0;
     this._drawLayers(ctx, c.width, c.height, sel, (x) => x * secPerPx, spp);
+  }
+
+  /** 概観の小節線（8・16・32… 小節ごと。表示幅に応じて間引く）。間引きの単位を返す。 */
+  _drawOverviewBars(ctx, width, height, secPerPx) {
+    const grid = this.beatGrid;
+    const dpr = window.devicePixelRatio || 1;
+    const step = thinStep(grid.meanBarSec / secPerPx, MIN_OVERVIEW_BAR_GAP_PX * dpr, OVERVIEW_BAR_STEPS);
+    ctx.fillStyle = COLORS.overviewBar;
+    const w = Math.max(1, Math.round(dpr));
+    for (let i = 0; i < grid.downbeats.length; i += step) {
+      ctx.fillRect(Math.round(grid.downbeats[i] / secPerPx), 0, w, height);
+    }
+    return step;
+  }
+
+  /** 拡大の拍の線と小節線（波形の下に描く）。小節番号は波形の後に描くので位置を返す。 */
+  _drawBeatGrid(ctx, width, height, t0, t1, xOf, secPerPx) {
+    const grid = this.beatGrid;
+    const dpr = window.devicePixelRatio || 1;
+    // 拍の線: 間隔が狭すぎるときは描かない（小節線だけにする）
+    if (grid.meanBeatSec / secPerPx >= MIN_BEAT_GAP_PX * dpr) {
+      ctx.fillStyle = COLORS.beat;
+      const [b0, b1] = grid.beatRange(t0, t1);
+      for (let i = b0; i < b1; i++) ctx.fillRect(Math.round(xOf(grid.beats[i])), 0, Math.max(1, Math.round(dpr)), height);
+    }
+    const [d0, d1] = grid.barRange(t0, t1);
+    const barW = Math.max(2, Math.round(1.5 * dpr));
+    const numberStep = thinStep(grid.meanBarSec / secPerPx, MIN_BAR_NUMBER_GAP_PX * dpr);
+    ctx.fillStyle = COLORS.bar;
+    const labels = [];
+    for (let i = d0; i < d1; i++) {
+      const x = Math.round(xOf(grid.downbeats[i]) - barW / 2);
+      ctx.fillRect(x, 0, barW, height);
+      if (i % numberStep === 0) labels.push([x + barW + 3 * dpr, i + 1]);
+    }
+    this.zoom.dataset.bars = String(d1 - d0);
+    return labels;
+  }
+
+  _drawBarNumbers(ctx, labels) {
+    if (!labels.length) return;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.fillStyle = COLORS.barNumber;
+    ctx.font = `600 ${10 * dpr}px system-ui, "Segoe UI", sans-serif`;
+    ctx.textBaseline = "top";
+    for (const [x, n] of labels) ctx.fillText(String(n), x, 3 * dpr);
   }
 
   _drawMarkers(ctx, width, height, xOf, state) {
@@ -182,17 +251,26 @@ export class WaveformView {
       const t0 = pos - (w / 2) * secPerPx;
       const timeAt = (x) => t0 + x * secPerPx;
       const xOf = (t) => (t - t0) / secPerPx;
-      // 1秒ごとの目盛り
-      ctx.fillStyle = COLORS.grid;
-      const step = this.zoomSeconds > 16 ? 5 : 1;
-      for (let s = Math.ceil(t0 / step) * step; s < timeAt(w); s += step) {
-        if (s >= 0 && s <= this.duration) ctx.fillRect(Math.round(xOf(s)), 0, 1, h);
+      let labels = [];
+      if (this.beatGrid) {
+        // 拍の線と小節線
+        labels = this._drawBeatGrid(ctx, w, h, t0, timeAt(w), xOf, secPerPx);
+        this.zoom.dataset.grid = "beats";
+      } else {
+        // 1秒ごとの目盛り
+        ctx.fillStyle = COLORS.grid;
+        const step = this.zoomSeconds > 16 ? 5 : 1;
+        for (let s = Math.ceil(t0 / step) * step; s < timeAt(w); s += step) {
+          if (s >= 0 && s <= this.duration) ctx.fillRect(Math.round(xOf(s)), 0, 1, h);
+        }
+        this.zoom.dataset.grid = "seconds";
       }
       ctx.fillStyle = COLORS.center;
       ctx.fillRect(0, h / 2, w, 1);
       this._drawMarkers(ctx, w, h, xOf, state);
       const spp = chooseZoomLevel(this.levels, secPerPx * this.sampleRate);
       this._drawLayers(ctx, w, h, state.sel, timeAt, spp);
+      this._drawBarNumbers(ctx, labels);
       const dpr = window.devicePixelRatio || 1;
       ctx.fillStyle = COLORS.playhead;
       ctx.fillRect(Math.round(w / 2 - dpr), 0, 2 * dpr, h);
