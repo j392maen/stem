@@ -361,15 +361,18 @@ def test_failure_marks_job_failed(seeded: Session, settings: Settings, src: Path
     assert res.skipped is False and res.job_id != job.job_id
 
 
-def test_clipping_is_logged(
+def test_loud_stem_is_limited_not_clipped(
     seeded: Session, settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """stem が ±1 を超えるときは全体に倍率をかけるので、FLAC 保存で切り詰めが起きない。"""
     loud = synth_mix(1.0, amp=0.95)
     src = write_source(tmp_path / "loud.wav", loud)
     sep = FakeSeparator(multistem_coefs={**dict.fromkeys(TOP, 0.0), "vocals": 1.5, "other": 0.0})
     with caplog.at_level("WARNING"):
-        _run(seeded, settings, src, sep, preset_code="fast")
-    assert "クリップ" in caplog.text
+        res = _run(seeded, settings, src, sep, preset_code="fast")
+    assert "クリップ" not in caplog.text
+    job = seeded.get(SeparationJob, res.job_id)
+    assert job is not None and job.output_gain_db < 0.0
 
 
 def test_map_outputs() -> None:

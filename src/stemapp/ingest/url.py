@@ -361,21 +361,30 @@ def _str_or_none(v: object) -> str | None:
 
 
 def _record_failure(
-    session: Session, url: str, code: str, detail: str, attempted_at: datetime
+    session: Session,
+    url: str,
+    code: str,
+    detail: str,
+    attempted_at: datetime,
+    source_id: int | None = None,
 ) -> int | None:
-    """失敗した取得を INPUT_SOURCE に残す。fetched_at には取得を試みた時刻を入れる。"""
+    """失敗した取得を INPUT_SOURCE に残す。fetched_at には取得を試みた時刻を入れる。
+
+    source_id を渡すとその行を failed にする（無ければ新しく作る）。
+    """
     session.rollback()
-    src = InputSource(
-        track_id=None,
-        source_type=SOURCE_URL,
-        original_name=None,
-        url=url,
-        fetch_status=FETCH_FAILED,
-        error_code=code,
-        error_detail=detail or None,
-        fetched_at=attempted_at,
-    )
-    session.add(src)
+    src = session.get(InputSource, source_id) if source_id is not None else None
+    if src is None:
+        src = InputSource(source_type=SOURCE_URL)
+        session.add(src)
+    src.track_id = None
+    src.source_type = SOURCE_URL
+    src.original_name = None
+    src.url = url
+    src.fetch_status = FETCH_FAILED
+    src.error_code = code
+    src.error_detail = detail or None
+    src.fetched_at = attempted_at
     session.commit()
     log.warning("URL の取得に失敗しました（%s）: %s", code, detail)
     return src.source_id
@@ -390,8 +399,12 @@ def fetch_url(
     ffmpeg_runner: FfmpegRunner | None = None,
     tag_reader: TagReader | None = None,
     timeout: float | None = DOWNLOAD_TIMEOUT_SEC,
+    source_id: int | None = None,
 ) -> ImportResult:
-    """URL の音声を取得して取り込む。失敗したら INPUT_SOURCE（failed）を残して UrlImportError。"""
+    """URL の音声を取得して取り込む。失敗したら INPUT_SOURCE（failed）を残して UrlImportError。
+
+    source_id を渡すと、INPUT_SOURCE を新しく作らず、その行（先に作っておいたもの）を更新する。
+    """
     attempted_at = datetime.now(UTC)
     out_dir = settings.cache_dir / "downloads" / uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -400,23 +413,23 @@ def fetch_url(
             proc = runner.run(download_args(url, out_dir), timeout=timeout)
         except subprocess.TimeoutExpired as e:
             detail = f"yt-dlp が {e.timeout:.0f} 秒で終わりませんでした。"
-            sid = _record_failure(session, url, NETWORK, detail, attempted_at)
+            sid = _record_failure(session, url, NETWORK, detail, attempted_at, source_id)
             raise UrlImportError(NETWORK, detail, sid) from e
         except OSError as e:
             detail = f"yt-dlp を起動できませんでした: {e}"
-            sid = _record_failure(session, url, UNKNOWN, detail, attempted_at)
+            sid = _record_failure(session, url, UNKNOWN, detail, attempted_at, source_id)
             raise UrlImportError(UNKNOWN, detail, sid) from e
 
         if proc.returncode != 0:
             code = classify_error(proc.stderr, proc.returncode)
             detail = error_detail(proc.stderr) or f"終了コード {proc.returncode}"
-            sid = _record_failure(session, url, code, detail, attempted_at)
+            sid = _record_failure(session, url, code, detail, attempted_at, source_id)
             raise UrlImportError(code, detail, sid)
 
         audio_file = find_downloaded_file(out_dir)
         if audio_file is None:
             detail = error_detail(proc.stderr) or "ダウンロードしたファイルが見つかりません。"
-            sid = _record_failure(session, url, UNKNOWN, detail, attempted_at)
+            sid = _record_failure(session, url, UNKNOWN, detail, attempted_at, source_id)
             raise UrlImportError(UNKNOWN, detail, sid)
 
         info = parse_info_json(proc.stdout)
@@ -439,11 +452,12 @@ def fetch_url(
                 artist=artist,
                 ffmpeg_runner=ffmpeg_runner,
                 tag_reader=tag_reader,
+                source_id=source_id,
             )
         except Exception as e:
             detail = f"取得した音声を取り込めませんでした: {type(e).__name__}: {e}"
             sid = _record_failure(
-                session, url, UNKNOWN, detail[-ERROR_DETAIL_MAX_CHARS:], attempted_at
+                session, url, UNKNOWN, detail[-ERROR_DETAIL_MAX_CHARS:], attempted_at, source_id
             )
             raise UrlImportError(UNKNOWN, detail, sid) from e
     finally:

@@ -232,3 +232,45 @@ def test_real_ffmpeg_tags_and_formats(session: Session, settings: Settings, tmp_
     other = write_source(tmp_path / "無題の曲.wav", mix * 0.5, subtype="PCM_16")
     third = import_file(session, settings, other)
     assert third.is_new is True and third.title == "無題の曲"
+
+
+def test_concurrent_same_audio_becomes_existing(
+    session: Session, settings: Settings, tmp_path: Path, mix: np.ndarray
+) -> None:
+    """同じ音が同時に取り込まれ、一意制約違反になったら探し直して既存として扱う。"""
+    from stemapp.audio import audio_hash
+    from stemapp.db import make_session_factory
+
+    src = write_source(tmp_path / "a.wav", mix)
+    factory = make_session_factory(session.get_bind())  # type: ignore[arg-type]
+    other_id: list[int] = []
+
+    def racing_tags(_path: Path) -> Mapping[str, str]:
+        # 検索の後・登録の前に、別の取り込みが同じ音を登録してしまう
+        with factory() as other:
+            t = Track(title="先に登録", audio_hash=audio_hash(mix))
+            other.add(t)
+            other.commit()
+            other_id.append(t.track_id)
+        return {}
+
+    res = _import(session, settings, src, tag_reader=racing_tags)
+    assert res.is_new is False
+    assert res.track_id == other_id[0]
+    assert len(session.scalars(select(Track)).all()) == 1
+    (source,) = session.scalars(select(InputSource)).all()
+    assert source.track_id == other_id[0] and source.fetch_status == "done"
+    assert not list((settings.cache_dir / "tmp").glob("*"))
+
+
+def test_import_updates_existing_source_row(
+    session: Session, settings: Settings, tmp_path: Path, mix: np.ndarray
+) -> None:
+    src_row = InputSource(source_type="file", original_name="x.wav", fetch_status="fetching")
+    session.add(src_row)
+    session.commit()
+    src = write_source(tmp_path / "x.wav", mix)
+    res = _import(session, settings, src, source_id=src_row.source_id)
+    assert res.source_id == src_row.source_id
+    (source,) = session.scalars(select(InputSource)).all()
+    assert source.fetch_status == "done" and source.track_id == res.track_id

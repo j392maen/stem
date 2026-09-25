@@ -194,10 +194,26 @@ def check_deno(_settings: Settings) -> CheckResult:
     return CheckResult("deno", Status.OK, first)
 
 
+LOCAL_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def check_host(settings: Settings) -> CheckResult:
+    name = "待ち受けアドレス"
+    host = settings.host.strip()
+    if host.lower() in LOCAL_HOSTS:
+        return CheckResult(name, Status.OK, f"{host}:{settings.port}（この PC からのみ）")
+    return CheckResult(
+        name, Status.WARN,
+        f"{host}:{settings.port}（外部に公開される可能性があります）",
+        "STEMAPP_HOST=127.0.0.1 にし、外出先からは Tailscale Serve を使ってください",
+    )
+
+
 DEFAULT_CHECKS: tuple[Check, ...] = (
     check_python,
     check_data_dir,
     check_db,
+    check_host,
     check_ffmpeg,
     check_torch_cuda,
     check_audio_separator,

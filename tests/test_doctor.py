@@ -112,3 +112,22 @@ def test_cli_init_db(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Non
     assert runner.invoke(cli.app, ["init-db"]).exit_code == 0
     assert runner.invoke(cli.app, ["init-db"]).exit_code == 0
     assert settings.db_path.is_file()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_host_local_is_ok(tmp_path: Path, host: str) -> None:
+    s = Settings(_env_file=None, data_dir=tmp_path / "d", host=host)  # type: ignore[call-arg]
+    res = doctor.check_host(s)
+    assert res.status is Status.OK and res.name == "待ち受けアドレス"
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "::"])
+def test_host_public_is_warned(tmp_path: Path, host: str) -> None:
+    s = Settings(_env_file=None, data_dir=tmp_path / "d", host=host)  # type: ignore[call-arg]
+    res = doctor.check_host(s)
+    assert res.status is Status.WARN
+    assert "外部に公開" in res.detail and "Tailscale Serve" in res.hint
+
+
+def test_host_check_is_in_default_checks() -> None:
+    assert doctor.check_host in doctor.DEFAULT_CHECKS

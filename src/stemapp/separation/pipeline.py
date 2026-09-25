@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from stemapp.audio import (
@@ -580,6 +580,90 @@ def separate_file(
     )
 
 
+PostProcess = Callable[[Session, Settings, int, ProgressCallback], None]
+"""分割結果の保存後に同じジョブの中で行う処理（配信用データの作成など）。
+
+引数は (session, settings, job_id, progress)。progress には 0〜1 と段階名を渡す。
+DB は flush まででよい（commit はジョブの完了時にまとめて行う）。
+"""
+
+LIMIT_PEAK = 0.999
+
+
+def limit_output(output: SeparationOutput, mix: np.ndarray) -> float:
+    """mixture と全 stem の最大絶対値が 1 を超えていたら、全 stem に同じ倍率をかける。
+
+    倍率は 0.999 / 最大値。stem 同士のバランスと「合計＝mixture × 倍率」の関係が保たれる。
+    かけた倍率（1.0 なら何もしていない）を返す。
+    """
+    peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+    for arr in output.stems.values():
+        if arr.size:
+            peak = max(peak, float(np.max(np.abs(arr))))
+    if peak <= 1.0:
+        return 1.0
+    gain = LIMIT_PEAK / peak
+    for name, arr in output.stems.items():
+        output.stems[name] = (arr.astype(np.float64) * gain).astype(np.float32)
+    log.info("最大値 %.3f が 1 を超えるため、全 stem に %.4f 倍（%.2f dB）をかけます。",
+             peak, gain, gain_to_db(gain))
+    return gain
+
+
+def gain_to_db(gain: float) -> float:
+    return 20.0 * float(np.log10(gain)) if gain > 0 else SILENCE_FLOOR_DB
+
+
+def delete_job_stems(session: Session, job_id: int) -> None:
+    """ジョブの STEM 行を消す（STEM_RENDITION と WAVEFORM は外部キーの CASCADE で消える）。"""
+    session.execute(
+        update(SeparationJob)
+        .where(SeparationJob.input_stem_id.in_(select(Stem.stem_id).where(Stem.job_id == job_id)))
+        .values(input_stem_id=None)
+    )
+    # 子（parent_stem_id あり）から消す
+    session.execute(delete(Stem).where(Stem.job_id == job_id, Stem.parent_stem_id.is_not(None)))
+    session.execute(delete(Stem).where(Stem.job_id == job_id))
+
+
+def _prepare_job(
+    session: Session,
+    track: Track,
+    plan: PresetPlan,
+    device: str,
+    job_id: int | None,
+) -> SeparationJob:
+    """ジョブを running にする。job_id が無ければ新しく作る。"""
+    run_on = "cpu" if device == DEVICE_CPU else "gpu"
+    if job_id is None:
+        job = SeparationJob(
+            track_id=track.track_id,
+            job_kind="full",
+            preset_id=plan.preset_id,
+            status="running",
+            run_on=run_on,
+        )
+        session.add(job)
+    else:
+        found = session.get(SeparationJob, job_id)
+        if found is None:
+            raise SeparationError(f"ジョブが見つかりません（job {job_id}）。")
+        if found.status not in ("queued", "running"):
+            raise SeparationError(
+                f"ジョブ {job_id} は実行できない状態です（{found.status}）。"
+            )
+        job = found
+        job.status = "running"
+        job.run_on = run_on
+    job.progress = 0.0
+    job.stage = "準備中"
+    job.started_at = job.started_at or _utcnow()
+    job.error_message = None
+    job.output_gain_db = 0.0
+    session.commit()
+    return job
+
+
 def separate_track(
     session: Session,
     settings: Settings,
@@ -592,9 +676,24 @@ def separate_track(
     progress: ProgressCallback | None = None,
     oom_policy: OomPolicy | None = None,
     started: float | None = None,
+    job_id: int | None = None,
+    postprocess: PostProcess | None = None,
 ) -> SeparateResult:
-    """取り込み済みの曲を分割する。完了済みの full ジョブがあれば、force でない限り分割しない。"""
+    """取り込み済みの曲を分割する。完了済みの full ジョブがあれば、force でない限り分割しない。
+
+    job_id を渡すと、登録済みのジョブ（queued / running）を実行する（ワーカー用）。
+    このときプリセットはジョブのものを使い、分割済みかどうかは調べない。
+    postprocess を渡すと、stem の保存後に「配信用データを作成中」の段階として実行する。
+    """
     t0 = time.perf_counter() if started is None else started
+    if job_id is not None:
+        queued = session.get(SeparationJob, job_id)
+        if queued is None:
+            raise SeparationError(f"ジョブが見つかりません（job {job_id}）。")
+        preset = session.get(SeparationPreset, queued.preset_id) if queued.preset_id else None
+        preset_code = preset.code if preset is not None else None
+        track_id = queued.track_id
+        force = True
     plan = load_plan(session, preset_code)
     track = session.get(Track, track_id)
     if track is None:
@@ -620,18 +719,7 @@ def separate_track(
 
     tmp_dir = settings.cache_dir / "tmp" / uuid.uuid4().hex
     try:
-        job = SeparationJob(
-            track_id=track.track_id,
-            job_kind="full",
-            preset_id=plan.preset_id,
-            status="running",
-            run_on="cpu" if device == DEVICE_CPU else "gpu",
-            progress=0.0,
-            stage="準備中",
-            started_at=_utcnow(),
-        )
-        session.add(job)
-        session.commit()
+        job = _prepare_job(session, track, plan, device, job_id)
 
         def set_progress(p: float, stage: str) -> None:
             job.progress = round(min(max(p, 0.0), 1.0), 4)
@@ -649,13 +737,23 @@ def separate_track(
                 workdir=tmp_dir,
                 device=device,
                 mix_path=normalized_path,
-                progress=lambda p, s: set_progress(0.02 + 0.88 * p, s),
+                progress=lambda p, s: set_progress(0.02 + 0.86 * p, s),
                 oom_policy=oom_policy,
             )
-            set_progress(0.92, "stem を保存中")
+            set_progress(0.9, "stem を保存中")
             if any(r.device == DEVICE_CPU for r in output.steps) and device != DEVICE_CPU:
                 job.run_on = "cpu"
+            gain = limit_output(output, mix)
+            job.output_gain_db = round(gain_to_db(gain), 4) if gain != 1.0 else 0.0
             infos = _save_stems(session, settings, job, output)
+            if postprocess is not None:
+                set_progress(0.92, "配信用データを作成中")
+                postprocess(
+                    session,
+                    settings,
+                    job.job_id,
+                    lambda p, s: set_progress(0.92 + 0.07 * p, s),
+                )
             job.status = "done"
             job.progress = 1.0
             job.stage = "完了"
@@ -666,6 +764,7 @@ def separate_track(
         except Exception as e:
             session.rollback()
             stage = job.stage or ""
+            delete_job_stems(session, job.job_id)
             job.status = "failed"
             job.finished_at = _utcnow()
             job.error_message = f"分割に失敗しました（{stage}）: {type(e).__name__}: {e}"
