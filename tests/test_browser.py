@@ -88,11 +88,6 @@ def _wait_gains(page: Any, expect: dict[str, float], timeout: float = 3.0) -> di
 LEAVES = ["lead_vocal", "backing_vocal", "drums", "bass", "guitar", "piano", "other"]
 
 
-def _open_player(page: Any, server: LiveServer, track_id: int) -> None:
-    page.goto(f"{server.base_url}/#/track/{track_id}")
-    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
-
-
 # --- 純粋な処理（ブラウザの中で評価） ----------------------------------------------
 
 
@@ -319,11 +314,15 @@ def test_full_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:
     assert page.evaluate(position) == pytest.approx(5.5, abs=0.01)
     page.keyboard.press("ArrowLeft")
     assert page.evaluate(position) == pytest.approx(0.5, abs=0.01)
-    # スペースで再生・停止
+    # スペースで再生・停止（stem ボタンにフォーカスがあっても、ボタンは押されない）
+    page.focus(".stem-btn[data-code='drums']")
+    before = _gains(page)["drums"]
     page.keyboard.press("Space")
     page.wait_for_function("() => window.__stemapp.view.engine.playing")
     page.keyboard.press("Space")
     page.wait_for_function("() => !window.__stemapp.view.engine.playing")
+    page.wait_for_timeout(100)
+    assert _gains(page)["drums"] == before
 
     page.set_viewport_size(PHONE)
     page.wait_for_timeout(300)
