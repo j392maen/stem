@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,7 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from stemapp.config import Settings, get_settings
 from stemapp.doctor import CheckResult, Status, exit_code, run_checks
@@ -74,15 +76,89 @@ def doctor() -> None:
     raise typer.Exit(code)
 
 
+WORKER_STOP_WAIT_SEC = 20.0
+
+
+def _start_worker_process() -> subprocess.Popen[bytes]:
+    """ワーカーを別プロセスで起動する。標準入力を閉じると止まる。"""
+    from stemapp.jobs.worker import child_env, new_group_kwargs
+
+    return subprocess.Popen(  # noqa: S603
+        [sys.executable, "-m", "stemapp.cli", "worker", "--stop-on-stdin-eof"],
+        stdin=subprocess.PIPE,
+        env=child_env(),
+        **new_group_kwargs(),  # type: ignore[arg-type]
+    )
+
+
+def _stop_worker_process(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=WORKER_STOP_WAIT_SEC)
+    except subprocess.TimeoutExpired:
+        typer.echo("ワーカーが止まらないため強制終了します。")
+        proc.kill()
+        proc.wait()
+
+
 @app.command()
 def serve() -> None:
-    """Web サーバーを起動する（設定の host/port）。"""
+    """Web サーバーを起動する（設定の host/port）。ワーカーも一緒に起動し、終了時に止める。"""
     import uvicorn
 
     from stemapp.app import create_app
 
     settings = _settings()
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+    worker_proc = _start_worker_process()
+    try:
+        uvicorn.run(
+            create_app(settings),
+            host=settings.host,
+            port=settings.port,
+            timeout_graceful_shutdown=3,
+        )
+    finally:
+        _stop_worker_process(worker_proc)
+
+
+@app.command()
+def worker(
+    stop_on_stdin_eof: Annotated[
+        bool, typer.Option("--stop-on-stdin-eof", hidden=True, help="標準入力が閉じたら止まる")
+    ] = False,
+) -> None:
+    """分割ワーカーだけを起動する（queued のジョブを1件ずつ実行する）。Ctrl+C で止まる。"""
+    from stemapp.jobs.worker import (
+        Worker,
+        WorkerLock,
+        WorkerLockError,
+        subprocess_launcher,
+    )
+    from stemapp.jobs.worker import stop_on_stdin_eof as watch_stdin
+
+    _setup_logging()
+    settings = _settings()
+    lock = WorkerLock(settings.data_root / "worker.lock")
+    try:
+        lock.acquire()
+    except WorkerLockError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1) from e
+    try:
+        with _db_engine(settings) as factory:
+            w = Worker(settings, factory, subprocess_launcher(settings))
+            if stop_on_stdin_eof:
+                watch_stdin(w.stop_event)
+            try:
+                w.run_forever()
+            except KeyboardInterrupt:
+                typer.echo("ワーカーを止めました。")
+    finally:
+        lock.release()
 
 
 # --- 分離 --------------------------------------------------------------------------
@@ -105,6 +181,25 @@ def make_separator(settings: Settings) -> Separator:
     return AudioSeparatorBackend(
         models_dir=settings.models_dir, work_dir=settings.cache_dir / "audio-separator"
     )
+
+
+@contextmanager
+def _db_engine(settings: Settings) -> Iterator[sessionmaker[Session]]:
+    """DB を開き（無ければ作って初期データを入れ）、セッションの作り方を返す。"""
+    from stemapp.db import init_db, make_engine, make_session_factory
+    from stemapp.models import SeparationPreset
+    from stemapp.seed import seed
+
+    engine = make_engine(settings.db_path)
+    try:
+        init_db(engine)
+        factory = make_session_factory(engine)
+        with factory() as session:
+            if session.scalars(select(SeparationPreset)).first() is None:
+                seed(session)
+        yield factory
+    finally:
+        engine.dispose()
 
 
 @contextmanager
