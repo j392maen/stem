@@ -23,6 +23,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from stemapp.api.common import is_local_request
+from stemapp.api.folders import supports_open_folder
 from stemapp.config import Settings
 
 COOKIE_NAME = "stemapp_session"
@@ -179,7 +181,11 @@ def logout(response: Response) -> dict[str, bool]:
 @router.get("/me")
 def me(request: Request) -> dict[str, bool]:
     # ここに来た時点で認証済み（未ログインならミドルウェアが 401 を返す）
+    local = is_local_request(request)
     return {
         "authenticated": True,
         "passcode_required": passcode_of(request.app.state.settings) is not None,
+        # サーバーと同じ PC のブラウザか（保存フォルダを開くボタンを出すかどうか）
+        "local_client": local,
+        "can_open_folder": local and supports_open_folder(),
     }
