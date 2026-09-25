@@ -11,3 +11,12 @@ __pycache__/
 *.ckpt
 *.onnx
 *.th
+*.opus
+*.m4a
+*.pth
+*.pt
+*.safetensors
+*.egg-info/
+build/
+dist/
+.coverage
