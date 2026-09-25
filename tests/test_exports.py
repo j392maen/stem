@@ -561,6 +561,28 @@ def test_delete_track_removes_exports(client: TestClient, job_id: int) -> None:
         assert s.scalars(select(ExportItem)).all() == []
 
 
+def test_delete_job_removes_its_exports_only(client: TestClient, job_id: int) -> None:
+    """ジョブ（1つの分け方）を消すと、そのジョブの書き出しだけが消える。"""
+    settings = _settings(client)
+    with _factory(client)() as s:
+        track_id = s.get(SeparationJob, job_id).track_id  # type: ignore[union-attr]
+    res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_resid_vocals"})
+    assert res.status_code == 201, res.text
+    other = res.json()["job"]["job_id"]
+    worker = Worker(settings, _factory(client), sync_launcher(settings),
+                    postprocess_encoder=fake_encoder)
+    assert worker.run_one() == other
+    gone = _export(client, other, {"export_type": "single", "format": "wav", "stem_code": "bass"})
+    keep = _export(client, job_id, {"export_type": "single", "format": "wav", "stem_code": "bass"})
+
+    assert client.delete(f"/api/jobs/{other}").status_code == 200
+    assert client.get(f"/api/exports/{gone['export_id']}").status_code == 404
+    assert not (settings.exports_dir / str(gone["export_id"])).exists()
+    assert client.get(f"/api/exports/{keep['export_id']}").status_code == 200
+    assert (settings.exports_dir / str(keep["export_id"])).is_dir()
+    assert client.get(keep["download_url"]).status_code == 200
+
+
 def test_deleted_job_exports_removed_by_cleanup(client: TestClient, job_id: int) -> None:
     """ジョブの行が（曲の削除以外で）消えても、次の片付けでフォルダが消える。"""
     settings = _settings(client)

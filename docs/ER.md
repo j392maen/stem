@@ -7,10 +7,10 @@
 | TRACK | track_id PK, title, artist, duration_sec, audio_hash UK, normalized_path, detected_instruments_json, created_at |
 | INPUT_SOURCE | source_id PK, track_id FK, source_type(file/url), original_name, url, fetch_status, error_code, error_detail, fetched_at |
 | DEVICE | device_id PK, name, kind(pc/iphone/ipad/other), push_subscription_json, last_seen_at |
-| SEPARATION_PRESET | preset_id PK, code UK(fast/standard/best), display_name, is_default |
-| PRESET_STEP | preset_id PK FK, step_order PK, model_id FK, input(mixture/vocals), role(multistem/vocals/karaoke), ensemble_weight, options_json |
+| SEPARATION_PRESET | preset_id PK, code UK(fast/standard/best、実験は exp_*), display_name, is_default, is_experimental(bool、聴き比べ用の実験), options_json(パイプライン全体の選択肢。例 {"residual_to": "other/vocals/split"}) |
+| PRESET_STEP | preset_id PK FK, step_order PK, model_id FK, input(mixture/vocals。karaoke のみ vocals も可、1プリセット内で同じ), role(multistem/vocals/karaoke), ensemble_weight, options_json |
 | MODEL | model_id PK, filename UK, display_name, architecture, output_stems_json, min_vram_mb, checkpoint_sha256, license, source_url |
-| SEPARATION_JOB | job_id PK, track_id FK, job_kind(full/refine), preset_id FK(full のみ), input_stem_id FK(refine のみ), requested_by FK→DEVICE, status(queued/running/done/failed/canceled), run_on(gpu/cpu/nightly), progress(0-1), stage, created_at, started_at, finished_at, error_message, cancel_requested(bool、キャンセル依頼), output_gain_db(float、既定0。保存前に全 stem にかけた倍率), postprocess_status(NULL/queued/running/done/failed、配信用データ・拍の作り直し), beat_warning(拍の解析に失敗したときの警告。NULL=なし) |
+| SEPARATION_JOB | job_id PK, track_id FK, job_kind(full/refine), preset_id FK(full のみ), input_stem_id FK(refine のみ), requested_by FK→DEVICE, status(queued/running/done/failed/canceled), run_on(gpu/cpu/nightly), progress(0-1), stage, created_at, started_at, finished_at, error_message, cancel_requested(bool、キャンセル依頼), output_gain_db(float、既定0。保存前に全 stem にかけた倍率), postprocess_status(NULL/queued/running/done/failed、配信用データ・拍の作り直し), beat_warning(拍の解析に失敗したときの警告。NULL=なし), residual_rms_db / mixture_rms_db(float、補正前の残差と元の曲の RMS dBFS。聴き比べの参考) |
 | STEM_TYPE | stem_type_id PK, code UK, display_name(日本語), parent_id FK→STEM_TYPE, tier(base/detail), refine_model_id FK→MODEL, experimental, color(#RRGGBB), display_order |
 | STEM | stem_id PK, job_id FK, stem_type_id FK, parent_stem_id FK→STEM, is_residual, rms_db, is_silent |
 | STEM_RENDITION | rendition_id PK, stem_id FK, purpose(master/stream), codec(flac/opus/wav), bitrate_kbps, file_path, bytes |

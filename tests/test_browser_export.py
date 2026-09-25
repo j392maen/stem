@@ -12,10 +12,19 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from browser_helpers import LiveServer
-from test_browser import PHONE, _done_track, _shot, browser, page, server  # noqa: F401
+from test_browser import (  # noqa: F401  fixture を使う
+    PHONE,
+    _done_track,
+    _shot,
+    _wait_jobs_done,
+    browser,
+    page,
+    server,
+)
 
 pytestmark = [
     pytest.mark.browser,
@@ -134,3 +143,36 @@ def test_export_phone(browser: Any, server: LiveServer, tmp_path: Path) -> None:
         assert errors == []
     finally:
         ctx.close()
+
+
+def test_export_follows_switched_job(
+    page: Any, server: LiveServer, tmp_path: Path  # noqa: F811
+) -> None:
+    """分け方を切り替えると、書き出しメニューは作り直され、表示中のジョブを書き出す。"""
+    track_id, fast_job = _done_track(server, tmp_path)
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        res = c.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_resid_vocals"})
+        assert res.status_code == 201, res.text
+        exp_job = res.json()["job"]["job_id"]
+    _wait_jobs_done(server, track_id, 2)
+    _open_player(page, server, track_id)
+    view = "window.__stemapp.view"
+    assert page.evaluate(f"() => {view}.jobId") == fast_job
+    page.click("#export-btn")
+    page.wait_for_selector(".export-modal")
+    page.click(".export-close")
+    assert page.evaluate(f"() => !!{view}.exporter")
+
+    page.select_option("#job-select", str(exp_job))
+    page.wait_for_function(f"() => {view}.jobId === {exp_job} && {view}.ready", timeout=60_000)
+    # 切り替え（読み直し）で前のメニューは後始末される
+    assert page.evaluate(f"() => {view}.exporter") is None
+    assert page.locator(".export-modal").count() == 0
+
+    page.click("#export-btn")
+    _choose(page, "type", "single")
+    page.select_option("#export-stem", "bass")
+    _create_and_wait(page, "用意した曲 - ベース.wav")
+    got = page.evaluate(f"() => {view}.exporter.current")
+    assert got["job_id"] == exp_job
+    assert page.errors == []  # type: ignore[attr-defined]
