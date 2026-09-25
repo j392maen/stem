@@ -521,7 +521,8 @@ def _save_stems(
             )
         )
     session.flush()
-    return infos
+    # 表示順（親の直後に子）で返す
+    return sorted(infos, key=lambda i: types[i.code].display_order)
 
 
 def separate_file(
