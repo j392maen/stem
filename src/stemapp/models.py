@@ -99,9 +99,15 @@ class SeparationPreset(Base):
     __tablename__ = "separation_preset"
 
     preset_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(20), unique=True)  # fast / standard / best
+    code: Mapped[str] = mapped_column(String(20), unique=True)  # fast / standard / best / exp_*
     display_name: Mapped[str] = mapped_column(String(100))
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 聴き比べ用の実験プリセット（画面では通常隠す）
+    is_experimental: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0")
+    )
+    # パイプライン全体の選択肢（例: {"residual_to": "vocals"}）。NULL は {} と同じ
+    options_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
 class PresetStep(Base):
@@ -172,6 +178,9 @@ class SeparationJob(Base):
     # 配信用データ（stream rendition・peaks）の作り直し（done のジョブのみ）。
     # NULL=依頼なし / queued / running / done / failed。ワーカーが1件ずつ処理する
     postprocess_status: Mapped[str | None] = mapped_column(String(10))
+    # 補正前の残差（mixture − 上位 stem の生出力の合計）と mixture の RMS（dBFS）。聴き比べの参考
+    residual_rms_db: Mapped[float | None] = mapped_column(Float)
+    mixture_rms_db: Mapped[float | None] = mapped_column(Float)
     # 拍の解析に失敗したときの警告（画面に出す）。拍が無くても再生はできるのでジョブは done のまま。
     # 解析に成功すると NULL に戻す
     beat_warning: Mapped[str | None] = mapped_column(Text)

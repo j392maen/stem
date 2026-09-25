@@ -19,7 +19,7 @@ from audio_helpers import synth_drums, write_source
 from browser_helpers import LiveServer, run_server
 from stemapp.beats import FakeBeatAnalyzer
 from stemapp.config import Settings
-from stemapp.models import BeatGrid
+from stemapp.models import BeatGrid, SeparationJob
 from test_browser import _shot, browser, page  # noqa: F401  fixture を使う
 
 pytestmark = [
@@ -176,4 +176,82 @@ def test_track_without_beats_keeps_second_grid(
     page.wait_for_function("() => document.querySelector('#beats-btn').disabled === false"
                            " && document.querySelector('#bpm-value').textContent === '120.0'",
                            timeout=20_000)
+    assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_beats_survive_job_switch(
+    page: Any, server: LiveServer, tmp_path: Path  # noqa: F811
+) -> None:
+    """分け方（ジョブ）を切り替えて読み直しても、拍の線・BPM・「拍を解析」が正しく出る（T12）。
+
+    拍は曲ごと、拍の警告はジョブごと（表示中のジョブの警告を出す）。
+    """
+    track_id, fast_job = _done_track(server, tmp_path)
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        res = c.post(f"/api/tracks/{track_id}/jobs", json={"preset": "exp_kara_mix"})
+        exp_job = res.json()["job"]["job_id"]
+        deadline = time.monotonic() + 90
+        while c.get(f"/api/jobs/{exp_job}").json()["status"] != "done":
+            assert time.monotonic() < deadline, "分割が終わりません"
+            time.sleep(0.2)
+    view = "window.__stemapp.view"
+    page.goto(f"{server.base_url}/#/track/{track_id}")
+    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+    assert page.evaluate(f"() => {view}.jobId") == fast_job
+    page.evaluate(f"() => {{ {view}.engine.pause(); {view}.seek(9.0); }}")
+    _wait_bpm(page, "150.0")
+
+    page.select_option("#job-select", str(exp_job))
+    page.wait_for_function(f"() => {view}.jobId === {exp_job} && {view}.ready", timeout=60_000)
+    _wait_bpm(page, "150.0")  # 位置（9 秒）も拍も引き継ぐ
+    page.wait_for_function("() => document.querySelector('#wave-zoom').dataset.grid === 'beats'")
+    assert page.inner_text("#beats-btn") == "拍を再解析"
+    assert page.inner_text("#meter") == "4/4"
+
+    # 拍の警告はジョブごと: 表示中でない方（fast）にだけ警告があるなら出さない
+    with server.session_factory() as s:
+        s.delete(s.get(BeatGrid, track_id))
+        s.get(SeparationJob, fast_job).beat_warning = "テスト用の警告（fast）"  # type: ignore[union-attr]
+        s.commit()
+    page.reload()
+    page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+    assert page.evaluate(f"() => {view}.jobId") == exp_job
+    assert "まだ解析されていません" in (page.get_attribute("#tempo", "title") or "")
+    page.select_option("#job-select", str(fast_job))
+    page.wait_for_function(f"() => {view}.jobId === {fast_job} && {view}.ready", timeout=60_000)
+    assert page.get_attribute("#tempo", "title") == "テスト用の警告（fast）"
+    assert page.inner_text("#beats-btn") == "拍を解析"
+    assert page.get_attribute("#wave-zoom", "data-grid") == "seconds"
+
+    # 表示中（fast）でないジョブ（新しい exp）が解析を受け持っても、そのジョブの終わりを待って
+    # 表示する。Fake の解析はすぐ終わるので、画面が exp の状態を確かめるまで拍を 404 にしておく
+    polled: list[str] = []
+    page.on("request", lambda r: polled.append(r.url)
+            if r.url.endswith(f"/api/jobs/{exp_job}") else None)
+
+    def hold_beats(route: Any) -> None:
+        if route.request.method == "GET" and not polled:
+            route.fulfill(status=404, json={"detail": "テスト用: まだ無い"})
+        else:
+            route.continue_()
+
+    page.route(f"**/api/tracks/{track_id}/beats", hold_beats)
+    page.click("#beats-btn")
+    _wait_bpm(page, "120.0", timeout_ms=20_000)
+    page.unroute(f"**/api/tracks/{track_id}/beats")
+    page.wait_for_function("() => document.querySelector('#wave-zoom').dataset.grid === 'beats'")
+    assert page.inner_text("#beats-btn") == "拍を再解析"
+    assert "自動解析" in (page.get_attribute("#tempo", "title") or "")
+    with server.session_factory() as s:
+        assert s.get(SeparationJob, fast_job).beat_warning is None  # type: ignore[union-attr]
+
+    # 解析を待っている間に分け方を切り替えても、待つのを続けて表示する
+    page.click("#beats-btn")
+    page.click(".modal button:has-text('解析し直す')")
+    page.select_option("#job-select", str(exp_job))
+    page.wait_for_function(f"() => {view}.jobId === {exp_job} && {view}.ready", timeout=60_000)
+    page.wait_for_function("() => document.querySelector('#beats-btn').disabled === false"
+                           " && document.querySelector('#bpm-value').textContent === '120.0'",
+                           timeout=20_000)
+    assert page.inner_text("#beats-btn") == "拍を再解析"
     assert not page.errors  # type: ignore[attr-defined]
