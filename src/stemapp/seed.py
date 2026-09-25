@@ -71,7 +71,7 @@ MODELS: list[ModelDef] = [
     ModelDef(DRUMSEP, "MDX23C ドラム分割", "mdx23c",
              ["kick", "snare", "toms", "hihat", "ride", "crash"]),
     ModelDef(MALE_FEMALE, "BS-RoFormer 男声/女声", "bs_roformer", ["male", "female"]),
-    ModelDef(ASPIRATION, "Mel-RoFormer 息", "mel_band_roformer", ["breath", "other"]),
+    ModelDef(ASPIRATION, "Mel-RoFormer 息", "mel_band_roformer", ["breath", "no_breath"]),
 ]
 
 # --- STEM_TYPE ---------------------------------------------------------------

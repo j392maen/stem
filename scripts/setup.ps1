@@ -78,7 +78,7 @@ try {
     $ytdlp = 'C:\mine\yt-dlp.exe'
     $line = Select-String -Path $envFile -Pattern '^\s*STEMAPP_YTDLP_PATH\s*=\s*(.+)$' |
         Select-Object -First 1
-    if ($line) { $ytdlp = $line.Matches[0].Groups[1].Value.Trim() }
+    if ($line) { $ytdlp = $line.Matches[0].Groups[1].Value.Trim().Trim('"', "'").Trim() }
     if (Test-Path $ytdlp) { Write-Ok "yt-dlp: $ytdlp（$(& $ytdlp --version)）" }
     else { Write-Warn "yt-dlp.exe が $ytdlp にありません（Python 版 yt-dlp で代用します）" }
 
