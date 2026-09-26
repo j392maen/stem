@@ -316,7 +316,11 @@ export class LibraryView {
     const libPanel = el("section", { class: "panel" },
       el("h2", { text: `ライブラリ（${this.tracks.length} 曲）` }), trackList);
 
-    this.root.replaceChildren(el("div", { class: "library" }, importPanel, libPanel));
+    // 端末の診断（iPhone で何が使えるかを調べる）。普段は目立たせない
+    const footer = el("p", { class: "library-foot" },
+      el("a", { href: "#/diag", id: "diag-link", text: "端末の診断" }));
+
+    this.root.replaceChildren(el("div", { class: "library" }, importPanel, libPanel, footer));
     this.renderImports();
     this.renderTracks();
   }

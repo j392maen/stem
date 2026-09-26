@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,14 +20,18 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
 from stemapp import __version__
-from stemapp.api import auth, cues, files, folders, imports, master, tracks
+from stemapp.api import auth, cues, diag, files, folders, imports, master, tracks
 from stemapp.api.imports import ImportDeps, ImportManager
 from stemapp.config import Settings, get_settings
 from stemapp.db import init_db, make_engine, make_session_factory
+from stemapp.hosts import HostCheckMiddleware
 from stemapp.ingest.service import recover_interrupted_imports
 from stemapp.seed import seed
 
 WEB_DIR: Path = Path(__file__).resolve().parent / "web"
+# PWA の manifest の種類（Windows の既定の対応表に無いことがある）
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+mimetypes.add_type("image/svg+xml", ".svg")
 
 # Starlette の既定の英語メッセージを日本語にする
 _DEFAULT_DETAILS: dict[int, str] = {
@@ -112,13 +117,15 @@ def create_app(
     app.state.settings = settings
     app.state.login_limiter = auth.LoginLimiter()
     app.middleware("http")(auth.auth_middleware)
+    # 後に足したものほど外側で先に動く。Host の確認（DNS リバインディング対策）は認証より先
+    app.add_middleware(HostCheckMiddleware, allowed=settings.allowed_host_names)
     _install_error_handlers(app)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    for module in (auth, imports, tracks, cues, files, folders, master):
+    for module in (auth, imports, tracks, cues, files, folders, master, diag):
         app.include_router(module.router)
     # 画面。API のルートより後に登録する（/api/* はここまで来ない）
     app.mount("/", WebFiles(directory=WEB_DIR, html=True), name="web")

@@ -227,6 +227,15 @@ def start_detached(cmd: Sequence[str]) -> None:
     threading.Thread(target=proc.wait, name="detached-wait", daemon=True).start()
 
 
+def explorer_path() -> str:
+    """エクスプローラーの完全パス（%SystemRoot%\\explorer.exe）。
+
+    名前だけで起動すると、作業フォルダや PATH にある同名のプログラムが選ばれるおそれがある。
+    """
+    system_root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    return str(Path(system_root) / "explorer.exe")
+
+
 def open_in_explorer(folder: Path) -> None:
     """フォルダをエクスプローラーで開く（Windows のみ）。"""
-    start_detached(["explorer.exe", str(folder)])
+    start_detached([explorer_path(), str(folder)])
