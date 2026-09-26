@@ -325,7 +325,7 @@ export class DiagView {
         ["端末の名前", r.device],
         ["UA", r.ua],
         ["画面", `${s.width}×${s.height}（表示 ${s.inner_width}×${s.inner_height}、倍率 ${s.device_pixel_ratio}）`],
-        ["ホーム画面から開いた", yesNo(r.standalone)],
+        ["ホーム画面から開いた", r.standalone ? "はい" : "いいえ（ブラウザで開いている）"],
         ["HTTPS など安全な接続", yesNo(r.secure_context)],
       ])));
     const ac = r.audio_context;
@@ -392,7 +392,7 @@ export class DiagView {
         el("div", { class: "row" },
           el("button", { class: "btn", type: "button", id: "lock-webaudio", text: "Web Audio で鳴らす", onclick: () => this.startLock("webaudio") }),
           el("button", { class: "btn", type: "button", id: "lock-element", text: "<audio> 要素で鳴らす", onclick: () => this.startLock("element") })),
-        history,
+        ...(history ? [history] : []),
       );
       return;
     }
@@ -407,7 +407,7 @@ export class DiagView {
         answer("stopped", "ロックすると止まった"),
         answer("stopped_later", "しばらくして止まった"),
         answer("unknown", "わからない・やめる")),
-      history,
+      ...(history ? [history] : []),
     );
   }
 
