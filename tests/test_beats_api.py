@@ -379,3 +379,20 @@ def test_old_db_gets_edit_columns_and_table(tmp_path: Path) -> None:
             assert body["edited"] is False and body["beats"] == [0.0, 0.5, 1.0]
     finally:
         engine.dispose()
+
+
+def test_edit_rejects_times_outside_track(client: TestClient, tmp_path: Path) -> None:
+    track_id = _track(client, tmp_path, seconds=8.0)
+    _separate(client, track_id, FakeBeatAnalyzer(120))
+    taps = [1.0, 1.5, 2.0, 2.5]
+    res = _edit(client, track_id, op="tap", range="all", taps=[-1.0, *taps])
+    assert res.status_code == 422  # 0 秒より前
+    res = _edit(client, track_id, op="tap", range="all", taps=[*taps, 500.0])
+    assert res.status_code == 400 and "曲の長さ" in res.json()["detail"]
+    res = _edit(client, track_id, op="cues", cue_start=1.0, cue_end=60.0, bars=4)
+    assert res.status_code == 400
+    res = _edit(client, track_id, op="double", range="loop", loop_start=1.0, loop_end=99.0)
+    assert res.status_code == 400
+    res = _edit(client, track_id, op="tap", range="all", taps=[1.0 + 0.01 * k for k in range(65)])
+    assert res.status_code == 422  # タップの回数の上限
+    assert _edit(client, track_id, op="tap", range="all", taps=taps).status_code == 200
