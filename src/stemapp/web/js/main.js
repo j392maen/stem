@@ -1,4 +1,4 @@
-// 画面の入口: ログインの確認と、ハッシュでの画面切り替え（#/library, #/track/<id>）。
+// 画面の入口: ログインの確認と、ハッシュでの画面切り替え（#/library, #/track/<id>, #/diag）。
 
 import { api, onUnauthorized } from "./api.js";
 import * as beatsMod from "./beats.js";
