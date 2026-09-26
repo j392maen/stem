@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from audio_helpers import fake_ffmpeg, synth_mix, write_source
 from job_helpers import make_track, no_tags, sync_launcher
 from stemapp.api import auth
-from stemapp.api.imports import ImportDeps, safe_filename
+from stemapp.api.imports import ImportDeps, browser_filename, safe_filename
 from stemapp.app import create_app
 from stemapp.config import Settings
 from stemapp.jobs import enqueue_full_job
@@ -384,6 +384,38 @@ def test_master_endpoints(client: TestClient) -> None:
 def _wait_import(client: TestClient, source_id: int) -> dict[str, Any]:
     client.app.state.import_manager.join()  # type: ignore[attr-defined]
     return client.get(f"/api/imports/{source_id}").json()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("%22曲%22.wav", '"曲".wav'),
+        ("a%0Ab%0dc.wav", "a\nb\rc.wav"),
+        ("a%0ab.wav", "a\nb.wav"),
+        ("100%25 %20曲.wav", "100%25 %20曲.wav"),  # ほかの %xx は戻さない
+        ("曲.wav", "曲.wav"),
+    ],
+)
+def test_browser_filename(raw: str, expected: str) -> None:
+    assert browser_filename(raw) == expected
+
+
+def test_import_file_browser_escaped_name(client: TestClient, tmp_path: Path) -> None:
+    """ブラウザが %22 に変えた `"` を戻して original_name に入れ、フォルダ名では取り除く。"""
+    src = write_source(tmp_path / "x.wav", synth_mix(1.0))
+    with open(src, "rb") as fh:
+        res = client.post(
+            "/api/imports",
+            files={"file": ("テスト: %22曲%22?%0A.wav", fh, "audio/wav")},
+            data={"separate": "true", "preset": "fast"},
+        )
+    assert res.status_code == 202
+    info = _wait_import(client, res.json()["source_id"])
+    assert info["status"] == "done", info
+    assert info["original_name"] == 'テスト: "曲"?\n.wav'
+    assert _run_worker_once(client) == info["job_id"]
+    settings = client.app.state.settings  # type: ignore[attr-defined]
+    assert (settings.stems_dir / "テスト 曲" / "fast" / "vocals.flac").is_file()
 
 
 def test_import_file_with_separate(client: TestClient, tmp_path: Path) -> None:
