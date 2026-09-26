@@ -50,6 +50,11 @@ export class BeatEditPanel {
     this.tapInfo = el("span", { class: "be-tap-info", id: "be-tap-info", text: "" });
     this.cueA = el("select", { class: "select small", id: "be-cue-a", "aria-label": "1つ目のキュー", onchange: () => this.suggestBars() });
     this.cueB = el("select", { class: "select small", id: "be-cue-b", "aria-label": "2つ目のキュー", onchange: () => this.suggestBars() });
+    // キュー2点からの1小節の拍数（既定は曲の拍子。乱れた所の小節から推定しない）
+    this.cueMeterSel = el("select", {
+      class: "select small", id: "be-cue-meter", "aria-label": "キューの間の拍子（1小節の拍数）",
+      onchange: () => this.suggestBars(),
+    }, METERS.map((n) => el("option", { value: String(n), text: `${n}/4` })));
     this.barsInput = el("input", {
       class: "input small be-bars", id: "be-bars", type: "number", min: "1", max: "1024", value: "8",
       "aria-label": "キューの間の小節数",
@@ -57,7 +62,7 @@ export class BeatEditPanel {
     this.cueRow = el("div", { class: "be-row" },
       el("span", { class: "be-label", text: "キュー2点から" }),
       this.cueA, el("span", { class: "muted", text: "〜" }), this.cueB,
-      this.barsInput, el("span", { class: "muted", text: "小節" }),
+      this.barsInput, el("span", { class: "muted", text: "小節" }), this.cueMeterSel,
       btn("be-cues", "適用", "2つのキューの間を、指定した小節数の一定テンポの拍で置き換えます（小節の頭はキューの位置）",
         () => this.applyCues()));
     this.cueNote = el("span", { class: "muted be-note", text: "キューを2つ打つと使えます。" });
@@ -92,7 +97,14 @@ export class BeatEditPanel {
             class: "btn small be-tap", type: "button", id: "be-tap", text: "タップ（T）",
             title: `再生しながら拍に合わせて ${MIN_TAPS} 回以上たたくと、その間隔と位置から一定テンポの拍を作ります`,
             onpointerdown: (e) => { e.preventDefault(); this.tapNow(); },
-            onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); this.tapNow(); } },
+            // Space・Enter はタップだけにする（プレイヤーの Space＝再生/停止に届けない）
+            onkeydown: (e) => {
+              if (e.key === "Enter" || e.key === " " || e.code === "Space") {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!e.repeat) this.tapNow();
+              }
+            },
           }),
           this.tapInfo),
         this.cueRow, this.cueNote,
@@ -116,6 +128,13 @@ export class BeatEditPanel {
       this.meterSel.append(el("option", { value: String(meter), text: `${meter}/4` }));
     }
     this.meterSel.value = String(meter);
+    this.meterShown = meter;
+    this.ensureMeterOption(this.cueMeterSel, grid.timeSignature);
+    if (this.cueGridKey !== grid) {
+      // 拍が変わったら、キュー2点からの拍子を曲の拍子に合わせ直す
+      this.cueGridKey = grid;
+      this.cueMeterSel.value = String(grid.timeSignature);
+    }
     const loopOpt = this.rangeSel.querySelector("option[value='loop']");
     loopOpt.disabled = !this.view.activeLoop();
     if (loopOpt.disabled && this.rangeSel.value === "loop") this.rangeSel.value = "segment";
@@ -124,6 +143,27 @@ export class BeatEditPanel {
       if (b !== this.undoBtn && b !== this.resetBtn) b.disabled = this.busy;
     }
     this.refreshCueButtons();
+  }
+
+  ensureMeterOption(sel, n) {
+    if (!sel.querySelector(`option[value="${n}"]`)) {
+      sel.append(el("option", { value: String(n), text: `${n}/4` }));
+    }
+  }
+
+  /** 開いている間、拍子の選択欄を再生位置の小節の拍数に合わせる（選んでいる最中は変えない）。 */
+  syncMeter(meter) {
+    if (!this.open || !this.grid || this.busy || meter === this.meterShown) return;
+    if (document.activeElement === this.meterSel) return;
+    this.ensureMeterOption(this.meterSel, meter);
+    this.meterSel.value = String(meter);
+    this.meterShown = meter;
+  }
+
+  /** キュー2点からの1小節の拍数（選択欄。無ければ曲の拍子）。 */
+  cueMeter() {
+    const n = Number(this.cueMeterSel.value);
+    return n >= 2 && n <= 12 ? n : (this.grid ? this.grid.timeSignature : 4);
   }
 
   refreshCues() {
@@ -165,7 +205,7 @@ export class BeatEditPanel {
     const [a, b] = pair;
     const bpm = grid.bpmAt(a.position_sec);
     if (!bpm) return;
-    const barSec = (grid.meterAt(a.position_sec + 1e-3) * 60) / bpm;
+    const barSec = (this.cueMeter() * 60) / bpm;
     this.barsInput.value = String(Math.max(1, Math.round((b.position_sec - a.position_sec) / barSec)));
   }
 
@@ -225,7 +265,10 @@ export class BeatEditPanel {
     if (!pair || pair[0].cue_id === pair[1].cue_id) { toast("別々のキューを2つ選んでください。"); return; }
     const bars = Math.round(Number(this.barsInput.value));
     if (!(bars >= 1)) { toast("小節数を入れてください。"); return; }
-    await this.edit("cues", { cue_start: pair[0].position_sec, cue_end: pair[1].position_sec, bars });
+    await this.edit("cues", {
+      cue_start: pair[0].position_sec, cue_end: pair[1].position_sec, bars,
+      beats_per_bar: this.cueMeter(),
+    });
   }
 
   /** 今たたいた（ボタン・T キー）。再生中の曲の時刻から出力の遅延を差し引く。 */

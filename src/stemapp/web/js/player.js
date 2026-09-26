@@ -508,6 +508,7 @@ export class PlayerView {
     const v = this.root.querySelector("#bpm-value");
     const m = this.root.querySelector("#meter");
     if (v) v.textContent = formatBpm(bpm);
+    if (grid && this.beatEdit) this.beatEdit.syncMeter(meter);
     if (m) {
       m.textContent = grid ? `${meter}/4` : "";
       m.hidden = !grid;
@@ -804,7 +805,10 @@ export class PlayerView {
     const len = (cue.loop_end_sec - cue.position_sec) * factor;
     const end = Math.round(Math.min(cue.position_sec + len, this.engine.duration) * 1000) / 1000;
     if (end <= cue.position_sec + 0.05) return;
-    if (await this.updateCue(cue, { loop_end_sec: end })) this.applyLoop();
+    if (await this.updateCue(cue, { loop_end_sec: end })) {
+      this.applyLoop();
+      toast(`キュー「${cue.label || "キュー"}」のループの終点を ${formatTime(end, true)} に変えて保存しました。`);
+    }
   }
 
   toggleSnap(on) {
@@ -942,11 +946,12 @@ export class PlayerView {
   // --- キーボード -------------------------------------------------------------
 
   handleKey(e) {
+    if (e.defaultPrevented) return; // ボタンなどが自分で処理したキー（タップの Space など）
     const tag = (e.target && e.target.tagName) || "";
     if (["INPUT", "TEXTAREA", "SELECT"].includes(tag) || document.querySelector(".modal-back")) return;
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
-      // 拍の補正を元に戻す
-      if (this.beatEdit && this.beatGrid && this.beatGrid.canUndo) {
+      // 拍の補正を元に戻す（補正パネルを開いているときだけ）
+      if (this.beatEdit && this.beatEdit.open && this.beatGrid && this.beatGrid.canUndo) {
         e.preventDefault();
         this.beatEdit.undo();
       }
@@ -1101,8 +1106,8 @@ export class PlayerView {
           title: `再生位置の小節の頭から ${n} 小節をループします`, "aria-pressed": "false",
           onclick: () => this.setBarLoop(n),
         })),
-        el("button", { class: "btn small", type: "button", id: "loop-half", text: "½", title: "ループを半分の長さに（[ キー）", onclick: () => this.scaleLoop(0.5) }),
-        el("button", { class: "btn small", type: "button", id: "loop-double", text: "×2", title: "ループを倍の長さに（] キー）", onclick: () => this.scaleLoop(2) }),
+        el("button", { class: "btn small", type: "button", id: "loop-half", text: "½", title: "ループを半分の長さに（[ キー）。キューのループは保存した終点を書き換えます", onclick: () => this.scaleLoop(0.5) }),
+        el("button", { class: "btn small", type: "button", id: "loop-double", text: "×2", title: "ループを倍の長さに（] キー）。キューのループは保存した終点を書き換えます", onclick: () => this.scaleLoop(2) }),
         el("span", { class: "bar-loop-state", id: "bar-loop-state" })));
 
     const help = el("p", { class: "keys-help" },
@@ -1112,7 +1117,7 @@ export class PlayerView {
       ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ　",
       el("kbd", { text: "B" }), " 小節ループ　", el("kbd", { text: "[" }), el("kbd", { text: "]" }),
       " ループ ½/×2　", el("kbd", { text: "T" }), " タップ（拍の補正を開いているとき）　",
-      el("kbd", { text: "Ctrl+Z" }), " 拍の補正を元に戻す");
+      el("kbd", { text: "Ctrl+Z" }), " 拍の補正を元に戻す（拍の補正を開いているとき）");
 
     if (this.beatEdit) this.beatEdit.dispose();
     this.beatEdit = new BeatEditPanel(this);

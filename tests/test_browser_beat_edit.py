@@ -44,6 +44,15 @@ def _bars_after_draw(pg: Any, time_text: str) -> int:
     return int(pg.get_attribute("#wave-zoom", "data-bars") or 0)
 
 
+def _bpm_text(pg: Any) -> str:
+    return pg.inner_text("#bpm-value")
+
+
+def _hide_toast(pg: Any) -> None:
+    """スクリーンショットの前に通知を消す（普段の画面を撮る）。"""
+    pg.evaluate("() => { document.getElementById('toast').hidden = true; }")
+
+
 def _wait_state(pg: Any, text: str) -> None:
     pg.wait_for_function(
         "(t) => document.querySelector('#be-state').textContent === t", arg=text
@@ -82,8 +91,18 @@ def test_edit_panel_double_tap_undo_reset(
     _wait_bpm(page, "150.0")  # 後ろの区間はそのまま
     assert not page.locator("#be-undo").is_disabled()
     _seek(page, 2.0)
+    _hide_toast(page)
     _shot(page, "beat_edit_double.png")
 
+    # Ctrl+Z は補正パネルを開いているときだけ（閉じていると何もしない）
+    page.click("#beat-edit > summary")
+    page.wait_for_selector("#be-double", state="hidden")
+    page.locator("body").focus()
+    page.keyboard.press("Control+z")
+    page.wait_for_timeout(300)
+    assert page.inner_text("#be-state") == "補正済み" and _bpm_text(page) == "240.0"
+    page.click("#beat-edit > summary")
+    page.wait_for_selector("#be-double", state="visible")
     # 元に戻す（Ctrl+Z）
     page.locator("body").focus()
     page.keyboard.press("Control+z")
@@ -217,10 +236,18 @@ def test_snap_bar_loop_cues_and_tempo_marks(
     page.click("#be-undo")
     _wait_state(page, "自動")
 
-    # キュー2点から: 8.0 秒と 12.83 秒の間（今の 150 BPM・4/4 なら約 3 小節）を 5 小節に
+    # キュー2点から: 8.0 秒と 12.83 秒の間（今の 150 BPM・4/4 なら約 3 小節）を 5 小節に。
+    # 1小節の拍数は選択欄（既定は曲の拍子 4）で、必ずサーバーに送る
     page.wait_for_selector("#be-cues", state="visible")
+    assert page.input_value("#be-cue-meter") == "4"
     assert page.input_value("#be-bars") == "3"
+    page.select_option("#be-cue-meter", "3")
+    assert page.input_value("#be-bars") == "4"  # 3 拍子なら約 4 小節
+    page.select_option("#be-cue-meter", "4")
     page.fill("#be-bars", "5")
+    sent: list[Any] = []
+    page.on("request", lambda r: sent.append(r.post_data_json)
+            if r.url.endswith("/beats/edit") else None)
     page.click("#be-cues")
     _wait_state(page, "補正済み")
     _seek(page, 10.0)
@@ -229,13 +256,32 @@ def test_snap_bar_loop_cues_and_tempo_marks(
     )
     downbeats = page.evaluate(f"() => Array.from({VIEW}.beatGrid.downbeats)")
     assert 8.0 in downbeats and 12.83 in downbeats
+    assert sent and sent[-1]["op"] == "cues" and sent[-1]["beats_per_bar"] == 4
 
-    # スクリーンショット（パネルを開いた PC・スマホ幅）
+    # 拍子の選択欄は、開いている間は再生位置の小節の拍数に合わせて変わる
     page.select_option("#be-range", "segment")
+    _seek(page, 20.0)
+    page.select_option("#be-meter", "3")
+    page.wait_for_function("() => document.querySelector('#meter').textContent === '3/4'")
+    page.locator("body").focus()
+    _seek(page, 3.0)
+    page.wait_for_function("() => document.querySelector('#be-meter').value === '4'")
+    _seek(page, 20.0)
+    page.wait_for_function("() => document.querySelector('#be-meter').value === '3'")
+    page.click("#be-undo")
+    _wait_state(page, "補正済み")
+    # キューのループに ½・×2 をかけると保存した終点を書き換える（title と通知で知らせる）
+    assert "書き換え" in (page.get_attribute("#loop-double", "title") or "")
+
+    # スクリーンショット（パネルを開いた PC・スマホ幅。通知が写らない普段の状態）
+    _seek(page, 10.0)
     page.evaluate(f"() => {VIEW}.setBarLoop(4)")
+    _hide_toast(page)
+    page.wait_for_timeout(200)
     _shot(page, "beat_edit_open.png")
     page.set_viewport_size(PHONE)
     page.wait_for_timeout(300)
+    _hide_toast(page)
     _shot(page, "beat_edit_phone.png")
     page.set_viewport_size(DESKTOP)
     assert not page.errors  # type: ignore[attr-defined]
@@ -251,6 +297,15 @@ def test_tap_uses_output_latency(page: Any, server: LiveServer, tmp_path: Path) 
     page.wait_for_function(
         "() => document.querySelector('#toast').textContent.includes('再生しながら')"
     )
+    # タップのボタンにフォーカスがあるときの Space はタップだけ（再生/停止にはならない）
+    page.evaluate("() => { document.getElementById('toast').textContent = ''; }")
+    page.focus("#be-tap")
+    page.keyboard.press("Space")
+    page.wait_for_function(
+        "() => document.querySelector('#toast').textContent.includes('再生しながら')"
+    )
+    page.wait_for_timeout(200)
+    assert page.evaluate(f"() => {VIEW}.engine.playing") is False
     got = page.evaluate(
         f"""() => {{
         const v = {VIEW};
