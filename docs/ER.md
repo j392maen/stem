@@ -24,8 +24,8 @@
 | BEAT_GRID | track_id PK FK, analyzer(解析器の名前と版。例 beat_this 1.1.0 final0), beats_json(拍の時刻・秒の配列), downbeats_json(小節の頭の時刻・秒の配列), time_signature(推定の拍子。1小節の拍数), created_at, edited_beats_json(null可。ユーザーが直した拍), edited_downbeats_json(null可), edited_time_signature(null可) |
 | BEAT_EDIT | edit_id PK, track_id FK, op(downbeat/double/half/meter/shift/tap/cues/reset/reanalyze), params_json(操作の引数), before_json(操作の前の直した結果 {beats, downbeats, time_signature}。null=自動の結果のままだった), created_at |
 | BEAT_ANCHOR | anchor_id PK, track_id FK, position_sec, kind(downbeat/beat), bar_number(null可), bpm(null可), created_at（T10c では未使用。将来のワープマーカー用） |
-| EXPORT | export_id PK, job_id FK, listen_preset_id FK(mix のみ), export_type(single/all/mix), format(wav/flac/mp3/zip), output_path, created_at |
-| EXPORT_ITEM | export_id PK FK, stem_id PK FK |
+| EXPORT | export_id PK, job_id FK, listen_preset_id FK(mix のみ), export_type(single/all/mix), format(wav/flac/mp3。all は ZIP にまとめ中身がこの形式), output_path, created_at, status(queued/running/done/failed), progress, stage, error_message, filename, bytes, mix_gain_db(mix で ±1 を超えたとき全体にかけた dB), finished_at |
+| EXPORT_ITEM | export_id PK FK, stem_id PK FK, gain_db(mix の音量) |
 | OFFLINE_CACHE | device_id PK FK, track_id PK FK, cached_at, bytes |
 
 制約:

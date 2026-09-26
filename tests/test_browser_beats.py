@@ -119,12 +119,15 @@ def test_bar_lines_and_bpm_follow_position(
     assert page.get_attribute("#tempo", "class") == "tempo"
     # 拡大波形は拍の線・小節線（8 秒表示で 120 BPM → 4 小節前後）
     # シーク（2 秒）の後に描いた画面を待つ（シーク前の 0 秒の画面では 2 小節しか見えない。
-    # 以前はここで前の画面を読んでまれに失敗した）
-    page.wait_for_function("() => document.querySelector('#time-now').textContent === '0:02.0'")
+    # 以前はここで前の画面を読んでまれに失敗した。T08 側でも同じ直しが入っていたのでまとめた）
+    page.wait_for_function(
+        "() => document.querySelector('#time-now').textContent === '0:02.0'", timeout=5000
+    )
     page.wait_for_function(
         "() => { const z = document.querySelector('#wave-zoom');"
         " const n = Number(z.dataset.bars);"
-        " return z.dataset.grid === 'beats' && n >= 3 && n <= 6; }"
+        " return z.dataset.grid === 'beats' && n >= 3 && n <= 6; }",
+        timeout=5000,
     )
     _shot(page, "beats_120.png")
 
