@@ -15,7 +15,7 @@ from stemapp.config import Settings
 from stemapp.delivery import fake_encoder, rebuild_delivery_files
 from stemapp.ingest import import_file
 from stemapp.jobs import delete_job
-from stemapp.models import InputSource, SeparationJob, Stem, StemRendition, Waveform
+from stemapp.models import InputSource, SeparationJob, Stem, StemRendition, Track, Waveform
 from stemapp.seed import seed
 from stemapp.separation import FakeSeparator
 from stemapp.separation.pipeline import separate_track
@@ -161,6 +161,22 @@ def test_empty_name_falls_back_to_track_id(
     res = _split(seeded, settings, track_id, "fast")
     job = seeded.get(SeparationJob, res.job_id)
     assert job is not None and job.output_dir == f"stems/track_{track_id}/fast"
+
+
+def test_no_source_falls_back_to_title(
+    seeded: Session, settings: Settings, tmp_path: Path
+) -> None:
+    # 古いデータなどで INPUT_SOURCE が無い曲は、曲名（TRACK.title）を使う
+    track_id = _track(seeded, settings, tmp_path, "whatever.wav")
+    for src in seeded.scalars(select(InputSource).where(InputSource.track_id == track_id)):
+        seeded.delete(src)
+    track = seeded.get(Track, track_id)
+    assert track is not None
+    track.title = "synth: 4min"
+    seeded.commit()
+    res = _split(seeded, settings, track_id, "fast")
+    job = seeded.get(SeparationJob, res.job_id)
+    assert job is not None and job.output_dir == "stems/synth 4min/fast"
 
 
 def test_multiple_jobs_and_force(seeded: Session, settings: Settings, tmp_path: Path) -> None:
