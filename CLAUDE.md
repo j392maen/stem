@@ -29,3 +29,4 @@
 - 通常テストは GPU なしで通す（Fake を使う）。GPU テストは `-m gpu`。
 - 秘密情報（パスコード等）は `.env` に置き、コミットしない。
 - 音源ファイルやモデルの重みをコミットしない。
+- bash で Windows のパスを扱うときに `cygpath` を使わない（この PC では anaconda の cygpath が `C:\Users\maeba\anaconda3\Library\c\...` に変換してしまい、別の場所にファイルができる）。パスは `C:\...` の形で直接書く。
