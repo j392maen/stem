@@ -47,10 +47,10 @@ a { color: inherit; }
   display: flex; align-items: center; gap: 8px;
   font-weight: 800; letter-spacing: 0.14em; text-decoration: none; font-size: 15px;
 }
+/* アプリのアイコン（波形の棒）。赤い丸は録音ボタンに見えるので使わない */
 .brand-mark {
-  width: 14px; height: 14px; border-radius: 50%;
-  background: radial-gradient(circle at 35% 35%, var(--accent), var(--accent-deep));
-  box-shadow: 0 0 10px rgba(255, 59, 78, 0.55);
+  width: 20px; height: 20px; border-radius: 5px;
+  background: url("../icons/icon.svg") center / contain no-repeat;
 }
 .topnav { display: flex; gap: 8px; margin-left: auto; align-items: center; min-width: 0; }
 
@@ -124,6 +124,15 @@ select:focus-visible, .play-btn:focus-visible {
   padding: 10px 14px; border-radius: 6px; max-width: calc(100vw - 32px);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
 }
+
+/* 画面上部の注意（外から開いたのにパスコードが無い等）。閉じられる */
+.notice {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  max-width: 1440px; margin: 12px auto 0; padding: 10px 14px;
+  background: var(--accent-soft); border: 1px solid var(--accent-deep); border-radius: var(--radius);
+  width: calc(100% - 32px); line-height: 1.6;
+}
+.notice .grow { min-width: 12em; }
 
 /* --- ダイアログ --------------------------------------------------------------- */
 .modal-back {

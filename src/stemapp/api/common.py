@@ -86,7 +86,15 @@ def safe_data_file(settings: Settings, stored: str) -> Path:
 
 LOCAL_HOSTS = frozenset({"127.0.0.1", "::1"})
 # 中継（Tailscale Serve など）を通ったしるし。接続元が 127.0.0.1 でも、この PC の外から来ている
-PROXY_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host", "tailscale-user-login")
+PROXY_HEADERS = (
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "via",
+    "tailscale-user-login",
+)
 
 
 def is_local_request(request: Request) -> bool:
@@ -97,4 +105,17 @@ def is_local_request(request: Request) -> bool:
     host = request.client.host if request.client else ""
     if host not in LOCAL_HOSTS:
         return False
-    return not any(h in request.headers for h in PROXY_HEADERS)
+    return not is_proxied(request)
+
+
+def is_proxied(request: Request) -> bool:
+    """中継（Tailscale Serve など）を通ってきたか（中継のヘッダーがあるか）。"""
+    return any(h in request.headers for h in PROXY_HEADERS)
+
+
+def is_https(request: Request) -> bool:
+    """ブラウザから見て HTTPS か（Tailscale Serve は X-Forwarded-Proto: https を付ける）。"""
+    if request.url.scheme == "https":
+        return True
+    proto = request.headers.get("x-forwarded-proto", "")
+    return proto.split(",")[0].strip().lower() == "https"
