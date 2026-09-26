@@ -1,8 +1,9 @@
 """stem の保存フォルダ（`data/stems/<元のファイル名>/<分け方>/`）の名前を決める。
 
 - 曲のフォルダ名は INPUT_SOURCE.original_name（最初に取り込みに成功したもの。ファイルなら
-  拡張子を除く）を `safe_folder_name` で整形したもの。別の曲が同じ名前を使っていたら ` (2)`,
-  ` (3)` … を付ける。一度決めたら変えない（その曲のジョブの SEPARATION_JOB.output_dir から読む）。
+  拡張子を除く。INPUT_SOURCE が無いときは TRACK.title）を `safe_folder_name` で整形したもの。
+  別の曲が同じ名前を使っていたら ` (2)`, ` (3)` … を付ける。
+  一度決めたら変えない（その曲のジョブの SEPARATION_JOB.output_dir から読む）。
 - ジョブのフォルダ名はプリセットの code。同じ曲の同じ code が使われていたら ` (2)` … を付ける。
 - 決めた場所は SEPARATION_JOB.output_dir（データフォルダからの相対パス、/ 区切り）に保存する。
   NULL は T13 より前の `data/stems/<job_id>/`（`stemapp migrate-folders` で移す）。
@@ -178,9 +179,10 @@ class FolderPlanner:
         name = track_folder_of_jobs(self.session, track_id)
         if name is None:
             track = self.session.get(Track, track_id)
-            base = safe_folder_name(track_source_name(self.session, track_id), track_id)
-            if track is None:
-                base = f"track_{track_id}"
+            raw = track_source_name(self.session, track_id)
+            if raw is None and track is not None:
+                raw = track.title  # INPUT_SOURCE が無い（または名前が無い）ときは曲名
+            base = safe_folder_name(raw, track_id)
             taken = _folders_of_other_tracks(self.session, track_id) | {
                 v for k, v in self._track_folder.items() if k != track_id
             }
