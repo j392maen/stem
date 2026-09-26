@@ -41,6 +41,8 @@ MAX_SHIFT_SEC = 1.0
 MIN_GAP_SEC = 0.03
 # キュー2点からの小節数の上限
 MAX_BARS = 1024
+# 補正した結果の拍の数の上限（300 BPM で約 67 分）。これを超える操作は誤りとみなす
+MAX_BEATS = 20000
 
 RANGE_KINDS = ("segment", "all", "loop")
 OPS = ("downbeat", "double", "half", "meter", "shift", "tap", "cues")
@@ -110,6 +112,8 @@ def _to_state(beats: np.ndarray, flags: np.ndarray, default_sig: int) -> GridSta
     keep = np.concatenate([[True], np.diff(beats) > 1e-4]) if len(beats) else np.zeros(0, bool)
     beats = beats[keep]
     flags = flags[keep]
+    if len(beats) > MAX_BEATS:
+        raise BeatEditError(f"拍の数が多すぎます（{len(beats)}。上限 {MAX_BEATS}）。")
     b = tuple(round(float(x), 4) for x in beats)
     d = tuple(round(float(x), 4) for x, f in zip(beats, flags, strict=True) if f)
     sig = estimate_time_signature(b, d, default=default_sig) if len(d) >= 2 else default_sig
@@ -151,6 +155,19 @@ def _first_flag(flags: np.ndarray, lo: int, hi: int) -> int:
         if flags[i]:
             return i
     return lo
+
+
+def _shared_start(beats: np.ndarray, rng: BeatRange, lo: int) -> bool:
+    """範囲が区間で、その始まりの拍が前の区間と共有されている（前の区間の終わりの拍でもある）か。
+
+    共有の拍は、ずらす・タップ・÷2 で動かさない・消さない（前の区間を変えないため）。
+    """
+    return (
+        rng.kind == "segment"
+        and math.isfinite(rng.start)
+        and 0 < lo < len(beats)
+        and abs(float(beats[lo]) - rng.start) <= EDGE_EPS
+    )
 
 
 def _need_beats(beats: np.ndarray, lo: int, hi: int, n: int = 1) -> None:
@@ -206,8 +223,8 @@ def set_downbeat(state: GridState, position: float, rng: BeatRange = ALL) -> Gri
 def scale_tempo(state: GridState, factor: int | float, rng: BeatRange = ALL) -> GridState:
     """×2（拍の間に拍を足す）／÷2（1つおきに間引く）。小節は範囲の最初の小節の頭から付け直す。
 
-    ÷2 は小節の頭の拍を残す側で間引く。範囲の始まりの拍が前の範囲と共有されている
-    （前にも拍がある）ときは、その拍は消さない。
+    ÷2 は小節の頭の拍を残す側で間引く。範囲が区間で、始まりの拍が前の区間と共有されている
+    ときは、その拍を残し、その拍を基準に1つおきに間引く（直後に半分の間隔を残さない）。
     """
     beats, flags = _to_arrays(state)
     lo, hi = _index_range(beats, rng)
@@ -227,11 +244,14 @@ def scale_tempo(state: GridState, factor: int | float, rng: BeatRange = ALL) -> 
         return _to_state(new_beats, new_flags, state.time_signature)
     if factor == 0.5:
         _need_beats(beats, lo, hi, 2)
-        anchor = _first_flag(flags, lo, hi)
+        base = lo if _shared_start(beats, rng, lo) else _first_flag(flags, lo, hi)
         keep = np.ones(len(beats), dtype=bool)
         for i in range(lo, hi):
-            if (i - anchor) % 2 != 0 and not (i == lo and lo > 0):
+            if (i - base) % 2 != 0:
                 keep[i] = False
+        # 小節の頭は、残した拍のうち最初の小節の頭（無ければ範囲の最初の拍）から付け直す
+        kept_flags = [i for i in range(lo, hi) if keep[i] and flags[i]]
+        anchor = kept_flags[0] if kept_flags else base
         new_beats, new_flags = beats[keep], flags[keep]
         lo2, hi2 = _index_range(new_beats, rng)
         anchor2 = int(np.searchsorted(new_beats, beats[anchor]))
@@ -259,11 +279,14 @@ def shift_beats(state: GridState, delta_sec: float, rng: BeatRange = ALL) -> Gri
     """ずらす: 範囲の拍（と小節の頭）を delta_sec だけ前後に動かす。
 
     範囲の外の拍を越える（MIN_GAP_SEC より近づく）ときは動かさない。0 秒より前に出た拍は消す。
+    範囲が区間のとき、前の区間と共有する始まりの拍は動かさない。
     """
     if not math.isfinite(delta_sec) or abs(delta_sec) > MAX_SHIFT_SEC:
         raise BeatEditError("ずらす量が大きすぎます。")
     beats, flags = _to_arrays(state)
     lo, hi = _index_range(beats, rng)
+    if _shared_start(beats, rng, lo):
+        lo += 1
     _need_beats(beats, lo, hi)
     moved = beats.copy()
     moved[lo:hi] += delta_sec
@@ -319,6 +342,8 @@ def tap_tempo(state: GridState, taps: Sequence[float], rng: BeatRange = ALL) -> 
 
     たたいた時刻に「番号 × 間隔 ＋ 位置」を最小二乗で当てはめる（1回ごとのずれをならす）。
     小節の頭は、たたき始めにいちばん近い今の小節の頭に合わせる（無ければ最初にたたいた拍）。
+    1小節の拍数は曲の拍子（state.time_signature）。範囲の中の小節から推定すると、乱れた所では
+    2拍などになるため。範囲が区間のとき、前の区間と共有する始まりの拍は残す。
     """
     t = np.sort(np.asarray([float(x) for x in taps], dtype=np.float64))
     if len(t) < MIN_TAPS:
@@ -332,7 +357,8 @@ def tap_tempo(state: GridState, taps: Sequence[float], rng: BeatRange = ALL) -> 
     _check_bpm(period)
     beats, flags = _to_arrays(state)
     lo, hi = _index_range(beats, rng)
-    per_bar = _local_meter(beats, flags, lo, hi, state.time_signature)
+    per_bar = state.time_signature
+    shared = _shared_start(beats, rng, lo)
     # 置き換える範囲（範囲が曲の端までなら、今の拍とたたいた所の広い方まで）
     first = min(float(beats[0]) if len(beats) else t[0], t[0])
     last = max(float(beats[-1]) if len(beats) else t[-1], t[-1])
@@ -342,6 +368,11 @@ def tap_tempo(state: GridState, taps: Sequence[float], rng: BeatRange = ALL) -> 
     k1 = math.floor((end - EDGE_EPS - t0) / period)
     new_beats = t0 + period * np.arange(k0, k1 + 1, dtype=np.float64)
     new_beats = new_beats[new_beats >= 0.0]
+    remove_from = start
+    if shared:
+        # 共有の拍は残し、それに半拍より近い拍は作らない
+        remove_from = float(beats[lo]) + 2 * EDGE_EPS
+        new_beats = new_beats[new_beats > float(beats[lo]) + 0.5 * period]
     if rng.bounded_end:
         # 範囲の後ろの最初の拍（区間なら次の区間の最初の拍）は残す。それに半拍より近い拍は作らない
         after = beats[beats >= end - EDGE_EPS]
@@ -352,7 +383,7 @@ def tap_tempo(state: GridState, taps: Sequence[float], rng: BeatRange = ALL) -> 
     if db_idx:
         downbeat_at = float(min((beats[i] for i in db_idx), key=lambda x: abs(x - t[0])))
     return _regular_replace(
-        beats, flags, start, end, new_beats, downbeat_at, per_bar, state.time_signature
+        beats, flags, remove_from, end, new_beats, downbeat_at, per_bar, state.time_signature
     )
 
 
@@ -361,16 +392,17 @@ def grid_from_cues(
 ) -> GridState:
     """キュー2点から: start と end の間を bars 小節の一定テンポの拍で置き換える。
 
-    start と end は小節の頭になる。1小節の拍数は per_bar（省略時はその間の今の小節の拍数）。
+    start と end は小節の頭になる。1小節の拍数は per_bar（省略時は曲の拍子 state.time_signature）。
+    その間の今の小節から推定しないのは、直したい所は小節の頭も乱れていて、2拍などと数えるため
+    （実データ「水槽」で 67.65 BPM になった）。
     """
     if not (end > start >= 0.0):
         raise BeatEditError("2つ目のキューは1つ目より後ろにしてください。")
     if not (1 <= bars <= MAX_BARS):
         raise BeatEditError(f"小節数は 1〜{MAX_BARS} にしてください。")
     beats, flags = _to_arrays(state)
-    lo, hi = _index_range(beats, BeatRange(start, end, "loop"))
     if per_bar is None:
-        per_bar = _local_meter(beats, flags, lo, hi, state.time_signature)
+        per_bar = state.time_signature
     if per_bar not in TIME_SIGNATURES:
         raise BeatEditError("拍子は 2〜12 拍から選んでください。")
     n = bars * per_bar

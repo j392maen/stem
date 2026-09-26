@@ -213,7 +213,7 @@ def _grid_or_404(session: Session, track_id: int) -> BeatGrid:
 
 
 EditOp = Literal["downbeat", "double", "half", "meter", "shift", "tap", "cues"]
-Sec = Annotated[float, Field(ge=0.0, le=24 * 60 * 60)]
+Sec = Annotated[float, Field(ge=0.0, le=24 * 60 * 60, allow_inf_nan=False)]
 
 
 class BeatEditRequest(BaseModel):
@@ -231,7 +231,7 @@ class BeatEditRequest(BaseModel):
     loop_end: Sec | None = None
     beats_per_bar: int | None = Field(default=None, ge=2, le=12)
     delta_sec: float | None = Field(default=None, ge=-1.0, le=1.0)
-    taps: list[float] | None = Field(default=None, max_length=64)
+    taps: list[Sec] | None = Field(default=None, max_length=64)  # 有限・0 以上（Sec）
     cue_start: Sec | None = None
     cue_end: Sec | None = None
     bars: int | None = Field(default=None, ge=1, le=1024)
@@ -250,10 +250,30 @@ class BeatEditRequest(BaseModel):
         return self
 
 
+# 曲の長さを超える時刻を受け付ける余裕（秒）。曲の長さが無いときは自動の拍の最後からの余裕
+TIME_MARGIN_SEC = 1.0
+NO_DURATION_MARGIN_SEC = 5.0
+
+
+def _check_times(session: Session, grid: BeatGrid, body: BeatEditRequest) -> None:
+    """時刻（再生位置・ループ・キュー・タップ）が曲の長さの中にあるか。外れていれば 400。"""
+    track = session.get(Track, grid.track_id)
+    if track is not None and track.duration_sec:
+        limit = float(track.duration_sec) + TIME_MARGIN_SEC
+    else:
+        auto = list(grid.beats_json or [])
+        limit = (max(auto) if auto else 0.0) + NO_DURATION_MARGIN_SEC
+    times = [body.position, body.loop_start, body.loop_end, body.cue_start, body.cue_end]
+    times += list(body.taps or [])
+    if any(t is not None and t > limit for t in times):
+        raise HTTPException(status_code=400, detail="曲の長さを超える時刻は指定できません。")
+
+
 @router.post("/tracks/{track_id}/beats/edit")
 def edit_beats(track_id: int, body: BeatEditRequest, session: SessionDep) -> dict[str, Any]:
     """拍を補正して保存し、有効な拍を返す。補正できないときは 400（理由は detail）。"""
     grid = _grid_or_404(session, track_id)
+    _check_times(session, grid, body)
     params = body.model_dump(exclude_none=True, exclude={"op"})
     try:
         edit_grid(session, grid, body.op, params)
