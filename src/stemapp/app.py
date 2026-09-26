@@ -19,10 +19,12 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
 from stemapp import __version__
-from stemapp.api import auth, cues, files, folders, imports, master, tracks
+from stemapp.api import auth, cues, exports, files, folders, imports, master, tracks
 from stemapp.api.imports import ImportDeps, ImportManager
+from stemapp.audio import FfmpegRunner
 from stemapp.config import Settings, get_settings
 from stemapp.db import init_db, make_engine, make_session_factory
+from stemapp.exports import ExportManager
 from stemapp.ingest.service import recover_interrupted_imports
 from stemapp.seed import seed
 
@@ -71,9 +73,14 @@ class WebFiles(StaticFiles):
 
 
 def create_app(
-    settings: Settings | None = None, *, import_deps: ImportDeps | None = None
+    settings: Settings | None = None,
+    *,
+    import_deps: ImportDeps | None = None,
+    export_runner: FfmpegRunner | None = None,
 ) -> FastAPI:
     """アプリを作る。
+
+    export_runner は書き出し（MP3）で使う ffmpeg の代わり（テスト用。None なら PATH の ffmpeg）。
 
     起動時に DB 作成・列の追加・初期データ投入と、中断された取り込みの片付けを行う。
     """
@@ -93,10 +100,14 @@ def create_app(
         manager = ImportManager(settings, session_factory, import_deps or ImportDeps())
         manager.start()
         app.state.import_manager = manager
+        export_manager = ExportManager(settings, session_factory, runner=export_runner)
+        export_manager.start()
+        app.state.export_manager = export_manager
         try:
             yield
         finally:
             manager.stop()
+            export_manager.stop()
             engine.dispose()
 
     # パスコードを設定しているときは API の説明ページ（/docs 等）を出さない
@@ -118,7 +129,7 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    for module in (auth, imports, tracks, cues, files, folders, master):
+    for module in (auth, imports, tracks, cues, files, folders, master, exports):
         app.include_router(module.router)
     # 画面。API のルートより後に登録する（/api/* はここまで来ない）
     app.mount("/", WebFiles(directory=WEB_DIR, html=True), name="web")
