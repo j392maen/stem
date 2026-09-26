@@ -16,6 +16,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from stemapp.config import Settings
+from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
 from stemapp.library import find_done_job
 from stemapp.models import SeparationJob, Track
 from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
@@ -152,6 +153,7 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
     if job is None:
         raise JobNotFound(f"ジョブが見つかりません（job {job_id}）。")
     output_dir = job.output_dir
+    export_ids = export_ids_for_jobs(session, [job_id])
     # 確かめてから消すまでの間にワーカーが取り出さないよう、条件付きで消す
     res = session.execute(
         delete(SeparationJob).where(
@@ -175,6 +177,7 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
     session.expunge(job)
     remove_job_dir(settings, job_id, output_dir)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
+    remove_export_dirs(settings, export_ids)  # 書き出したファイル（data/exports/<id>）
     log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
     return job
 
