@@ -166,6 +166,12 @@ export class Engine {
     this.playing = false;
   }
 
+  /** 出力の遅延（秒）。再生位置の音が実際に聞こえるまでの時間（タップの補正に使う）。 */
+  outputLatency() {
+    const c = this.ctx;
+    return Math.max(0, (Number(c.outputLatency) || 0) + (Number(c.baseLatency) || 0));
+  }
+
   /** 鳴っている音源の数（テスト・確認用）。 */
   activeSources() {
     let n = 0;
