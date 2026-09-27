@@ -22,8 +22,10 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    """一時ディレクトリを使う設定（.env は読まない）。"""
-    return Settings(_env_file=None, data_dir=tmp_path / "data")  # type: ignore[call-arg]
+    """一時ディレクトリを使う設定（.env は読まない）。TestClient の Host を許可する。"""
+    return Settings(  # type: ignore[call-arg]
+        _env_file=None, data_dir=tmp_path / "data", allowed_hosts="testserver"
+    )
 
 
 @pytest.fixture
