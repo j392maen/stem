@@ -1,7 +1,8 @@
-// 画面の入口: ログインの確認と、ハッシュでの画面切り替え（#/library, #/track/<id>）。
+// 画面の入口: ログインの確認と、ハッシュでの画面切り替え（#/library, #/track/<id>, #/diag）。
 
 import { api, onUnauthorized } from "./api.js";
 import * as beatsMod from "./beats.js";
+import { DiagView } from "./diag.js";
 import * as engineMod from "./engine.js";
 import { LibraryView } from "./library.js";
 import * as peaksMod from "./peaks.js";
@@ -79,13 +80,18 @@ async function route() {
   renderNav();
   const hash = location.hash || "#/library";
   const m = /^#\/track\/(\d+)$/.exec(hash);
+  let title = "ライブラリ";
   if (m) {
     current = new PlayerView(root, Number(m[1]));
+    title = "プレイヤー";
+  } else if (hash === "#/diag") {
+    current = new DiagView(root);
+    title = "端末の診断";
   } else {
     if (hash !== "#/library") history.replaceState(null, "", "#/library");
     current = new LibraryView(root);
   }
-  document.title = m ? "stemapp - プレイヤー" : "stemapp - ライブラリ";
+  document.title = `stemapp - ${title}`;
   try {
     await current.mount();
   } catch (e) {
@@ -93,10 +99,41 @@ async function route() {
   }
 }
 
+const NOTICE_KEY = "stemapp.hidePasscodeNotice";
+
+/** 外（Tailscale 経由など）から開いたのにパスコードが無いとき、設定を勧める（使えなくはしない）。 */
+function showPasscodeNotice(show) {
+  const box = document.getElementById("notice");
+  if (!box) return;
+  let hidden = false;
+  try { hidden = sessionStorage.getItem(NOTICE_KEY) === "1"; } catch { /* 保存できなくても動く */ }
+  if (!show || hidden) { box.hidden = true; return; }
+  box.replaceChildren(
+    el("span", { class: "grow", id: "passcode-notice",
+      text: "外から開いていますが、パスコードが設定されていません。PC の .env に STEMAPP_PASSCODE を設定し、stemapp を起動し直すことをおすすめします。" }),
+    el("button", {
+      class: "btn small", type: "button", text: "閉じる",
+      onclick: () => {
+        box.hidden = true;
+        try { sessionStorage.setItem(NOTICE_KEY, "1"); } catch { /* 保存できなくても動く */ }
+      },
+    }),
+  );
+  box.hidden = false;
+}
+
+/** ホーム画面に追加したときのための Service Worker（画面ファイルだけ。音声・API は扱わない）。 */
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+  navigator.serviceWorker.register("sw.js").catch(() => { /* 無くても動く */ });
+}
+
 async function boot() {
+  registerServiceWorker();
   try {
     const me = await api("/api/me");
     passcodeRequired = !!me.passcode_required;
+    showPasscodeNotice(!!me.passcode_recommended);
   } catch (e) {
     if (e.status === 401) return; // ログイン画面は onUnauthorized が出す
     root.replaceChildren(el("p", { class: "empty error-text", text: e.message }));

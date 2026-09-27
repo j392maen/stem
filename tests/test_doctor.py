@@ -131,3 +131,112 @@ def test_host_public_is_warned(tmp_path: Path, host: str) -> None:
 
 def test_host_check_is_in_default_checks() -> None:
     assert doctor.check_host in doctor.DEFAULT_CHECKS
+
+
+# --- Tailscale ------------------------------------------------------------------------
+
+TS = "unagi.tail8b25a2.ts.net"
+TS_STATUS = {"BackendState": "Running", "Self": {"DNSName": f"{TS}."}}
+
+
+def _serve(port: int = 8000, funnel: bool = False) -> dict[str, object]:
+    conf: dict[str, object] = {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {f"{TS}:443": {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{port}"}}}},
+    }
+    if funnel:
+        conf["AllowFunnel"] = {f"{TS}:443": True}
+    return conf
+
+
+def _fake_tailscale(
+    monkeypatch: pytest.MonkeyPatch, status: object, serve: object = None
+) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake(_exe: str, args: list[str]) -> object:
+        calls.append(list(args))
+        if args[0] == "status":
+            if isinstance(status, Exception):
+                raise status
+            return status
+        if isinstance(serve, Exception):
+            raise serve
+        return {} if serve is None else serve
+
+    monkeypatch.setattr(doctor, "find_tailscale", lambda: "tailscale.exe")
+    monkeypatch.setattr(doctor, "_tailscale_json", fake)
+    return calls
+
+
+def test_tailscale_missing_is_warn(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "find_tailscale", lambda: None)
+    res = doctor.check_tailscale(settings)
+    assert res.status is Status.WARN and "入っていません" in res.detail
+
+
+def test_tailscale_not_logged_in(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_tailscale(monkeypatch, {"BackendState": "NeedsLogin"})
+    res = doctor.check_tailscale(settings)
+    assert res.status is Status.WARN and "ログイン" in res.detail
+
+
+def test_tailscale_status_error(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_tailscale(monkeypatch, OSError("起動していない"))
+    assert doctor.check_tailscale(settings).status is Status.WARN
+
+
+def test_tailscale_running_without_serve(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_tailscale(monkeypatch, TS_STATUS, {})
+    res = doctor.check_tailscale(settings.model_copy(update={"allowed_hosts": ""}))
+    assert res.status is Status.OK
+    assert TS in res.detail and "serve 未設定" in res.detail
+    assert f"STEMAPP_ALLOWED_HOSTS={TS}" in res.hint  # 名前を見つけて案内する
+    assert "tailscale-serve.ps1 start" in res.hint
+
+
+def test_tailscale_serve_on_and_allowed(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_tailscale(monkeypatch, TS_STATUS, _serve())
+    res = doctor.check_tailscale(settings.model_copy(update={"allowed_hosts": TS}))
+    assert res.status is Status.OK
+    assert f"https://{TS}:443/" in res.detail
+    assert res.hint == ""
+
+
+def test_tailscale_serve_on_but_host_not_allowed(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_tailscale(monkeypatch, TS_STATUS, _serve())
+    res = doctor.check_tailscale(settings.model_copy(update={"allowed_hosts": ""}))
+    assert res.status is Status.WARN
+    assert "STEMAPP_ALLOWED_HOSTS" in res.hint
+
+
+def test_tailscale_serve_other_port_is_not_ours(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_tailscale(monkeypatch, TS_STATUS, _serve(port=9999))
+    res = doctor.check_tailscale(settings.model_copy(update={"allowed_hosts": TS}))
+    assert "serve 未設定" in res.detail
+
+
+def test_tailscale_funnel_is_warned(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_tailscale(monkeypatch, TS_STATUS, _serve(funnel=True))
+    res = doctor.check_tailscale(settings.model_copy(update={"allowed_hosts": TS}))
+    assert res.status is Status.WARN
+    assert "Funnel" in res.detail and "funnel reset" in res.hint
+
+
+def test_tailscale_serve_status_error(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_tailscale(monkeypatch, TS_STATUS, ValueError("壊れた JSON"))
+    res = doctor.check_tailscale(settings)
+    assert res.status is Status.OK
+    assert "取れません" in res.detail
+
+
+def test_tailscale_check_is_in_default_checks() -> None:
+    assert doctor.check_tailscale in doctor.DEFAULT_CHECKS

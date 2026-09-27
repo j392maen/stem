@@ -5,8 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0b0e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="stemapp">
 <title>stemapp</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/diag.css">
 <link rel="stylesheet" href="css/export.css">
 <script type="module" src="js/main.js"></script>
 </head>
@@ -17,6 +25,7 @@
   </a>
   <nav class="topnav" id="topnav"></nav>
 </header>
+<div id="notice" class="notice" role="status" hidden></div>
 <main id="view" class="view" aria-live="polite"></main>
 <div id="toast" class="toast" role="status" hidden></div>
 <noscript><p class="empty">JavaScript を有効にしてください。</p></noscript>
