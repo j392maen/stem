@@ -1,0 +1,28 @@
+/* 端末の診断ページ（#/diag）と、ライブラリ下の目立たないリンク。 */
+
+.library-foot { margin: 4px 0 0; text-align: right; font-size: 12px; }
+.library-foot a { color: var(--faint); text-decoration: none; }
+.library-foot a:hover, .library-foot a:focus-visible { color: var(--muted); text-decoration: underline; }
+
+.diag { display: grid; gap: var(--gap); max-width: 900px; margin: 0 auto; }
+.diag-output { display: grid; gap: var(--gap); }
+.diag-section p { margin: 6px 0; line-height: 1.6; }
+.diag-section .row .input { flex: 1 1 10em; }
+.diag-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.diag-table th, .diag-table td {
+  text-align: left; vertical-align: top; padding: 6px 8px; border-top: 1px solid var(--line);
+}
+.diag-table tr:first-child th, .diag-table tr:first-child td { border-top: 0; }
+.diag-table th { width: 38%; color: var(--muted); font-weight: 500; }
+.diag-table td { overflow-wrap: anywhere; }
+.diag-ok { color: var(--ok); font-weight: 700; }
+.diag-ng { color: #ff8a95; font-weight: 700; }
+.small-note { font-size: 12px; }
+.diag-steps { margin: 0 0 10px; padding-left: 1.4em; line-height: 1.7; }
+.diag-lock .row { margin: 6px 0; }
+.diag-lock-list { margin: 10px 0 0; padding-left: 1.2em; line-height: 1.7; color: var(--muted); }
+
+@media (max-width: 640px) {
+  .diag-table th { width: 44%; }
+  .diag-table th, .diag-table td { padding: 6px 4px; }
+}
