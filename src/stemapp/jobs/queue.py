@@ -175,7 +175,7 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
         raise JobConflict("配信用データを作成待ち・作成中です。終わってから削除してください。")
     session.commit()  # STEM・STEM_RENDITION・WAVEFORM・EXPORT は外部キーの CASCADE で消える
     session.expunge(job)
-    remove_job_dir(settings, job_id, output_dir)
+    remove_job_dir(session, settings, job_id, output_dir)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
     remove_export_dirs(settings, export_ids)  # 書き出したファイル（data/exports/<id>）
     log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
@@ -202,7 +202,7 @@ def discard_job_outputs(session: Session, settings: Settings, job_id: int) -> No
         update(SeparationJob).where(SeparationJob.job_id == job_id).values(output_dir=None)
     )
     session.commit()
-    remove_job_dir(settings, job_id, output_dir)
+    remove_job_dir(session, settings, job_id, output_dir)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
 
 

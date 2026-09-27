@@ -109,3 +109,29 @@ def test_separate_command_fills_missing_delivery(
     assert _count(settings, StemRendition) == 16
     assert _count(settings, Waveform) == 32
     assert _count(settings, SeparationJob) == 1
+
+
+def test_separate_error_with_markup_like_text(
+    cli_env: FakeSeparator, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """エラーや曲名に rich の書式に見える文字（[/b] や [sm123]）があっても、そのまま表示する。"""
+
+    class Broken(FakeSeparator):
+        def separate(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("[/b] こわれた [sm46822928]")
+
+    monkeypatch.setattr(cli, "make_separator", lambda _s: Broken())
+    src = write_source(tmp_path / "a.wav", synth_mix(1.0))
+    res = runner.invoke(cli.app, ["separate", str(src), "--preset", "fast"])
+    assert res.exit_code == 1
+    assert "[/b] こわれた [sm46822928]" in res.output.replace("\n", "")
+
+
+def test_separate_result_shows_brackets(
+    cli_env: FakeSeparator, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COLUMNS", "300")
+    src = write_source(tmp_path / "アカ通信ン [sm46822928] [b].wav", synth_mix(1.0))
+    res = runner.invoke(cli.app, ["separate", str(src), "--preset", "fast"])
+    assert res.exit_code == 0, res.output
+    assert "アカ通信ン [sm46822928] [b]" in res.output

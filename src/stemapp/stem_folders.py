@@ -15,10 +15,11 @@ import logging
 import os
 import re
 import shutil
+import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from stemapp.config import Settings
@@ -27,7 +28,7 @@ from stemapp.models import InputSource, SeparationJob, SeparationPreset, Track
 log = logging.getLogger(__name__)
 
 STEMS_DIRNAME = "stems"
-MAX_NAME_LEN = 100
+MAX_NAME_LEN = 100  # UTF-16 の単位（Windows のパスの長さの数え方。絵文字などは 2）
 FETCH_DONE = "done"
 
 # Windows でファイル名に使えない文字と制御文字（0x00〜0x1F）
@@ -49,21 +50,73 @@ def _trim(name: str) -> str:
     return name.strip().rstrip(". ").strip()
 
 
+def utf16_len(text: str) -> int:
+    """UTF-16 の単位での長さ（BMP 外の文字は 2）。"""
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in text)
+
+
+def _is_joiner(c: str) -> bool:
+    """直前の文字とくっついて1文字に見えるもの（結合文字・ZWJ・異体字セレクタ・肌の色）。"""
+    cp = ord(c)
+    return (
+        unicodedata.combining(c) != 0
+        or unicodedata.category(c) in ("Mn", "Me", "Mc")
+        or cp == 0x200D
+        or 0xFE00 <= cp <= 0xFE0F
+        or 0xE0100 <= cp <= 0xE01EF
+        or 0x1F3FB <= cp <= 0x1F3FF
+        or 0xE0020 <= cp <= 0xE007F  # タグ文字（旗の絵文字）
+    )
+
+
+def truncate_utf16(text: str, limit: int) -> str:
+    """UTF-16 の単位で limit 以内に切る。サロゲートペアや、結合文字・ZWJ でつながった
+    まとまり（書記素）の途中では切らない（簡易判定）。"""
+    if utf16_len(text) <= limit:
+        return text
+    used = 0
+    end = 0
+    for i, c in enumerate(text):
+        w = 2 if ord(c) > 0xFFFF else 1
+        if used + w > limit:
+            break
+        used += w
+        end = i + 1
+    # 切った位置の直後がくっつく文字なら、まとまりの先頭まで戻す
+    while 0 < end < len(text) and (_is_joiner(text[end]) or text[end - 1] == "\u200d"):
+        end -= 1
+    # 国旗（地域指示子 2 つで1文字）の片方だけを残さない
+    if 0 < end < len(text) and _is_regional(text[end - 1]) and _is_regional(text[end]):
+        run = 0
+        while end - run > 0 and _is_regional(text[end - run - 1]):
+            run += 1
+        if run % 2 == 1:
+            end -= 1
+    return text[:end]
+
+
+def _is_regional(c: str) -> bool:
+    return 0x1F1E6 <= ord(c) <= 0x1F1FF
+
+
 def safe_folder_name(name: str | None, track_id: int) -> str:
     """Windows のフォルダ名に使える形にする（使えない文字は飛ばす）。
 
+    - Unicode の NFC に正規化する。
     - `\\ / : * ? " < > |` と制御文字を取り除く。
     - 前後の空白、末尾のピリオドと空白を取り除く。
-    - 100 文字で切る（切った後にも末尾の整形をやり直す）。
+    - UTF-16 の単位で 100 以内に切る（切った後にも末尾の整形をやり直す）。
     - 予約名（CON, PRN, AUX, NUL, COM1〜9, LPT1〜9。拡張子付きも）なら末尾に `_` を付ける。
+    - 数字だけなら末尾に `_` を付ける（T13 より前の `stems/<job_id>` と重ならないように）。
     - 空になったら `track_<track_id>`。
     """
-    cleaned = _trim(_INVALID_CHARS.sub("", name or ""))
-    cleaned = _trim(cleaned[:MAX_NAME_LEN])
+    cleaned = unicodedata.normalize("NFC", name or "")
+    cleaned = _trim(_INVALID_CHARS.sub("", cleaned))
+    cleaned = _trim(truncate_utf16(cleaned, MAX_NAME_LEN))
     if not cleaned:
         return f"track_{track_id}"
-    if _is_reserved(cleaned):
-        cleaned = cleaned[: MAX_NAME_LEN - 1] + "_"
+    if _is_reserved(cleaned) or cleaned.isascii() and cleaned.isdigit():
+        cleaned = _trim(truncate_utf16(cleaned, MAX_NAME_LEN - 1)) + "_"
     return cleaned
 
 
@@ -94,7 +147,7 @@ def with_number(base: str, n: int) -> str:
     if n <= 1:
         return base
     suffix = f" ({n})"
-    head = _trim(base[: MAX_NAME_LEN - len(suffix)]) or base[:1]
+    head = _trim(truncate_utf16(base, MAX_NAME_LEN - len(suffix))) or base[:1]
     return head + suffix
 
 
@@ -229,8 +282,56 @@ def job_dir_of(session: Session, settings: Settings, job_id: int) -> Path:
     return job_dir(settings, job_id, output_dir)
 
 
-def remove_job_dir(settings: Settings, job_id: int, output_dir: str | None) -> None:
-    """ジョブの保存フォルダを消し、空になった曲のフォルダも消す。"""
+# T13 より前の `stems/<job_id>/` の中にあるフォルダ（これ以外のフォルダがあれば旧形式ではない）
+LEGACY_SUBDIRS = frozenset({"stream", "peaks"})
+
+
+def legacy_dir(settings: Settings, job_id: int) -> Path:
+    return settings.data_dir / STEMS_DIRNAME / str(job_id)
+
+
+def is_legacy_job_dir(session: Session, settings: Settings, job_id: int) -> bool:
+    """`stems/<job_id>` が、そのジョブの T13 より前の保存フォルダだと判断できるか。
+
+    - ほかのジョブの output_dir（新しい形の曲フォルダ）として使われていない。
+    - 中身が旧形式（直下に master の FLAC など。フォルダは stream / peaks だけ）。
+    どちらかに当てはまらなければ False（消さない・移さない）。
+    """
+    path = legacy_dir(settings, job_id)
+    if not path.is_dir():
+        return False
+    rel = f"{STEMS_DIRNAME}/{job_id}"
+    used = session.scalar(
+        select(func.count())
+        .select_from(SeparationJob)
+        .where(or_(SeparationJob.output_dir == rel, SeparationJob.output_dir.like(rel + "/%")))
+    )
+    if used:
+        return False
+    try:
+        return all(
+            not child.is_dir() or child.name in LEGACY_SUBDIRS for child in path.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def remove_job_dir(
+    session: Session, settings: Settings, job_id: int, output_dir: str | None
+) -> None:
+    """ジョブの保存フォルダを消し、空になった曲のフォルダも消す。
+
+    output_dir が NULL（T13 より前のジョブ）なら、`stems/<job_id>` が本当にそのジョブの
+    旧形式のフォルダだと判断できるときだけ消す（別の曲のフォルダを消さないため）。
+    """
+    if output_dir is None:
+        if is_legacy_job_dir(session, settings, job_id):
+            shutil.rmtree(legacy_dir(settings, job_id), ignore_errors=True)
+        elif legacy_dir(settings, job_id).exists():
+            log.warning(
+                "stems/%d は job %d の古い保存フォルダではないため消しません。", job_id, job_id
+            )
+        return
     path = job_dir(settings, job_id, output_dir)
     shutil.rmtree(path, ignore_errors=True)
     remove_if_empty(settings, path.parent)

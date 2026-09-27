@@ -179,7 +179,7 @@ def delete_track(
     remove_export_dirs(settings, export_ids)
     shutil.rmtree(settings.tracks_dir / str(track_id), ignore_errors=True)
     for job_id, output_dir in job_dirs:
-        remove_job_dir(settings, job_id, output_dir)
+        remove_job_dir(session, settings, job_id, output_dir)
     log.info("曲を削除しました（track %d, job %s）。", track_id, job_ids)
     return {"deleted": True, "track_id": track_id, "job_ids": job_ids}
 

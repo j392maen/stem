@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -63,7 +64,10 @@ def render_results(results: list[CheckResult], console: Console | None = None) -
     table.add_column("対処のヒント")
     for r in results:
         style = _STATUS_STYLE[r.status]
-        table.add_row(r.name, f"[{style}]{r.status.value}[/{style}]", r.detail, r.hint)
+        table.add_row(
+            escape(r.name), f"[{style}]{r.status.value}[/{style}]", escape(r.detail),
+            escape(r.hint),
+        )
     console.print(table)
 
 
@@ -259,7 +263,9 @@ def render_separate_result(result: SeparateResult, console: Console | None = Non
         if st.is_residual:
             name += " ※残り"
         level = "-" if st.rms_db is None else f"{st.rms_db:.1f}"
-        table.add_row(name, level, "はい" if st.is_silent else "", str(st.file_path))
+        table.add_row(
+            escape(name), level, "はい" if st.is_silent else "", escape(str(st.file_path))
+        )
     console.print(table)
 
 
@@ -279,18 +285,21 @@ def _import_target(
 
     try:
         if is_url(target):
-            console.print(f"URL から取得しています: {target}")
+            console.print(f"URL から取得しています: {target}", markup=False)
             return fetch_url(session, settings, target, make_ytdlp_runner(settings))
         return import_file(session, settings, Path(target))
     except UrlImportError as e:
         console.print(
-            f"[bold red]{e.message}[/bold red]（理由コード: {e.code}）", soft_wrap=True
+            f"[bold red]{escape(e.message)}[/bold red]（理由コード: {escape(e.code)}）",
+            soft_wrap=True,
         )
         if e.detail:
             console.print(f"詳細:\n{e.detail}", markup=False, soft_wrap=True)
         raise typer.Exit(1) from e
     except Exception as e:  # 正規化の失敗など
-        console.print(f"[bold red]取り込みに失敗しました: {e}[/bold red]", soft_wrap=True)
+        console.print(
+            f"[bold red]取り込みに失敗しました: {escape(str(e))}[/bold red]", soft_wrap=True
+        )
         raise typer.Exit(1) from e
 
 
@@ -351,7 +360,7 @@ def separate(
         try:
             load_plan(session, preset)  # プリセットの誤りは取り込む前に知らせる
         except SeparationError as e:
-            console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
+            console.print(f"[bold red]{escape(str(e))}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         imported = _import_target(session, settings, target, console)
         try:
@@ -374,10 +383,10 @@ def separate(
                 console.print("配信用データ（Opus・波形）を作成しています。")
                 rebuild_delivery_files(session, settings, result.job_id, encoder=audio.run_ffmpeg)
         except SeparationError as e:
-            console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
+            console.print(f"[bold red]{escape(str(e))}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         except Exception as e:
-            console.print(f"[bold red]失敗しました: {e}[/bold red]", soft_wrap=True)
+            console.print(f"[bold red]失敗しました: {escape(str(e))}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         if result.skipped:
             console.print(
@@ -419,14 +428,14 @@ def render_bench(report: BenchReport, console: Console | None = None) -> None:
         return "-" if v is None else f"{v:,.0f}"
 
     for pb in report.presets:
-        table.add_row(pb.preset, "全体", f"{pb.seconds:.1f}", mb(pb.peak_memory_mb), "")
+        table.add_row(escape(pb.preset), "全体", f"{pb.seconds:.1f}", mb(pb.peak_memory_mb), "")
         for st in pb.steps:
             note = f"{st.device}, チャンク {st.chunk_scale:g} 倍"
             if st.attempts:
                 note += f", やり直し {len(st.attempts)} 回"
             table.add_row(
                 "",
-                f"{st.order}. {st.model_filename}（{st.role}）",
+                escape(f"{st.order}. {st.model_filename}（{st.role}）"),
                 f"{st.seconds:.1f}",
                 mb(st.peak_memory_mb),
                 note,
@@ -461,11 +470,11 @@ def bench(
                 device=DEVICE_CPU if cpu else DEVICE_CUDA,
             )
         except Exception as e:
-            console.print(f"[bold red]失敗しました: {e}[/bold red]", soft_wrap=True)
+            console.print(f"[bold red]失敗しました: {escape(str(e))}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
     render_bench(report, console)
     path = save_report(settings, report)
-    console.print(f"結果を保存しました: {path}")
+    console.print(f"結果を保存しました: {path}", markup=False)
 
 
 # --- 拍 ----------------------------------------------------------------------------
@@ -498,7 +507,9 @@ def beats(
             )
             session.commit()
         except Exception as e:
-            console.print(f"[bold red]拍を解析できませんでした: {e}[/bold red]", soft_wrap=True)
+            console.print(
+                f"[bold red]拍を解析できませんでした: {escape(str(e))}[/bold red]", soft_wrap=True
+            )
             raise typer.Exit(1) from e
         grid = outcome.grid
         beat_list = list(grid.beats_json or [])
@@ -514,7 +525,8 @@ def beats(
         console.print(table)
         console.print(
             f"拍 {len(beat_list)}・小節の頭 {len(grid.downbeats_json or [])}・"
-            f"拍子 {grid.time_signature}/4・解析器 {grid.analyzer}"
+            f"拍子 {grid.time_signature}/4・解析器 {grid.analyzer}",
+            markup=False,
         )
         if outcome.result is not None:
             console.print(
@@ -585,7 +597,9 @@ def export_cmd(
                 )
             ).first()
             if found is None:
-                console.print(f"[bold red]組み合わせ「{preset}」が見つかりません。[/bold red]")
+                console.print(
+                    f"[bold red]組み合わせ「{escape(preset)}」が見つかりません。[/bold red]"
+                )
                 raise typer.Exit(1)
             preset_id = found.listen_preset_id
         if export_type == "single" and len(codes) != 1:
@@ -613,10 +627,12 @@ def export_cmd(
                 dst = _free_path(output / result.path.name)
                 result.path.replace(dst)
         except ExportError as e:
-            console.print(f"[bold red]{e}[/bold red]", soft_wrap=True)
+            console.print(f"[bold red]{escape(str(e))}[/bold red]", soft_wrap=True)
             raise typer.Exit(1) from e
         except Exception as e:
-            console.print(f"[bold red]書き出しに失敗しました: {e}[/bold red]", soft_wrap=True)
+            console.print(
+                f"[bold red]書き出しに失敗しました: {escape(str(e))}[/bold red]", soft_wrap=True
+            )
             raise typer.Exit(1) from e
     console.print(f"書き出しました: {dst}", markup=False, soft_wrap=True)
     console.print(f"大きさ: {result.bytes / 1024 / 1024:.1f} MB")
@@ -638,17 +654,52 @@ def migrate_folders_cmd(
 
     サーバーとワーカーを止めてから実行する。何度実行しても同じ結果になる。
     """
-    from stemapp.folder_migration import FAILED, MOVED, PLANNED, SKIPPED, migrate_folders
+    from stemapp.folder_migration import (
+        FAILED,
+        MOVED,
+        NEEDS_CHECK,
+        PLANNED,
+        SKIPPED,
+        MigrationBlocked,
+        migrate_folders,
+    )
+    from stemapp.jobs.worker import WorkerLock, WorkerLockError
 
     _setup_logging()
     settings = _settings()
     console = Console()
-    with _db_session(settings) as session:
-        report = migrate_folders(session, settings, dry_run=dry_run)
+    # 移している間にワーカーが動かないよう、ワーカーと同じロックを取る
+    lock = WorkerLock(settings.data_root / "worker.lock")
+    try:
+        lock.acquire()
+    except WorkerLockError as e:
+        if not dry_run:
+            console.print(
+                "[bold red]ワーカー（stemapp serve / worker）が動いています。"
+                "止めてから実行してください。[/bold red]"
+            )
+            raise typer.Exit(1) from e
+        console.print("注意: ワーカーが動いています。実際に移すときは止めてから実行してください。")
+    try:
+        with _db_session(settings) as session:
+            report = migrate_folders(session, settings, dry_run=dry_run)
+    except MigrationBlocked as e:
+        console.print(f"[bold red]{escape(str(e))}[/bold red]", soft_wrap=True)
+        raise typer.Exit(1) from e
+    finally:
+        lock.release()
+    for note in report.notes:
+        console.print(note, markup=False, soft_wrap=True)
     if not report.items:
         console.print("移すフォルダはありません（移行済みです）。")
         return
-    labels = {PLANNED: "予定", MOVED: "移動済み", SKIPPED: "対象外", FAILED: "失敗（元に戻した）"}
+    labels = {
+        PLANNED: "予定",
+        MOVED: "移動済み",
+        SKIPPED: "対象外",
+        FAILED: "失敗（元に戻した）",
+        NEEDS_CHECK: "失敗・要確認",
+    }
     table = Table(title="保存フォルダの移行" + ("（予定・dry-run）" if dry_run else ""))
     table.add_column("job", justify="right")
     table.add_column("track", justify="right")
@@ -661,8 +712,8 @@ def migrate_folders_cmd(
     for i in report.items:
         result = labels[i.status] + (f": {i.message}" if i.message else "")
         table.add_row(
-            str(i.job_id), str(i.track_id), i.old_dir, i.new_dir or "-", str(i.files),
-            _size(i.bytes), str(i.db_paths), result,
+            str(i.job_id), str(i.track_id), escape(i.old_dir), escape(i.new_dir or "-"),
+            str(i.files), _size(i.bytes), str(i.db_paths), escape(result),
         )
     console.print(table)
     files, total = report.before
@@ -679,9 +730,9 @@ def migrate_folders_cmd(
         console.print("[bold red]ファイル数か合計サイズが違います。[/bold red]")
     console.print(
         f"移動 {report.count(MOVED)} 件・失敗 {report.count(FAILED)} 件・"
-        f"対象外 {report.count(SKIPPED)} 件"
+        f"要確認 {report.count(NEEDS_CHECK)} 件・対象外 {report.count(SKIPPED)} 件"
     )
-    if report.count(FAILED) or not same:
+    if report.count(FAILED) or report.count(NEEDS_CHECK) or not same:
         raise typer.Exit(1)
 
 

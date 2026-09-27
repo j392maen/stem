@@ -897,7 +897,7 @@ def separate_track(
                 .values(output_dir=None)
             )
             session.commit()
-            remove_job_dir(settings, current_job_id, out_rel)
+            remove_job_dir(session, settings, current_job_id, out_rel)
             log.warning("job %d の処理をやめました（結果は書き込みません）。", current_job_id)
             raise
         except Exception as e:
@@ -909,7 +909,7 @@ def separate_track(
             job.error_message = f"分割に失敗しました（{stage}）: {type(e).__name__}: {e}"
             job.output_dir = None
             session.commit()
-            remove_job_dir(settings, current_job_id, out_rel)
+            remove_job_dir(session, settings, current_job_id, out_rel)
             log.error("job %d 失敗: %s", job.job_id, job.error_message)
             raise SeparationError(job.error_message) from e
 
