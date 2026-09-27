@@ -18,11 +18,16 @@ from stemapp.delivery import fake_encoder, rebuild_delivery_files
 from stemapp.folder_migration import (
     FAILED,
     MOVED,
+    NEEDS_CHECK,
     PLANNED,
     SKIPPED,
+    MigrationBlocked,
+    _write_journal,
     folder_stats,
+    journal_path,
     migrate_folders,
 )
+from stemapp.jobs.worker import WorkerLock
 from stemapp.library import resolve_data_path
 from stemapp.models import Export, SeparationJob, Stem, StemRendition, Waveform
 from stemapp.seed import seed
@@ -67,13 +72,13 @@ def _legacy_job(
     assert job is not None and job.output_dir
     new_prefix = job.output_dir + "/"
     old_prefix = f"stems/{job_id}/"
-    # 書き出し（T08）の成果物が保存フォルダの中にある場合も書き換わることを確かめる
-    export_file = settings.data_dir / job.output_dir / "exports" / "mix.wav"
-    export_file.parent.mkdir(parents=True)
+    # EXPORT.output_path が stems/<job_id>/ を指していれば書き換わることを確かめる
+    # （T08 の書き出しは data/exports/ に置くので、ふつうは対象外）
+    export_file = settings.data_dir / job.output_dir / "mix_export.wav"
     export_file.write_bytes(b"RIFF....")
     session.add(
         Export(job_id=job_id, export_type="mix", format="wav",
-               output_path=new_prefix + "exports/mix.wav")
+               output_path=new_prefix + "mix_export.wav")
     )
     session.flush()
     stem_ids = select(Stem.stem_id).where(Stem.job_id == job_id)
@@ -265,3 +270,177 @@ def test_cli_migrate_folders(
 
     again = runner.invoke(cli.app, ["migrate-folders"])
     assert again.exit_code == 0 and "移すフォルダはありません" in again.output
+
+
+# --- 中断への備え（予定の記録） -----------------------------------------------------------
+
+
+def _state(session: Session, settings: Settings, job_id: int) -> tuple[str | None, list[str]]:
+    session.expire_all()
+    job = session.get(SeparationJob, job_id)
+    assert job is not None
+    return job.output_dir, sorted(_all_paths(session, job_id))
+
+
+def test_keyboard_interrupt_restores_and_reraises(
+    seeded: Session, settings: Settings, legacy: dict[str, int]
+) -> None:
+    bad = legacy["song_combo"]
+    before = _state(seeded, settings, bad)
+
+    def rename(src: Path, dst: Path) -> None:
+        os.rename(src, dst)
+        if src.name == str(bad):
+            raise KeyboardInterrupt  # 移した直後に Ctrl+C
+
+    with pytest.raises(KeyboardInterrupt):
+        migrate_folders(seeded, settings, rename=rename)
+    assert _state(seeded, settings, bad) == before
+    assert (settings.stems_dir / str(bad)).is_dir()
+    assert not (settings.stems_dir / "song" / "exp_combo").exists()
+    assert not journal_path(settings).exists()
+    # もう一度実行すると残りを移す
+    report = migrate_folders(seeded, settings)
+    assert report.notes == []
+    assert {i.job_id: i.status for i in report.items}[bad] == MOVED
+
+
+def test_journal_recovers_after_kill(
+    seeded: Session, settings: Settings, legacy: dict[str, int]
+) -> None:
+    """フォルダを移した直後にプロセスが止まった（DB は古いまま・記録が残った）状態から直る。"""
+    bad = legacy["song_fast"]
+    before = _state(seeded, settings, bad)
+    _write_journal(settings, bad, f"stems/{bad}", "stems/song/fast")
+    (settings.stems_dir / "song").mkdir()
+    os.rename(settings.stems_dir / str(bad), settings.stems_dir / "song" / "fast")
+    assert _state(seeded, settings, bad) == before  # DB は古い場所を指したまま
+
+    # dry-run は何も変えずに、直す予定を知らせる
+    dry = migrate_folders(seeded, settings, dry_run=True)
+    assert dry.notes and "元に戻します" in dry.notes[0]
+    assert journal_path(settings).exists()
+    assert (settings.stems_dir / "song" / "fast").is_dir()
+
+    report = migrate_folders(seeded, settings)
+    assert report.notes and "元に戻します" in report.notes[0]
+    assert not journal_path(settings).exists()
+    assert [i.status for i in report.items] == [MOVED] * 4
+    output_dir, paths = _state(seeded, settings, bad)
+    assert output_dir == "stems/song/fast"
+    assert paths and all(p.startswith("stems/song/fast/") for p in paths)
+    assert all(resolve_data_path(settings, p).is_file() for p in paths)
+
+
+def test_journal_after_commit_is_cleared(
+    seeded: Session, settings: Settings, legacy: dict[str, int]
+) -> None:
+    report = migrate_folders(seeded, settings)
+    assert all(i.status == MOVED for i in report.items)
+    job_id = legacy["song_fast"]
+    # commit の後、記録を消す前に止まった
+    _write_journal(settings, job_id, f"stems/{job_id}", "stems/song/fast")
+    again = migrate_folders(seeded, settings)
+    assert again.items == [] and "完了していました" in again.notes[0]
+    assert not journal_path(settings).exists()
+
+
+def test_journal_before_rename_is_cleared(
+    seeded: Session, settings: Settings, legacy: dict[str, int]
+) -> None:
+    job_id = legacy["song_fast"]
+    _write_journal(settings, job_id, f"stems/{job_id}", "stems/song/fast")  # 移す前に止まった
+    report = migrate_folders(seeded, settings)
+    assert "移す前" in report.notes[0]
+    assert [i.status for i in report.items] == [MOVED] * 4
+
+
+def test_journal_ambiguous_blocks(
+    seeded: Session, settings: Settings, legacy: dict[str, int]
+) -> None:
+    job_id = legacy["song_fast"]
+    _write_journal(settings, job_id, f"stems/{job_id}", "stems/song/fast")
+    (settings.stems_dir / "song" / "fast").mkdir(parents=True)  # 元にも先にもある
+    with pytest.raises(MigrationBlocked):
+        migrate_folders(seeded, settings)
+    with pytest.raises(MigrationBlocked):
+        migrate_folders(seeded, settings, dry_run=True)
+    assert (settings.stems_dir / str(job_id)).is_dir() and journal_path(settings).exists()
+
+
+def test_rename_back_failure_needs_check_then_recovers(
+    seeded: Session, settings: Settings, legacy: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad = legacy["song_combo"]
+    real_stats = folder_migration.folder_stats
+
+    def broken_stats(path: Path) -> tuple[int, int]:
+        files, total = real_stats(path)
+        return (files - 1, total) if path.name == "exp_combo" else (files, total)
+
+    def rename(src: Path, dst: Path) -> None:
+        if dst.name == str(bad):  # 元に戻す rename だけ失敗させる
+            raise PermissionError("使用中です")
+        os.rename(src, dst)
+
+    monkeypatch.setattr(folder_migration, "folder_stats", broken_stats)
+    report = migrate_folders(seeded, settings, rename=rename)
+    item = next(i for i in report.items if i.job_id == bad)
+    assert item.status == NEEDS_CHECK
+    assert "song" in item.message and "exp_combo" in item.message  # 新しい場所を知らせる
+    assert report.items[-1] is item  # そこで止まる（記録を上書きしない）
+    assert journal_path(settings).exists()
+
+    monkeypatch.setattr(folder_migration, "folder_stats", real_stats)
+    report = migrate_folders(seeded, settings)
+    assert report.notes and "元に戻します" in report.notes[0]
+    assert all(i.status == MOVED for i in report.items)
+    assert not journal_path(settings).exists()
+    seeded.expire_all()
+    assert all(
+        j.output_dir is not None for j in seeded.scalars(select(SeparationJob))
+    )
+
+
+def _cli_setup(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> int:
+    monkeypatch.setattr(cli, "_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    monkeypatch.setenv("COLUMNS", "250")  # 表を折り返さない
+    engine = make_engine(settings.db_path)
+    try:
+        init_db(engine)
+        with make_session_factory(engine)() as s:
+            seed(s)
+            track_id = make_track(s, settings, tmp_path, name=name)
+            return _legacy_job(s, settings, track_id, "fast")
+    finally:
+        engine.dispose()
+
+
+def test_cli_refuses_while_worker_runs(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = _cli_setup(settings, tmp_path, monkeypatch, "song")
+    lock = WorkerLock(settings.data_root / "worker.lock")
+    lock.acquire()
+    try:
+        res = runner.invoke(cli.app, ["migrate-folders"])
+        assert res.exit_code == 1 and "止めてから" in res.output
+        assert (settings.stems_dir / str(job_id)).is_dir()
+        dry = runner.invoke(cli.app, ["migrate-folders", "--dry-run"])
+        assert dry.exit_code == 0 and "ワーカーが動いています" in dry.output
+    finally:
+        lock.release()
+    res = runner.invoke(cli.app, ["migrate-folders"])
+    assert res.exit_code == 0, res.output
+
+
+def test_cli_shows_brackets_in_names(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cli_setup(settings, tmp_path, monkeypatch, "アカ通信ン [sm46822928] [b]")
+    dry = runner.invoke(cli.app, ["migrate-folders", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "stems/アカ通信ン [sm46822928] [b]/fast" in dry.output
