@@ -336,14 +336,16 @@ def _check_bpm(period: float) -> None:
         raise BeatEditError(f"テンポが範囲外です（{bpm:.1f} BPM。{MIN_BPM:.0f}〜{MAX_BPM:.0f}）。")
 
 
-def tap_tempo(state: GridState, taps: Sequence[float], rng: BeatRange = ALL) -> GridState:
+def tap_tempo(
+    state: GridState, taps: Sequence[float], rng: BeatRange = ALL, per_bar: int | None = None
+) -> GridState:
     """タップ: たたいた時刻（曲の時刻。出力の遅延は差し引き済み）から一定テンポの拍を作り、
     範囲の拍を置き換える。
 
     たたいた時刻に「番号 × 間隔 ＋ 位置」を最小二乗で当てはめる（1回ごとのずれをならす）。
     小節の頭は、たたき始めにいちばん近い今の小節の頭に合わせる（無ければ最初にたたいた拍）。
-    1小節の拍数は曲の拍子（state.time_signature）。範囲の中の小節から推定すると、乱れた所では
-    2拍などになるため。範囲が区間のとき、前の区間と共有する始まりの拍は残す。
+    1小節の拍数は per_bar（画面の拍子の選択欄の値）。省略時は曲の拍子（state.time_signature）。
+    範囲の中の小節から推定しないのは、乱れた所では2拍などになるため。範囲が区間のとき、前の区間と共有する始まりの拍は残す。
     """
     t = np.sort(np.asarray([float(x) for x in taps], dtype=np.float64))
     if len(t) < MIN_TAPS:
@@ -357,7 +359,10 @@ def tap_tempo(state: GridState, taps: Sequence[float], rng: BeatRange = ALL) -> 
     _check_bpm(period)
     beats, flags = _to_arrays(state)
     lo, hi = _index_range(beats, rng)
-    per_bar = state.time_signature
+    if per_bar is None:
+        per_bar = state.time_signature
+    if per_bar not in TIME_SIGNATURES:
+        raise BeatEditError("拍子は 2〜12 拍から選んでください。")
     shared = _shared_start(beats, rng, lo)
     # 置き換える範囲（範囲が曲の端までなら、今の拍とたたいた所の広い方まで）
     first = min(float(beats[0]) if len(beats) else t[0], t[0])
@@ -447,4 +452,5 @@ def apply_edit(state: GridState, op: str, params: Mapping[str, Any]) -> GridStat
         return set_meter(state, int(params["beats_per_bar"]), rng)
     if op == "shift":
         return shift_beats(state, float(params["delta_sec"]), rng)
-    return tap_tempo(state, [float(x) for x in params.get("taps") or []], rng)
+    per_bar = int(params["beats_per_bar"]) if params.get("beats_per_bar") else None
+    return tap_tempo(state, [float(x) for x in params.get("taps") or []], rng, per_bar)

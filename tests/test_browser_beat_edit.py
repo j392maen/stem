@@ -113,6 +113,9 @@ def test_edit_panel_double_tap_undo_reset(
 
     # タップ（テスト用に曲の時刻を直接渡す）: 150 BPM の間隔で 5 回 → 範囲（曲全体）を置き換える
     page.select_option("#be-range", "all")
+    tap_sent: list[Any] = []
+    page.on("request", lambda r: tap_sent.append(r.post_data_json)
+            if r.url.endswith("/beats/edit") else None)
     page.evaluate(
         f"""() => {{
         const p = {VIEW}.beatEdit;
@@ -125,6 +128,8 @@ def test_edit_panel_double_tap_undo_reset(
     page.wait_for_function(
         "() => document.querySelector('#be-tap-info').textContent === 'タップから拍を作りました'"
     )
+    # 1小節の拍数は拍子の選択欄の値（再生位置の小節に追従する値）を送る
+    assert tap_sent and tap_sent[-1]["op"] == "tap" and tap_sent[-1]["beats_per_bar"] == 4
     _seek(page, 9.0)
     _wait_bpm(page, "150.0")
     # 少ないタップは使わない

@@ -300,7 +300,11 @@ export class BeatEditPanel {
       this.tapInfo.textContent = taps.length ? `${MIN_TAPS} 回以上たたいてください` : "";
       return false;
     }
-    const ok = await this.edit("tap", { taps });
+    // 1小節の拍数は拍子の選択欄（再生位置の小節に追従する値）。区間ごとに拍子が違う曲のため
+    const perBar = Number(this.meterSel.value);
+    const args = { taps };
+    if (perBar >= 2 && perBar <= 12) args.beats_per_bar = perBar;
+    const ok = await this.edit("tap", args);
     this.tapInfo.textContent = ok ? "タップから拍を作りました" : "";
     return ok;
   }

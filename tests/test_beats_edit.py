@@ -263,6 +263,27 @@ def test_tap_in_bounded_segment_keeps_boundary_beat() -> None:
     assert d.min() > 0.2  # 二重の拍が無い
 
 
+def test_tap_uses_given_beats_per_bar() -> None:
+    """タップの1小節の拍数は、画面の拍子の選択欄の値（省略時は曲の拍子）。"""
+    g = grid([(0, 120), (16, 100)], 40)
+    rng = resolve_range(g, "segment", 30.0)
+    taps = [20.0 + k * 0.4 for k in range(6)]
+    three = tap_tempo(g, taps, rng, per_bar=3)
+    later = [d for d in three.downbeats if d > 16.5]
+    b = np.asarray(three.beats)
+    idx = [int(np.argmin(np.abs(b - d))) for d in later]
+    assert set(np.diff(idx)) == {3}
+    assert [d for d in three.downbeats if d < 16] == [d for d in g.downbeats if d < 16]
+    four = tap_tempo(g, taps, rng)
+    idx4 = [int(np.argmin(np.abs(np.asarray(four.beats) - d))) for d in four.downbeats if d > 16.5]
+    assert set(np.diff(idx4)) == {4}
+    via = apply_edit(g, "tap", {"range": "segment", "position": 30.0, "taps": taps,
+                                "beats_per_bar": 3})
+    assert via == three
+    with pytest.raises(BeatEditError):
+        tap_tempo(g, taps, rng, per_bar=13)
+
+
 def test_tap_errors() -> None:
     g = grid([(0, 120)], 10)
     with pytest.raises(BeatEditError, match="4 回以上"):
