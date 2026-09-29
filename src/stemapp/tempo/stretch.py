@@ -48,9 +48,31 @@ class Stretcher(Protocol):
         ...
 
 
+# ffmpeg 8.0 の rubberband フィルタの出力は、倍率 r のとき出力の時刻で
+# 「L × (1 − 1/r)」だけ遅れる（r > 1 で遅れ、r < 1 で早まる。曲の時刻に直すと L × (r − 1)）。
+# フィルタが遅延を入力の時間で差し引き、出力の時間で差し引いていないためと見られる。
+# L は 44.1kHz で実測した値（1 秒おきのバーストの重心。0.5〜2.0 倍を原点を通る直線で当てはめた）。
+RUBBERBAND_LATENCY_SAMPLES = 1600
+
+
+def latency_shift(ratio: float, latency: int = RUBBERBAND_LATENCY_SAMPLES) -> int:
+    """伸縮した出力の先頭で落とすサンプル数（負なら先頭に足す無音のサンプル数。44.1kHz）。"""
+    return round(latency * (1.0 - 1.0 / ratio))
+
+
 def rubberband_filter(ratio: float, frames: int, fmt: StreamFormat = DEFAULT_STREAM_FORMAT) -> str:
-    """-af のフィルタ。伸縮 → 足りなければ無音を足す → frames で切る →（必要なら）リサンプル。"""
-    chain = [f"rubberband=tempo={ratio:.6f}", "apad", f"atrim=end_sample={int(frames)}"]
+    """-af のフィルタ。
+
+    伸縮（左右をまとめて処理し定位を保つ）→ 遅れの補正（先頭を落とす／無音を足す）→
+    足りなければ無音を足す → frames で切る →（必要なら）リサンプル。
+    """
+    chain = [f"rubberband=tempo={ratio:.6f}:channels=together"]
+    shift = latency_shift(ratio)
+    if shift > 0:
+        chain += [f"atrim=start_sample={shift}", "asetpts=PTS-STARTPTS"]
+    elif shift < 0:
+        chain.append(f"adelay=delays={-shift}S:all=1")
+    chain += ["apad", f"atrim=end_sample={int(frames)}"]
     if fmt.sample_rate is not None:
         chain.append(f"aresample={fmt.sample_rate}")
     return ",".join(chain)
