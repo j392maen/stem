@@ -95,3 +95,19 @@
 @media (max-width: 600px) {
   .stem-family { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); padding: 6px; }
 }
+
+/* 分けられない理由（古い保存フォルダ）と、分けた結果の注意 */
+.refine-row.note, .refine-row.warn { background: transparent; }
+.refine-row.note .muted, .refine-row.warn .muted { white-space: normal; overflow-wrap: anywhere; }
+.refine-row.warn { border-color: var(--accent-deep); border-style: dashed; }
+
+/* 指で操作する画面: 「分ける／戻す／中止」を 32px 以上にし、stem の ON/OFF と押し間違えにくくする
+   （右下、番号の左に置く。名前の行とは上下で分け、名前は横幅いっぱいに出す） */
+@media (pointer: coarse) {
+  .stem-cell.has-act > .stem-btn { min-height: 74px; }
+  .stem-cell.has-act > .stem-btn .sub { padding-right: 60px; }
+  .refine-act { bottom: 4px; right: 22px; width: 34px; height: 34px; border-radius: 6px; }
+  .stem-btn:not(:has(.key)) ~ .refine-act { right: 4px; }
+  .refine-act svg { width: 18px; height: 18px; }
+  .refine-act.stop svg { width: 13px; height: 13px; }
+}

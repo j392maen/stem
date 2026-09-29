@@ -191,6 +191,8 @@ class SeparationJob(Base):
     # stem の保存フォルダ（データフォルダからの相対パス。例 "stems/曲名/standard"）。
     # 保存を始めるときに一度決める（`stemapp.stem_folders`）。NULL は T13 より前の stems/<job_id>
     output_dir: Mapped[str | None] = mapped_column(Text)
+    # 処理は終わったが注意がある（詳細分割で残りが 24bit の範囲を超えた等）。NULL=なし
+    warning: Mapped[str | None] = mapped_column(Text)
 
 
 class Stem(Base):

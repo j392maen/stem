@@ -12,10 +12,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
-from browser_helpers import LiveServer, run_server
+from browser_helpers import SCREENS_DIR, LiveServer, run_server
 from stemapp.config import Settings
+from stemapp.models import SeparationJob
+from stemapp.seed import DRUMSEP
 from test_browser import (  # noqa: F401  fixture を使う
     PHONE,
     _done_track,
@@ -205,3 +208,81 @@ def test_refine_cancel(page: Any, slow_server: LiveServer, tmp_path: Path) -> No
     time.sleep(0.2)
     assert "drums" in _gains(page)
     assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_refine_done_while_loading(page: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811
+    """画面の読み込み中に分割が終わっても、読み込みが終わったら子を出す（読み直す）。"""
+    track_id, job_id = _done_track(server, tmp_path)
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        stems = {s["code"]: s for s in c.get(f"/api/jobs/{job_id}/stems").json()["stems"]}
+        res = c.post(f"/api/stems/{stems['drums']['stem_id']}/refine", json={"model": DRUMSEP})
+        assert res.status_code == 201
+
+    # 再生用の音声の取得を止めておき（読み込みが終わらない）、分割が終わるのを待つ
+    held: list[Any] = []
+    release = {"on": False}
+
+    def hold(route: Any) -> None:
+        if release["on"]:
+            route.continue_()
+        else:
+            held.append(route)
+
+    page.route("**/api/files/renditions/**", hold)
+    page.goto(f"{server.base_url}/#/track/{track_id}")
+    page.wait_for_selector("#loading:not([hidden])")
+    # 読み込み中に分割が終わった: 読み直し待ちの表示
+    page.wait_for_selector("#refine-status :text('読み込みが終わったら')", timeout=60_000)
+    assert page.locator(".stem-btn[data-code='kick']").count() == 0
+    release["on"] = True
+    for r in held:
+        r.continue_()
+    # 読み込みが終わると読み直して、子が出る
+    _wait_loaded_with(page, "kick")
+    assert page.locator(".stem-family[data-family='drums']").count() == 1
+    assert page.locator("#refine-status").is_hidden()
+    assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_refine_note_for_legacy_folder(page: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811
+    """古い保存フォルダ（output_dir が NULL）のジョブは、分けられない理由を出す。"""
+    track_id, job_id = _done_track(server, tmp_path)
+    with server.session_factory() as s:
+        job = s.get(SeparationJob, job_id)
+        assert job is not None
+        job.output_dir = None
+        s.commit()
+    _open_player(page, server, track_id)
+    note = page.locator("#refine-note")
+    assert note.is_visible()
+    assert "migrate-folders" in note.inner_text()
+    assert page.locator(".refine-act").count() == 0
+    assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_refine_buttons_are_large_on_touch(
+    browser: Any, server: LiveServer, tmp_path: Path  # noqa: F811
+) -> None:
+    """指で操作する画面では「分ける」を 32px 以上にし、名前と重ならない。"""
+    track_id, _job_id = _done_track(server, tmp_path)
+    ctx = browser.new_context(viewport=PHONE, locale="ja-JP", has_touch=True, is_mobile=True)
+    try:
+        pg = ctx.new_page()
+        _open_player(pg, server, track_id)
+        assert pg.evaluate("() => matchMedia('(pointer: coarse)').matches") is True
+        act = pg.locator(".stem-cell[data-code='drums'] .refine-act.split")
+        box = act.bounding_box()
+        assert box is not None and box["width"] >= 32 and box["height"] >= 32
+        # 名前の行はボタンより上で終わり、横幅いっぱいに出る（省略されない）
+        name = pg.locator(".stem-cell[data-code='drums'] .stem-btn .name")
+        nbox = name.bounding_box()
+        assert nbox is not None and nbox["y"] + nbox["height"] <= box["y"] + 1
+        assert name.evaluate("e => e.scrollWidth <= e.clientWidth")
+        lead = pg.locator(".stem-cell[data-code='lead_vocal'] .stem-btn .name")
+        assert lead.evaluate("e => e.scrollWidth <= e.clientWidth")
+        # full_page の撮影は画面の大きさを変えてしまうので、見えている範囲だけ撮る
+        pg.locator("#stems").scroll_into_view_if_needed()
+        SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+        pg.screenshot(path=str(SCREENS_DIR / "refine_touch_phone.png"))
+    finally:
+        ctx.close()

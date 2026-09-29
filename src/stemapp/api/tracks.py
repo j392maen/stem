@@ -586,6 +586,13 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
     active_refines = [j for j in refine_rows if j.status in ACTIVE_STATUSES]
     busy_stems = {j.input_stem_id for j in active_refines}
     can_refine = job.job_kind == "full" and job.status == DONE and job.output_dir is not None
+    # 分けられない理由を画面に出す（ボタンを黙って消さない）
+    refine_note = (
+        "詳細分割（もっと分ける）するには、先に保存フォルダの移行"
+        "（stemapp migrate-folders）が必要です。"
+        if job.job_kind == "full" and job.status == DONE and job.output_dir is None
+        else None
+    )
 
     def methods_of(stem: Stem, stype: StemType) -> list[dict[str, Any]]:
         if not can_refine or view.children_of(stem.stem_id):
@@ -615,6 +622,7 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
             "job_id": rj.job_id,
             "model": m.filename if m else None,
             "display_name": m.display_name if m else None,
+            "warning": rj.warning,
         }
 
     stems = []
@@ -686,6 +694,7 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
         "delivery_missing": missing,
         "stems": stems,
         "refine_jobs": refine_jobs,
+        "refine_note": refine_note,
     }
 
 

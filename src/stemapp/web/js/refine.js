@@ -43,6 +43,8 @@ export class RefineUI {
     // 分けた stem の stem_id → 分割待ち・分割中・失敗した詳細分割（model 付き）
     this.jobs = new Map();
     for (const j of view.job.refine_jobs || []) this.jobs.set(j.input_stem_id, j);
+    // 分け終わって、画面の読み直しを待っているジョブ（読み込み中に終わったとき）
+    this.pendingDone = [];
     this.timer = 0;
     this.back = null;
     this.disposed = false;
@@ -117,6 +119,7 @@ export class RefineUI {
     cell.querySelectorAll(".refine-act, .refine-bar").forEach((n) => n.remove());
     const job = this.jobs.get(s.stem_id);
     const active = job && ACTIVE.has(job.status);
+    const waiting = !!job && job.status === "done"; // 読み直し待ち
     cell.classList.toggle("refining", !!active);
     cell.classList.toggle("refine-failed", !!job && job.status === "failed");
     let act = null;
@@ -127,6 +130,8 @@ export class RefineUI {
       }, svgIcon("stop"));
       cell.append(el("div", { class: "refine-bar", role: "progressbar", "aria-label": `${s.display_name} を分割中` },
         el("span", { style: { width: percent(job.progress) } })));
+    } else if (waiting) {
+      act = null;
     } else if (s.refined_by) {
       act = el("button", {
         class: "refine-act undo", type: "button", "aria-label": `${s.display_name} を分ける前に戻す`,
@@ -153,6 +158,17 @@ export class RefineUI {
       box.after(status);
     }
     const rows = [];
+    if (this.view.job.refine_note) {
+      rows.push(el("div", { class: "refine-row note", id: "refine-note" },
+        el("span", { class: "muted", text: this.view.job.refine_note })));
+    }
+    for (const s of this.stems) {
+      const w = s.refined_by && s.refined_by.warning;
+      if (w) {
+        rows.push(el("div", { class: "refine-row warn" },
+          el("strong", { text: s.display_name }), el("span", { class: "muted", text: w })));
+      }
+    }
     for (const job of this.jobs.values()) {
       const s = this.stemById(job.input_stem_id);
       if (!s) continue;
@@ -162,6 +178,10 @@ export class RefineUI {
           el("strong", { text: s.display_name }),
           el("span", { class: "muted", text: job.status === "queued" ? "分割待ち" : (job.stage || "分割中") }),
           el("span", { class: "refine-pct", text: job.status === "queued" ? "" : percent(job.progress) })));
+      } else if (job.status === "done") {
+        rows.push(el("div", { class: "refine-row", dataset: { jobId: String(job.job_id) } },
+          el("strong", { text: s.display_name }),
+          el("span", { class: "muted", text: "分け終わりました。読み込みが終わったら子の stem を出します。" })));
       } else if (job.status === "failed") {
         rows.push(el("div", { class: "refine-row failed", dataset: { jobId: String(job.job_id) } },
           el("strong", { text: s.display_name }),
@@ -282,6 +302,7 @@ export class RefineUI {
   schedule() {
     clearTimeout(this.timer);
     if (this.disposed) return;
+    if (!this.activeJobs().length && !this.pendingDone.length) return;
     this.timer = setTimeout(() => this.poll(), POLL_MS);
   }
 
@@ -309,17 +330,20 @@ export class RefineUI {
         if (fresh.status === "failed") toast(fresh.error_message || "分割に失敗しました。");
       }
     }
-    if (done.length) {
-      this.finish(done);
+    this.pendingDone.push(...done);
+    if (this.pendingDone.length && !this.view.loading) {
+      const ready = this.pendingDone;
+      this.pendingDone = [];
+      this.finish(ready);
       return;
     }
+    // 読み込み中に終わったものは、読み込みが終わるまで待ってから読み直す
     this.refresh();
-    if (this.activeJobs().length) this.schedule();
+    this.schedule();
   }
 
   /** 詳細分割が終わった: 子を読み込むため画面を読み直す（読み込み中なら終わるのを待つ）。 */
   finish(done) {
-    if (this.view.loading) { this.refresh(); this.schedule(); return; }
     const expand = done.map((job) => {
       const s = this.stemById(job.input_stem_id);
       const method = s && (s.refine_methods || []).find((m) => m.model === job.model);

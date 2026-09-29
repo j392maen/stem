@@ -34,9 +34,9 @@ import numpy as np
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from stemapp.audio import count_clipped, read_audio, rms_db, write_flac24, write_wav_float
+from stemapp.audio import read_audio, rms_db, write_flac24, write_wav_float
 from stemapp.config import Settings
-from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
+from stemapp.exports.service import remove_export_dirs
 from stemapp.library import data_relative, resolve_data_path
 from stemapp.models import Model, SeparationJob, Stem, StemRendition, StemType
 from stemapp.separation.base import DEVICE_CPU, DEVICE_CUDA, Separator
@@ -335,6 +335,10 @@ def enqueue_refine_job(
         raise RefineConflict(
             "この stem は既に別の方法で分けてあります（置き換えるには force を指定してください）。"
         )
+    if current is not None and active_exports_of_jobs(session, [current.job_id]):
+        raise ExportsBusy(
+            "今の子を使った書き出しが作成待ち・作成中です。書き出しが終わってから分け直してください。"
+        )
     check = check_refine(
         session, view, stem_id, method, types,
         replacing=True,
@@ -381,6 +385,28 @@ class RefineOutput:
         return max(peaks) if peaks else None
 
 
+FULL_SCALE_24 = float(2**23)
+MAX_24 = (2**23 - 1) / FULL_SCALE_24  # 24bit で表せるいちばん大きい値
+
+
+def quantize24(x: np.ndarray) -> np.ndarray:
+    """FLAC 24bit に保存して読み直したときと同じ値（float64）にする。
+
+    libsndfile は x × 2^23 を四捨五入し、-2^23〜2^23-1 に収める（1.0 は 2^23-1 になる）。
+    """
+    k = np.clip(np.round(np.asarray(x, dtype=np.float64) * FULL_SCALE_24), -FULL_SCALE_24,
+                FULL_SCALE_24 - 1)
+    return k / FULL_SCALE_24
+
+
+def count_outside24(x: np.ndarray) -> int:
+    """24bit の範囲（-1〜MAX_24）に収まらないサンプルの数（四捨五入で収まるものは数えない）。"""
+    a = np.asarray(x, dtype=np.float64)
+    hi = MAX_24 + 0.5 / FULL_SCALE_24
+    lo = -1.0 - 0.5 / FULL_SCALE_24
+    return int(np.count_nonzero((a >= hi) | (a < lo)))
+
+
 def _fit(x: np.ndarray, n: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     if x.shape[0] >= n:
@@ -402,12 +428,14 @@ def run_refine(
 ) -> RefineOutput:
     """親の音を method で分け、残り（親 − 子の合計）まで作る（DB は触らない）。
 
-    名前の付いた子は ±1 に丸めてから残りを計算する（FLAC 24bit に保存しても合計が親に
-    一致するように）。残りが ±1 を超えたときだけ一致しなくなる（ログと clipped に残す）。
+    親と名前の付いた子を、FLAC 24bit に保存したときと同じ値（±1 に丸め、2^-23 の刻み）に
+    してから残りを計算する。残りも同じ刻みに乗るので、保存した後も「子の合計＝親」がぴったり
+    成り立つ。残りが 24bit の範囲（±1）を超えたときだけ一致しなくなる（clipped に残す。
+    ジョブでは JOB.warning にも書く）。
     """
     t0 = time.perf_counter()
     n = parent.shape[0]
-    parent64 = np.asarray(parent, dtype=np.float64)
+    parent64 = quantize24(parent)  # 保存済みの親（master）なら何も変わらない
     steps: list[StepResult] = []
 
     def report(p: float, stage: str) -> None:
@@ -452,17 +480,17 @@ def run_refine(
     total = np.zeros_like(parent64)
     for code in method.child_codes:
         arr = _fit(out[code], n)
-        c = count_clipped(arr)
+        c = count_outside24(arr)
         if c:
             clipped[code] = c
-            arr = np.clip(arr, -1.0, 1.0)
-        # 保存する値（24bit）に合わせてから残りを計算すると、保存後も合計が親に一致する
-        stems[code] = arr.astype(np.float32)
-        total += stems[code].astype(np.float64)
+        # 保存する値（24bit）にそろえてから足す。はみ出た分は残りに入る
+        q = quantize24(arr)
+        stems[code] = q.astype(np.float32)  # 24bit の刻みは float32 で正確に表せる
+        total += q
     del out
     rest = rest_code(parent_code)
-    rest_arr = parent64 - total
-    c = count_clipped(rest_arr)
+    rest_arr = parent64 - total  # 刻みの上の値どうしの差なので、これも刻みに乗る（丸め誤差なし）
+    c = count_outside24(rest_arr)
     if c:
         clipped[rest] = c
         log.warning(
@@ -612,6 +640,7 @@ def run_refine_job(
             )
             if any(r.device == DEVICE_CPU for r in output.steps):
                 job.run_on = "cpu"
+            job.warning = rest_warning(output, types_display(session))
             set_progress(0.88, "stem を保存中")
             job.output_dir = refine_dir_name(session, settings, owner, stype.code)
             out_rel = job.output_dir
@@ -627,7 +656,9 @@ def run_refine_job(
                 if j.job_id != job_id and j.status not in ACTIVE
             ]
             old = [(j.job_id, j.output_dir) for j in old_jobs]
-            old_exports = export_ids_for_jobs(session, [j for j, _ in old])
+            # 古い子を使った書き出し: 作成待ち・作成中なら置き換えない（失敗にする）、
+            # 作成済みなら一緒に消す（EXPORT_ITEM だけが消えて中身の欠けた書き出しが残らないように）
+            old_exports = take_exports_of_jobs(session, [j for j, _ in old])
             for old_id, _ in old:
                 delete_job_stems(session, old_id)
                 session.execute(delete(SeparationJob).where(SeparationJob.job_id == old_id))
@@ -748,3 +779,119 @@ def refine_payload(method: RefineMethod, types: TypeIndex, stem_code: str) -> di
             if c in types.by_code
         ],
     }
+
+
+class ExportsBusy(RefineConflict):
+    """消す stem を使う書き出しが作成待ち・作成中。"""
+
+
+def take_exports_of_jobs(session: Session, job_ids: list[int]) -> list[int]:
+    """ジョブの stem を使う書き出し（EXPORT）を DB から消し、export_id を返す（commit しない）。
+
+    書き出しは full ジョブの行（EXPORT.job_id）に付くので、stem（EXPORT_ITEM）から探す。
+    作成待ち・作成中のものがあれば何も消さずに ExportsBusy。ファイルは呼び出し側が commit の後に
+    `remove_export_dirs` で消す。
+    """
+    from stemapp.exports.service import exports_using_stems
+
+    if not job_ids:
+        return []
+    stem_ids = list(session.scalars(select(Stem.stem_id).where(Stem.job_id.in_(job_ids))))
+    exps = exports_using_stems(session, stem_ids)
+    if any(e.status in ACTIVE for e in exps):
+        raise ExportsBusy(
+            "この stem を使った書き出しが作成待ち・作成中です。"
+            "書き出しが終わってからやり直してください。"
+        )
+    ids = [e.export_id for e in exps]
+    for e in exps:
+        session.delete(e)
+    session.flush()
+    return ids
+
+
+def types_display(session: Session) -> dict[str, str]:
+    return {t.code: t.display_name for t in session.scalars(select(StemType))}
+
+
+def rest_warning(output: RefineOutput, names: dict[str, str]) -> str | None:
+    """残りが 24bit の範囲を超えた（保存後に子の合計が親と一致しない）ときの注意書き。"""
+    n = output.clipped.get(output.rest, 0)
+    if not n:
+        return None
+    return (
+        f"{names.get(output.rest, output.rest)}が 24bit の範囲（±1）を超えたため、"
+        f"{n} サンプルで子の合計が親と一致しません（音割れしている可能性があります）。"
+    )
+
+
+def active_exports_of_jobs(session: Session, job_ids: list[int]) -> list[int]:
+    """ジョブの stem を使う、作成待ち・作成中の書き出しの export_id。"""
+    from stemapp.exports.service import exports_using_stems
+
+    if not job_ids:
+        return []
+    stem_ids = list(session.scalars(select(Stem.stem_id).where(Stem.job_id.in_(job_ids))))
+    return [e.export_id for e in exports_using_stems(session, stem_ids) if e.status in ACTIVE]
+
+
+# 詳細分割のフォルダに入っているもの（これ以外があれば消さない）
+_REFINE_FILE_SUFFIXES = frozenset({".flac", ".webm", ".m4a", ".stpk"})
+_DELIVERY_DIRS = frozenset({"stream", "peaks"})
+
+
+def _looks_like_refine_dir(path: Path) -> bool:
+    try:
+        for child in path.iterdir():
+            if child.is_dir():
+                if child.name not in _DELIVERY_DIRS:
+                    return False
+                if any(
+                    not f.is_file() or f.suffix.lower() not in _REFINE_FILE_SUFFIXES
+                    for f in child.iterdir()
+                ):
+                    return False
+            elif child.suffix.lower() not in _REFINE_FILE_SUFFIXES:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def clean_orphan_refine_dirs(session: Session, settings: Settings) -> list[str]:
+    """どのジョブも使っていない詳細分割のフォルダ（分け方のフォルダの下）を消す。
+
+    置き換え（force）の完了を commit した後、古い子のフォルダを消す前に止められたときなどに残る。
+    ワーカーの起動時（実行中のジョブが無いとき）に呼ぶ。中身が stem の音声・配信用データだけの
+    フォルダしか消さない。消したもの（データフォルダからの相対パス）を返す。
+    """
+    used = {
+        od for od in session.scalars(
+            select(SeparationJob.output_dir).where(SeparationJob.output_dir.is_not(None))
+        ) if od
+    }
+    running = session.scalar(
+        select(SeparationJob.job_id).where(SeparationJob.status == RUNNING).limit(1)
+    )
+    if running is not None:
+        return []
+    removed: list[str] = []
+    for od in sorted(
+        session.scalars(
+            select(SeparationJob.output_dir).where(
+                SeparationJob.job_kind == JOB_KIND_FULL, SeparationJob.output_dir.is_not(None)
+            )
+        )
+    ):
+        base = job_dir(settings, 0, od)
+        if not base.is_dir():
+            continue
+        for sub in base.iterdir():
+            if not sub.is_dir() or sub.name in _DELIVERY_DIRS:
+                continue
+            rel = f"{od}/{sub.name}"
+            if rel in used or not _looks_like_refine_dir(sub):
+                continue
+            shutil.rmtree(sub, ignore_errors=True)
+            removed.append(rel)
+    return removed

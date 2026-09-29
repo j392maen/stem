@@ -59,9 +59,6 @@ from stemapp.separation.refine import (
 from stemapp.stem_view import build_view
 from test_api import _app
 
-# 24bit の1段（2^-23）。保存した子の合計と親の差は、子の数 × 半段 以内
-LSB24 = 2.0**-23
-
 
 @pytest.fixture
 def factory(engine: Engine) -> sessionmaker[Session]:
@@ -272,10 +269,11 @@ def test_refine_job_saves_children(
         assert set(kids) == {*methods[model].child_codes, rest_code(parent)}
         assert [c for c, k in kids.items() if k.is_residual] == [rest_code(parent)]
         assert all(k.job_id == job_id for k in kids.values())
-        # 保存した子（24bit）の合計＝親（24bit の量子化誤差の範囲）
+        # 保存した子（24bit）の合計＝親（24bit の刻みにそろえてから残りを作るので、ぴったり）
         parent_audio = _master(settings, s, parent_id)
         total = sum(_master(settings, s, k.stem_id) for k in kids.values())
-        assert np.max(np.abs(total - parent_audio)) <= len(kids) * LSB24
+        assert np.array_equal(total, parent_audio)
+        assert job.warning is None
         # 配信用データ（stream と全解像度の peaks）
         for code, k in kids.items():
             rends = s.scalars(select(StemRendition).where(StemRendition.stem_id == k.stem_id)).all()
@@ -605,6 +603,7 @@ def test_api_refine_flow(client: TestClient, api_job: tuple[int, int]) -> None:
     assert len(stems["kick"]["peaks"]) == len(DEFAULT_LEVELS)
     assert stems["drums"]["refined_by"] == {
         "job_id": refine_id, "model": DRUMSEP, "display_name": "MDX23C ドラム分割",
+        "warning": None,
     }
     assert stems["drums"]["refine_methods"] == []  # 子を持つ stem には出さない
     # 同じ方法は分け直さない、force なら登録する
