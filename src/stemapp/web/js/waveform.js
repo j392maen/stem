@@ -5,8 +5,9 @@
 // 拍が解析済みなら、拡大の目盛りを拍の線（細く暗め）と小節線（やや太く明るめ＋小節番号）にし、
 // 概観にも小節線を間引いて描く。拍が無ければ拡大は1秒目盛りのまま。
 // 線は stem の波形より先に描き（波形が上）、差し色の赤（再生位置・ループ）は使わない。
+// テンポが変わる位置（区間の境目）には、概観の下端に小さな印を描く（ポインタを合わせると前後の BPM）。
 
-import { thinStep } from "./beats.js";
+import { formatBpm, thinStep } from "./beats.js";
 import { chooseOverviewLevel, chooseZoomLevel, rangeMinMax } from "./peaks.js";
 
 const COLORS = {
@@ -22,7 +23,12 @@ const COLORS = {
   bar: "rgba(196, 198, 214, 0.30)",
   barNumber: "rgba(196, 198, 214, 0.62)",
   overviewBar: "rgba(196, 198, 214, 0.16)",
+  tempoMark: "rgba(226, 228, 238, 0.85)",
 };
+
+// テンポの印の大きさ（CSS px）と、ポインタが印に当たったとみなす幅
+const TEMPO_MARK_PX = 5;
+const TEMPO_HIT_PX = 6;
 
 // 線どうしの最小の間隔（CSS px）。これより狭くなるなら間引く
 const MIN_BEAT_GAP_PX = 6;
@@ -106,6 +112,17 @@ export class WaveformView {
     this.overviewKey = ""; // 概観を描き直す
   }
 
+  /** 概観の x（CSS px）に近いテンポの印（無ければ null）。 */
+  tempoMarkAt(cssX, cssWidth) {
+    if (!this.beatGrid || !(cssWidth > 0)) return null;
+    let best = null;
+    for (const m of this.beatGrid.tempoChanges()) {
+      const dx = Math.abs((m.t / this.duration) * cssWidth - cssX);
+      if (dx <= TEMPO_HIT_PX && (!best || dx < best.dx)) best = { ...m, dx };
+    }
+    return best;
+  }
+
   // --- 描画 ------------------------------------------------------------------
 
   _drawLayers(ctx, width, height, sel, timeAt, spp) {
@@ -141,6 +158,26 @@ export class WaveformView {
     const secPerPx = this.duration / c.width;
     this.overviewBarStep = this.beatGrid ? this._drawOverviewBars(ctx, c.width, c.height, secPerPx) : 0;
     this._drawLayers(ctx, c.width, c.height, sel, (x) => x * secPerPx, spp);
+    this._drawTempoMarks(ctx, c.height, secPerPx);
+  }
+
+  /** テンポが変わる位置の印（概観の下端の小さな三角）。 */
+  _drawTempoMarks(ctx, height, secPerPx) {
+    const marks = this.beatGrid ? this.beatGrid.tempoChanges() : [];
+    this.overview.dataset.tempoMarks = String(marks.length);
+    if (!marks.length) return;
+    const dpr = window.devicePixelRatio || 1;
+    const r = TEMPO_MARK_PX * dpr;
+    ctx.fillStyle = COLORS.tempoMark;
+    for (const m of marks) {
+      const x = m.t / secPerPx;
+      ctx.beginPath();
+      ctx.moveTo(x - r, height);
+      ctx.lineTo(x + r, height);
+      ctx.lineTo(x, height - r * 1.3);
+      ctx.closePath();
+      ctx.fill();
+    }
   }
 
   /** 概観の小節線（8・16・32… 小節ごと。表示幅に応じて間引く）。間引きの単位を返す。 */
@@ -284,6 +321,14 @@ export class WaveformView {
       const rect = canvas.getBoundingClientRect();
       return { x: e.clientX - rect.left, w: rect.width };
     };
+    // テンポの印にポインタを合わせると、前後の BPM を出す（title）
+    this.overview.addEventListener("pointermove", (e) => {
+      const { x, w } = cssX(this.overview, e);
+      const m = this.tempoMarkAt(x, w);
+      const text = m ? `テンポの変わり目: ${formatBpm(m.from)} → ${formatBpm(m.to)} BPM` : "";
+      if (this.overview.title !== text) this.overview.title = text;
+      this.overview.classList.toggle("on-mark", !!m);
+    });
     // 概観: 押した位置・ドラッグした位置へ。離したときに確定する
     this.overview.addEventListener("pointerdown", (e) => {
       const canvas = this.overview;

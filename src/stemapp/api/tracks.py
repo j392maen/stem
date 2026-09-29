@@ -8,17 +8,25 @@ import logging
 import shutil
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from stemapp.api.common import SessionDep, iso, job_to_dict, not_found, preset_codes
-from stemapp.beats.service import beats_payload, get_grid
+from stemapp.beats.edit import BeatEditError
+from stemapp.beats.service import (
+    beats_payload,
+    can_undo,
+    edit_grid,
+    get_grid,
+    reset_edits,
+    undo_edit,
+)
 from stemapp.config import Settings
 from stemapp.delivery import missing_delivery
 from stemapp.exports import export_ids_for_jobs, remove_export_dirs
@@ -190,13 +198,109 @@ MISSING_BEATS = "beats"
 
 @router.get("/tracks/{track_id}/beats")
 def get_beats(track_id: int, session: SessionDep) -> dict[str, Any]:
-    """拍・小節の頭・拍子・区間ごとの BPM。まだ解析していなければ 404。"""
+    """有効な拍（直した結果があればそれ）・小節の頭・拍子・区間ごとの BPM、直したか（edited）、
+    元に戻せるか（can_undo）。まだ解析していなければ 404。"""
+    return beats_payload(_grid_or_404(session, track_id), undo=can_undo(session, track_id))
+
+
+def _grid_or_404(session: Session, track_id: int) -> BeatGrid:
     if session.get(Track, track_id) is None:
         raise not_found("曲")
     grid = get_grid(session, track_id)
     if grid is None:
         raise HTTPException(status_code=404, detail="この曲の拍はまだ解析されていません。")
-    return beats_payload(grid)
+    return grid
+
+
+EditOp = Literal["downbeat", "double", "half", "meter", "shift", "tap", "cues"]
+Sec = Annotated[float, Field(ge=0.0, le=24 * 60 * 60, allow_inf_nan=False)]
+
+
+class BeatEditRequest(BaseModel):
+    """拍の補正の操作。計算はサーバー側（`stemapp.beats.edit`）。
+
+    range: segment（再生位置を含む区間。既定）/ all（曲全体）/ loop（loop_start〜loop_end）。
+    操作ごとの引数: meter は beats_per_bar、shift は delta_sec、tap は taps（曲の時刻の列）、
+    cues は cue_start・cue_end・bars（beats_per_bar は省略可）。
+    """
+
+    op: EditOp
+    position: Sec = 0.0
+    range: Literal["segment", "all", "loop"] = "segment"
+    loop_start: Sec | None = None
+    loop_end: Sec | None = None
+    beats_per_bar: int | None = Field(default=None, ge=2, le=12)
+    delta_sec: float | None = Field(default=None, ge=-1.0, le=1.0)
+    taps: list[Sec] | None = Field(default=None, max_length=64)  # 有限・0 以上（Sec）
+    cue_start: Sec | None = None
+    cue_end: Sec | None = None
+    bars: int | None = Field(default=None, ge=1, le=1024)
+
+    @model_validator(mode="after")
+    def _needed_args(self) -> BeatEditRequest:
+        need = {
+            "meter": ("beats_per_bar",),
+            "shift": ("delta_sec",),
+            "tap": ("taps",),
+            "cues": ("cue_start", "cue_end", "bars"),
+        }.get(self.op, ())
+        missing = [k for k in need if getattr(self, k) is None]
+        if missing:
+            raise ValueError(f"{self.op} には {', '.join(missing)} が必要です。")
+        return self
+
+
+# 曲の長さを超える時刻を受け付ける余裕（秒）。曲の長さが無いときは自動の拍の最後からの余裕
+TIME_MARGIN_SEC = 1.0
+NO_DURATION_MARGIN_SEC = 5.0
+
+
+def _check_times(session: Session, grid: BeatGrid, body: BeatEditRequest) -> None:
+    """時刻（再生位置・ループ・キュー・タップ）が曲の長さの中にあるか。外れていれば 400。"""
+    track = session.get(Track, grid.track_id)
+    if track is not None and track.duration_sec:
+        limit = float(track.duration_sec) + TIME_MARGIN_SEC
+    else:
+        auto = list(grid.beats_json or [])
+        limit = (max(auto) if auto else 0.0) + NO_DURATION_MARGIN_SEC
+    times = [body.position, body.loop_start, body.loop_end, body.cue_start, body.cue_end]
+    times += list(body.taps or [])
+    if any(t is not None and t > limit for t in times):
+        raise HTTPException(status_code=400, detail="曲の長さを超える時刻は指定できません。")
+
+
+@router.post("/tracks/{track_id}/beats/edit")
+def edit_beats(track_id: int, body: BeatEditRequest, session: SessionDep) -> dict[str, Any]:
+    """拍を補正して保存し、有効な拍を返す。補正できないときは 400（理由は detail）。"""
+    grid = _grid_or_404(session, track_id)
+    _check_times(session, grid, body)
+    params = body.model_dump(exclude_none=True, exclude={"op"})
+    try:
+        edit_grid(session, grid, body.op, params)
+    except BeatEditError as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    session.commit()
+    return beats_payload(grid, undo=True)
+
+
+@router.post("/tracks/{track_id}/beats/undo")
+def undo_beats(track_id: int, session: SessionDep) -> dict[str, Any]:
+    """直前の補正を取り消す。取り消すものが無ければ 409。"""
+    grid = _grid_or_404(session, track_id)
+    if not undo_edit(session, grid):
+        raise HTTPException(status_code=409, detail="元に戻せる操作がありません。")
+    session.commit()
+    return beats_payload(grid, undo=can_undo(session, track_id))
+
+
+@router.post("/tracks/{track_id}/beats/reset")
+def reset_beats(track_id: int, session: SessionDep) -> dict[str, Any]:
+    """自動の結果に戻す（元に戻すで取り消せる）。直していなければ何もしない。"""
+    grid = _grid_or_404(session, track_id)
+    reset_edits(session, grid)
+    session.commit()
+    return beats_payload(grid, undo=can_undo(session, track_id))
 
 
 BEATS_MESSAGES = {
@@ -230,6 +334,8 @@ def reanalyze_beats(track_id: int, response: Response, session: SessionDep) -> d
         )
     grid = session.get(BeatGrid, track_id)
     if grid is not None:
+        # 直した結果は履歴に移す（解析が終わった後、元に戻すで戻せる）
+        reset_edits(session, grid, op="reanalyze")
         session.delete(grid)
         session.commit()
     if job.postprocess_status in ACTIVE_STATUSES:
