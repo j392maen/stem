@@ -6,8 +6,10 @@
 //   作っている間は「元の速度のまま（今の音のまま）」か「ピッチを変えて指定の速度で」鳴らす（設定）。
 // - 拍・キュー・ループ・波形・再生位置はすべて元の曲の時刻のまま（engine が音声データ上の時刻に直す）。
 // - 曲ごとの速度・方式・スライダーの幅はブラウザ（localStorage）に保存し、次に開いたときに戻す。
-// - メモリ: 音声は「今鳴らしている組（元の音声 or ある倍率の伸縮済み）」だけを持つ。別の組に替えるときは
-//   読み込み終わるまで今の組で鳴らし、差し替えたら前の組を捨てる（iPhone でメモリを倍に使わないため）。
+// - メモリ: 音声は「今鳴らしている組（元の音声 or ある倍率の伸縮済み）」と、読み込み中の組の最大2組。
+//   読み込み中に別の組に変えたら、前の読み込みは止める（AbortController）。
+//   省メモリ（スマホ幅・長い曲では既定で ON。画面で切り替えられる）: 前の組を捨ててから読み込む
+//   （読み込む間は止めて、終わったら同じ位置から続ける）。
 
 import { api, fetchBinary } from "./api.js";
 import { formatBpm } from "./beats.js";
@@ -22,6 +24,8 @@ export const MODES = ["pitch", "keep"];
 export const PENDING = ["original", "pitch"]; // 作成中の鳴らし方
 const KEY_PREFIX = "stemapp.tempo.";
 const PENDING_KEY = "stemapp.tempo.pending";
+const LOWMEM_KEY = "stemapp.tempo.lowmem";
+const LONG_TRACK_SEC = 8 * 60; // これより長い曲は省メモリを既定にする
 const REQUEST_DELAY_MS = 500; // ピッチを保つ方式でスライダーを動かしている間は作成を頼まない
 const LOAD_CONCURRENCY = 3;
 const POLL_MS = 1500;
@@ -64,6 +68,18 @@ export function ratioToSlider(r, range) {
   return Math.max(-lim, Math.min(lim, Math.round((r - 1) * 1000)));
 }
 
+/** 倍率が入るいちばん狭いスライダーの幅（今の幅で入ればそのまま。どれにも入らなければ最大）。 */
+export function rangeFor(r, current) {
+  const need = Math.abs(r - 1) * 100;
+  if (need <= current + 1e-9) return current;
+  return RANGES.find((n) => need <= n + 1e-9) ?? RANGES[RANGES.length - 1];
+}
+
+/** 省メモリの既定: スマホ幅か長い曲なら ON。 */
+export function defaultLowMemory(narrow, durationSec) {
+  return !!narrow || (Number(durationSec) || 0) > LONG_TRACK_SEC;
+}
+
 export function loadTempoState(trackId) {
   const def = { ratio: 1, mode: "pitch", range: 8 };
   try {
@@ -81,6 +97,16 @@ function saveTempoState(trackId, state) {
   try {
     localStorage.setItem(KEY_PREFIX + trackId, JSON.stringify(state));
   } catch { /* 保存できなくても動く */ }
+}
+
+function loadLowMemory(durationSec) {
+  try {
+    const v = localStorage.getItem(LOWMEM_KEY);
+    if (v === "1" || v === "0") return v === "1";
+  } catch { /* 読めなくても動く */ }
+  const narrow = typeof window !== "undefined" && window.matchMedia
+    && window.matchMedia("(max-width: 640px)").matches;
+  return defaultLowMemory(narrow, durationSec);
 }
 
 function loadPending() {
@@ -112,6 +138,9 @@ export class TempoPanel {
     this.mode = saved.mode;
     this.range = saved.range;
     this.pending = loadPending();
+    this.lowMemory = loadLowMemory(view.track ? view.track.duration_sec : 0);
+    this.loadAbort = null; // 読み込み中の組の AbortController
+    this.resumeAfterLoad = false; // 省メモリで止めた: 読み込み終わったら再生を続ける
     this.activeKey = ORIGINAL; // 今鳴らしている音声の組（元の音声 or 倍率）
     this.loadingKey = null; // 読み込み中の組
     this.failedKey = null; // 読み込みに失敗した組（速度・方式を変えるまで読み直さない）
@@ -134,7 +163,7 @@ export class TempoPanel {
     const seg = (name, items, onpick) => el("div", { class: "seg", role: "group", "aria-label": name },
       items.map(([value, text, title]) => el("button", {
         class: "seg-btn", type: "button", text, title, dataset: { value: String(value) },
-        "aria-pressed": "false", onclick: () => onpick(value),
+        "aria-pressed": "false", onclick: (e) => { e.currentTarget.blur(); onpick(value); },
       })));
     this.modeSeg = seg("速度の方式", [
       ["pitch", "ピッチも変わる", "再生の速さをそのまま変えます（すぐ効く。音の高さも変わる）"],
@@ -148,6 +177,8 @@ export class TempoPanel {
       type: "range", class: "tp-slider", id: "tp-slider", step: "1", value: "0",
       "aria-label": "速度",
       oninput: (e) => this.setRatio(sliderToRatio(e.target.value), { fromSlider: true }),
+      // 動かし終わったらフォーカスを外す（Space・数字キーなどをプレイヤーに戻す）
+      onchange: (e) => e.target.blur(),
       ondblclick: () => this.setRatio(1),
     });
     this.readout = el("span", { class: "tp-readout", id: "tp-readout", text: "±0.0%" });
@@ -161,9 +192,13 @@ export class TempoPanel {
     });
     this.resetBtn = el("button", {
       class: "btn small", type: "button", id: "tp-reset", text: "元の速度に戻す",
-      title: "速度を元に戻します（R キー）", onclick: () => this.setRatio(1),
+      title: "速度を元に戻します（R キー）",
+      onclick: (e) => { e.currentTarget.blur(); this.setRatio(1); },
     });
-    const step = (sign) => (e) => this.nudge(sign * (e.shiftKey ? COARSE_STEP : FINE_STEP));
+    const step = (sign) => (e) => {
+      e.currentTarget.blur();
+      this.nudge(sign * (e.shiftKey ? COARSE_STEP : FINE_STEP));
+    };
     this.status = el("span", { class: "tp-status", id: "tp-status", role: "status" });
     this.bar = el("div", { class: "progress tp-progress", id: "tp-progress", hidden: true },
       el("span", { style: { width: "0%" } }));
@@ -178,13 +213,22 @@ export class TempoPanel {
     this.pendingSel = el("select", {
       class: "select small", id: "tp-pending", "aria-label": "作成中の鳴らし方",
       title: "ピッチを保つ音声を作っている間の鳴らし方",
-      onchange: (e) => this.setPending(e.target.value),
+      onchange: (e) => { e.target.blur(); this.setPending(e.target.value); },
     },
     el("option", { value: "original", text: "作成中は今の音のまま" }),
     el("option", { value: "pitch", text: "作成中はピッチを変えて先に速度を変える" }));
     this.pendingSel.value = this.pending;
+    this.lowMemInput = el("input", {
+      type: "checkbox", id: "tp-lowmem", checked: this.lowMemory,
+      onchange: (e) => { e.target.blur(); this.setLowMemory(e.target.checked); },
+    });
     this.keepRow = el("div", { class: "tp-row tp-keep", id: "tp-keep" },
-      this.pendingSel, this.status, this.bar, this.cancelBtn, this.retryBtn);
+      this.pendingSel, this.status, this.bar, this.cancelBtn, this.retryBtn,
+      el("label", {
+        class: "snap-toggle tp-lowmem",
+        title: "音声の組を切り替えるとき、前の組を捨ててから読み込みます（読み込む間は止まる）。"
+          + "スマホ幅・長い曲では既定で ON",
+      }, this.lowMemInput, el("span", { text: "省メモリ" })));
 
     return el("section", { class: "panel tempo-panel", id: "tempo-panel" },
       el("div", { class: "tp-row" },
@@ -288,6 +332,7 @@ export class TempoPanel {
     const v = clampRatio(r);
     if (v === this.ratio && !fromSlider) { this.refresh(); return; }
     this.ratio = v;
+    this.range = rangeFor(v, this.range);
     this.failedKey = null;
     this.save();
     this.refresh();
@@ -312,6 +357,11 @@ export class TempoPanel {
     this.range = range;
     this.save();
     this.refresh();
+  }
+
+  setLowMemory(on) {
+    this.lowMemory = !!on;
+    try { localStorage.setItem(LOWMEM_KEY, on ? "1" : "0"); } catch { /* 保存できなくても動く */ }
   }
 
   setPending(value) {
@@ -365,6 +415,8 @@ export class TempoPanel {
     const d = this.desired();
     if (this.mode === "keep" && this.ratio !== 1) this.scheduleRequest();
     else this.dropRender();
+    // 読み込み中の組がもう要らなくなったら止める（同時に持つ組を最大2組にする）
+    if (this.loadingKey && (!d || d.key !== this.loadingKey)) this.abortLoad();
     if (d && d.key === this.activeKey) {
       engine.setRate(d.rate);
       this.refreshStatus();
@@ -377,29 +429,55 @@ export class TempoPanel {
     this.refreshStatus();
   }
 
+  abortLoad() {
+    if (this.loadAbort) this.loadAbort.abort();
+    this.loadAbort = null;
+    this.loadingKey = null;
+  }
+
   async loadSet(d) {
     if (this.loadingKey === d.key) return;
-    const codes = [...this.engine.tracks.keys()].filter((c) => this.engine.tracks.get(c).buffer);
+    const codes = Object.keys(this.urls || {});
     const missing = codes.filter((c) => !d.urls || !d.urls[c]);
     if (missing.length) {
       this.failedKey = d.key;
       toast(`速度を変えた音声がそろっていません（${missing.join(", ")}）。`);
       return;
     }
+    this.abortLoad();
+    const abort = new AbortController();
+    const onLeave = () => abort.abort();
+    this.view.abort.signal.addEventListener("abort", onLeave);
+    this.loadAbort = abort;
     this.loadingKey = d.key;
     this.refreshStatus();
     const engine = this.engine;
+    // 省メモリ: 前の組を捨ててから読み込む（読み込む間は止め、終わったら同じ位置から続ける）
+    if (this.lowMemory && this.activeKey !== null) {
+      // 読み込みを途中で別の組に替えても、終わったら再生を続ける（インスタンスに覚えておく）
+      this.resumeAfterLoad = engine.playing;
+      engine.pause();
+      engine.setBuffers(Object.fromEntries(codes.map((c) => [c, null])), engine.bufScale);
+      this.activeKey = null;
+    }
     try {
-      const signal = this.view.abort.signal;
       const list = await mapLimit(codes, LOAD_CONCURRENCY, async (code) => {
-        const buf = await fetchBinary(d.urls[code], signal);
-        return [code, await engine.decode(buf)];
+        if (abort.signal.aborted) throw new DOMException("中断しました", "AbortError");
+        const buf = await fetchBinary(d.urls[code], abort.signal);
+        const decoded = await engine.decode(buf);
+        if (abort.signal.aborted) throw new DOMException("中断しました", "AbortError");
+        return [code, decoded];
       });
-      if (this.disposed || engine !== this.engine) return;
+      if (this.disposed || engine !== this.engine || abort.signal.aborted) return;
       const now = this.desired();
       if (!now || now.key !== d.key) return; // 読み込む間に設定が変わった
       engine.setBuffers(Object.fromEntries(list), d.scale, now.rate);
       this.activeKey = d.key;
+      if (this.resumeAfterLoad) {
+        this.resumeAfterLoad = false;
+        await engine.play();
+        if (this.view.updateTransport) this.view.updateTransport();
+      }
     } catch (e) {
       if (e.status === 404 && this.render && this.render.ratio_key === d.key) {
         // キャッシュから消えていた: 作り直しを頼む
@@ -409,8 +487,12 @@ export class TempoPanel {
         toast(`音声を読み込めませんでした: ${e.message}`);
       }
     } finally {
-      if (this.loadingKey === d.key) this.loadingKey = null;
-      if (!this.disposed) {
+      this.view.abort.signal.removeEventListener("abort", onLeave);
+      if (this.loadAbort === abort) {
+        this.loadAbort = null;
+        this.loadingKey = null;
+      }
+      if (!this.disposed && !abort.signal.aborted) {
         this.refreshStatus();
         // 読み込む間に設定が変わっていたら、今の設定で合わせ直す
         const now = this.desired();
@@ -547,6 +629,7 @@ export class TempoPanel {
 
   dispose() {
     this.disposed = true;
+    this.abortLoad();
     clearTimeout(this.requestTimer);
     this.closeSource();
   }

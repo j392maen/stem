@@ -145,8 +145,7 @@ export class Engine {
     return now + FADE_SEC;
   }
 
-  _startSources(offset) {
-    const when = this.ctx.currentTime + START_DELAY_SEC;
+  _startSources(offset, when = this.ctx.currentTime + START_DELAY_SEC) {
     const g = this.fade.gain;
     g.setValueAtTime(0, when);
     g.linearRampToValueAtTime(1, when + FADE_SEC);
@@ -250,7 +249,8 @@ export class Engine {
       this.rate = r;
       return;
     }
-    const when = this.ctx.currentTime + RATE_DELAY_SEC;
+    // 音源の開始（startCtxTime）がまだ先なら、その時刻にそろえる（開始前の位置を数え違えない）
+    const when = Math.max(this.ctx.currentTime + RATE_DELAY_SEC, this.startCtxTime);
     const base = this._positionAtCtx(when); // 旧い速さで when まで進んだ位置
     for (const t of this.tracks.values()) {
       if (t.source) t.source.playbackRate.setValueAtTime(r, when);
@@ -264,26 +264,47 @@ export class Engine {
   /**
    * 全 stem の音声を差し替える（サーバーで伸縮した音声 ⇔ 元の音声）。buffers: { code: AudioBuffer }、
    * scale: 音声の 1 秒が曲の何秒か、rate: 差し替え後の playbackRate。
-   * 再生中は同じ曲の時刻から鳴らし直す（シークと同じく 8ms のフェード）。GainNode はそのまま
+   * 再生中は、少し先の時刻 when で前の音源を止めて新しい音源を始める。新しい音源は「前の音源が
+   * when まで鳴って届く曲の時刻」から始めるので、同じ部分を繰り返したり飛ばしたりしない
+   * （when の直前 8ms でフェードアウトし、when から 8ms でフェードイン）。GainNode はそのまま
    * なので stem の選択は保たれる。ループは曲の時刻なので音声データ上の位置に直して設定し直す。
    */
   setBuffers(buffers, scale = 1, rate = this.rate) {
-    const pos = this.position;
     const wasPlaying = this.playing;
-    if (wasPlaying) this._stopSources(this._fadeOut());
+    const now = this.ctx.currentTime;
+    const when = Math.max(now + START_DELAY_SEC, this.startCtxTime);
+    const pos = wasPlaying ? this._positionAtCtx(when) : this.position;
+    if (wasPlaying) {
+      const g = this.fade.gain;
+      g.cancelScheduledValues(now);
+      g.setValueAtTime(g.value, now);
+      g.setValueAtTime(g.value, Math.max(now, when - FADE_SEC));
+      g.linearRampToValueAtTime(0, when);
+      this._stopSources(when);
+    }
     for (const [code, t] of this.tracks) {
       if (Object.prototype.hasOwnProperty.call(buffers, code)) t.buffer = buffers[code];
     }
+    const before = { offset: this.startOffset, ctxTime: this.startCtxTime, speed: this.speed };
     this.bufScale = scale;
     this.rate = rate;
-    if (wasPlaying) this._startSources(clampTime(pos, this.duration));
-    else this.pausedAt = clampTime(pos, this.duration);
+    if (wasPlaying) {
+      this._startSources(clampTime(pos, this.duration), when);
+      // when までは前の音源が鳴っているので、前の基準で数える（位置が止まって見えないように）
+      this._beforeRate = before;
+    } else {
+      this.pausedAt = clampTime(pos, this.duration);
+    }
   }
 
   /** ループ区間を設定（null で解除。曲の時刻）。再生中は音を止めずに切り替える。 */
   setLoop(loop) {
     const valid = loop && loop.end > loop.start ? { start: loop.start, end: loop.end } : null;
     const pos = this.position;
+    const now = this.ctx.currentTime;
+    // 基準を置き直す時刻: 今。ただし音源の開始・速度の切り替えが予約中ならその時刻
+    const at = this.playing ? Math.max(now, this.startCtxTime) : now;
+    const base = this.playing ? this._positionAtCtx(at) : pos;
     this.loop = valid;
     if (!this.playing) {
       if (valid && (pos < valid.start || pos >= valid.end)) this.pausedAt = valid.start;
@@ -293,8 +314,7 @@ export class Engine {
       this.seek(valid.start); // 区間の外にいるときは始点へ
       return;
     }
-    // 区間の中にいる（または解除）: 鳴っている音源の設定だけを変え、位置の基準を今に置き直す
-    const now = this.ctx.currentTime;
+    // 区間の中にいる（または解除）: 鳴っている音源の設定だけを変え、位置の基準を置き直す
     const s = this.bufScale;
     for (const t of this.tracks.values()) {
       if (!t.source) continue;
@@ -304,9 +324,9 @@ export class Engine {
         t.source.loopEnd = valid.end / s;
       }
     }
-    this.startOffset = pos;
-    this.startCtxTime = now;
-    this._beforeRate = null;
+    this.startOffset = base;
+    this.startCtxTime = at;
+    if (at <= now) this._beforeRate = null; // 予約中の切り替えより前は、前の基準で数える
   }
 
   /** 毎フレーム呼ぶ。ループなしで最後まで来たら止める。 */
