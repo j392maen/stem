@@ -210,3 +210,189 @@ def test_old_db_gets_beat_tables_and_column(tmp_path: Path) -> None:
             assert s.get(SeparationJob, 7).status == "done"
     finally:
         engine.dispose()
+
+
+# --- 補正（T10c） --------------------------------------------------------------------------
+
+
+def _edit(client: TestClient, track_id: int, **body: object):
+    return client.post(f"/api/tracks/{track_id}/beats/edit", json=body)
+
+
+def test_edit_undo_reset(client: TestClient, tmp_path: Path) -> None:
+    track_id = _track(client, tmp_path, seconds=12.0)
+    _separate(client, track_id, FakeBeatAnalyzer(60))
+    body = client.get(f"/api/tracks/{track_id}/beats").json()
+    assert body["edited"] is False and body["can_undo"] is False
+    auto_beats = body["beats"]
+
+    res = _edit(client, track_id, op="double", range="all")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["edited"] is True and body["can_undo"] is True
+    assert [s["bpm"] for s in body["segments"]] == [120.0]
+    assert len(body["beats"]) == 2 * len(auto_beats) - 1
+    # GET も有効な拍（直した結果）を返す
+    assert client.get(f"/api/tracks/{track_id}/beats").json()["beats"] == body["beats"]
+    # 自動の結果は書き換えない
+    with _factory(client)() as s:
+        grid = s.get(BeatGrid, track_id)
+        assert grid.beats_json == auto_beats and grid.edited_beats_json == body["beats"]
+
+    body = _edit(client, track_id, op="meter", range="all", beats_per_bar=3).json()
+    assert body["time_signature"] == 3 and body["auto_time_signature"] == 4
+
+    # 元に戻す（複数回）
+    body = client.post(f"/api/tracks/{track_id}/beats/undo").json()
+    assert body["time_signature"] == 4 and body["edited"] is True and body["can_undo"] is True
+    body = client.post(f"/api/tracks/{track_id}/beats/undo").json()
+    assert body["edited"] is False and body["can_undo"] is False and body["beats"] == auto_beats
+    res = client.post(f"/api/tracks/{track_id}/beats/undo")
+    assert res.status_code == 409 and "元に戻せる操作" in res.json()["detail"]
+
+    # 自動に戻す（元に戻すで取り消せる）
+    _edit(client, track_id, op="double", range="all")
+    _edit(client, track_id, op="shift", range="all", delta_sec=0.01)
+    body = client.post(f"/api/tracks/{track_id}/beats/reset").json()
+    assert body["edited"] is False and body["beats"] == auto_beats and body["can_undo"] is True
+    body = client.post(f"/api/tracks/{track_id}/beats/undo").json()
+    assert body["edited"] is True and body["beats"][0] == 0.01
+    # 直していないときの reset は何もしない（履歴も増やさない）
+    client.post(f"/api/tracks/{track_id}/beats/undo")
+    client.post(f"/api/tracks/{track_id}/beats/undo")
+    body = client.post(f"/api/tracks/{track_id}/beats/reset").json()
+    assert body["edited"] is False and body["can_undo"] is False
+
+
+def test_edit_errors(client: TestClient, tmp_path: Path) -> None:
+    track_id = _track(client, tmp_path)
+    assert _edit(client, track_id, op="double").status_code == 404  # 未解析
+    assert _edit(client, 9999, op="double").status_code == 404
+    _separate(client, track_id, FakeBeatAnalyzer(120))
+    assert _edit(client, track_id, op="nope").status_code == 422
+    res = _edit(client, track_id, op="meter")
+    assert res.status_code == 422 and "beats_per_bar" in res.text
+    res = _edit(client, track_id, op="tap", taps=[1.0, 1.5])
+    assert res.status_code == 400 and "4 回以上" in res.json()["detail"]
+    res = _edit(client, track_id, op="double", range="loop")
+    assert res.status_code == 400 and "ループ区間" in res.json()["detail"]
+    res = _edit(client, track_id, op="cues", cue_start=4.0, cue_end=2.0, bars=1)
+    assert res.status_code == 400
+    # 失敗した操作は履歴に残らない
+    assert client.get(f"/api/tracks/{track_id}/beats").json()["can_undo"] is False
+
+
+def test_edit_ops_via_api(client: TestClient, tmp_path: Path) -> None:
+    track_id = _track(client, tmp_path, seconds=12.0)
+    _separate(client, track_id, FakeBeatAnalyzer([(0, 120), (4, 150)]))
+    # 区間（再生位置 6 秒 → 150 BPM の区間）だけ ÷2
+    body = _edit(client, track_id, op="half", position=6.0).json()
+    assert [s["bpm"] for s in body["segments"]] == [120.0, 75.0]
+    body = _edit(client, track_id, op="downbeat", position=5.3, range="segment").json()
+    assert any(abs(d - 5.6) < 0.01 for d in body["downbeats"])  # ÷2 の後の拍は 4.0, 4.8, 5.6…
+    taps = [2.0 + k * 0.4 for k in range(6)]
+    body = _edit(client, track_id, op="tap", taps=taps, range="all").json()
+    assert [s["bpm"] for s in body["segments"]] == [150.0]
+    body = _edit(client, track_id, op="cues", cue_start=0.0, cue_end=8.0, bars=4).json()
+    assert body["segments"][0]["bpm"] == 120.0
+    body = _edit(
+        client, track_id, op="shift", range="loop", loop_start=0.0, loop_end=4.0, delta_sec=-0.01
+    ).json()
+    assert body["beats"][0] == 0.49
+
+
+def test_reanalyze_moves_edits_to_history(client: TestClient, tmp_path: Path) -> None:
+    """再解析すると新しい自動の結果を使い、直した結果は「元に戻す」で戻せる。"""
+    track_id = _track(client, tmp_path)
+    job_id = _separate(client, track_id, FakeBeatAnalyzer(100))
+    edited = _edit(client, track_id, op="double", range="all").json()
+    assert client.post(f"/api/tracks/{track_id}/beats").status_code == 202
+    assert client.post(f"/api/tracks/{track_id}/beats/undo").status_code == 404  # 解析待ち
+    assert _worker(client).run_postprocess_one() == job_id
+    body = client.get(f"/api/tracks/{track_id}/beats").json()
+    assert body["edited"] is False and body["can_undo"] is True
+    assert [s["bpm"] for s in body["segments"]] == [120.0, 150.0]
+    body = client.post(f"/api/tracks/{track_id}/beats/undo").json()
+    assert body["edited"] is True and body["beats"] == edited["beats"]
+
+
+def test_cli_force_reanalyze_moves_edits_to_history(
+    settings: Settings, session: Session, tmp_path: Path
+) -> None:
+    from stemapp.beats.service import analyze_track, beats_payload, can_undo, edit_grid
+
+    track_id = make_track(session, settings, tmp_path, seconds=8.0)
+    analyze_track(session, settings, track_id, FakeBeatAnalyzer(100))
+    grid = session.get(BeatGrid, track_id)
+    edit_grid(session, grid, "double", {"range": "all"})
+    session.commit()
+    analyze_track(session, settings, track_id, FakeBeatAnalyzer(90), force=True)
+    session.commit()
+    body = beats_payload(grid, undo=can_undo(session, track_id))
+    assert body["edited"] is False and body["segments"][0]["bpm"] == 90.0 and body["can_undo"]
+
+
+def test_history_is_capped(settings: Settings, session: Session, tmp_path: Path) -> None:
+    from stemapp.beats import service
+    from stemapp.models import BeatEdit
+
+    track_id = make_track(session, settings, tmp_path, seconds=8.0)
+    service.analyze_track(session, settings, track_id, FakeBeatAnalyzer(100))
+    grid = session.get(BeatGrid, track_id)
+    for i in range(service.MAX_HISTORY + 5):
+        service.edit_grid(
+            session, grid, "shift", {"range": "all", "delta_sec": 0.001 if i % 2 else -0.001}
+        )
+    session.commit()
+    assert session.query(BeatEdit).count() == service.MAX_HISTORY
+
+
+def test_old_db_gets_edit_columns_and_table(tmp_path: Path) -> None:
+    from stemapp.beats.service import beats_payload
+
+    engine = make_engine(tmp_path / "old.db")
+    try:
+        init_db(engine)
+        with engine.begin() as conn:
+            # T10 までの DB を再現する
+            conn.exec_driver_sql("DROP TABLE beat_edit")
+            for col in ("edited_beats_json", "edited_downbeats_json", "edited_time_signature"):
+                conn.exec_driver_sql(f"ALTER TABLE beat_grid DROP COLUMN {col}")
+            conn.exec_driver_sql(
+                "INSERT INTO track (track_id, title, audio_hash, created_at) "
+                "VALUES (1, '古い曲', 'h1', '2026-01-01 00:00:00')"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO beat_grid (track_id, analyzer, beats_json, downbeats_json, "
+                "time_signature, created_at) VALUES (1, 'fake 1', '[0.0, 0.5, 1.0]', '[0.0]', 4, "
+                "'2026-01-01 00:00:00')"
+            )
+        init_db(engine)
+        insp = inspect(engine)
+        assert "beat_edit" in set(insp.get_table_names())
+        cols = {c["name"] for c in insp.get_columns("beat_grid")}
+        assert {"edited_beats_json", "edited_downbeats_json", "edited_time_signature"} <= cols
+        with Session(engine) as s:
+            grid = s.get(BeatGrid, 1)
+            assert grid.edited_beats_json is None
+            body = beats_payload(grid)
+            assert body["edited"] is False and body["beats"] == [0.0, 0.5, 1.0]
+    finally:
+        engine.dispose()
+
+
+def test_edit_rejects_times_outside_track(client: TestClient, tmp_path: Path) -> None:
+    track_id = _track(client, tmp_path, seconds=8.0)
+    _separate(client, track_id, FakeBeatAnalyzer(120))
+    taps = [1.0, 1.5, 2.0, 2.5]
+    res = _edit(client, track_id, op="tap", range="all", taps=[-1.0, *taps])
+    assert res.status_code == 422  # 0 秒より前
+    res = _edit(client, track_id, op="tap", range="all", taps=[*taps, 500.0])
+    assert res.status_code == 400 and "曲の長さ" in res.json()["detail"]
+    res = _edit(client, track_id, op="cues", cue_start=1.0, cue_end=60.0, bars=4)
+    assert res.status_code == 400
+    res = _edit(client, track_id, op="double", range="loop", loop_start=1.0, loop_end=99.0)
+    assert res.status_code == 400
+    res = _edit(client, track_id, op="tap", range="all", taps=[1.0 + 0.01 * k for k in range(65)])
+    assert res.status_code == 422  # タップの回数の上限
+    assert _edit(client, track_id, op="tap", range="all", taps=taps).status_code == 200

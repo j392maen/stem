@@ -118,15 +118,17 @@ def test_bar_lines_and_bpm_follow_position(
     assert page.inner_text("#meter") == "4/4"
     assert page.get_attribute("#tempo", "class") == "tempo"
     # 拡大波形は拍の線・小節線（8 秒表示で 120 BPM → 4 小節前後）
-    page.wait_for_function("() => document.querySelector('#wave-zoom').dataset.grid === 'beats'")
-    # 0 秒の位置の描画（2 小節）が残っていることがあるので、2 秒の位置の描画を待つ
+    # シーク（2 秒）の後に描いた画面を待つ（シーク前の 0 秒の画面では 2 小節しか見えない。
+    # 以前はここで前の画面を読んでまれに失敗した。T08 側でも同じ直しが入っていたのでまとめた）
     page.wait_for_function(
-        "() => { const n = Number(document.querySelector('#wave-zoom').dataset.bars);"
-        " return n >= 3 && n <= 6; }",
+        "() => document.querySelector('#time-now').textContent === '0:02.0'", timeout=5000
+    )
+    page.wait_for_function(
+        "() => { const z = document.querySelector('#wave-zoom');"
+        " const n = Number(z.dataset.bars);"
+        " return z.dataset.grid === 'beats' && n >= 3 && n <= 6; }",
         timeout=5000,
     )
-    bars = int(page.get_attribute("#wave-zoom", "data-bars") or 0)
-    assert 3 <= bars <= 6, bars
     _shot(page, "beats_120.png")
 
     page.evaluate(f"() => {view}.engine.seek(9.0)")
@@ -142,11 +144,14 @@ def test_bar_lines_and_bpm_follow_position(
     page.click("#play-btn")
 
     # 拡大・縮小しても小節線は描ける（32 秒表示では曲全体の小節が見える）
+    # 固定の待ち時間に頼らず、描き直された状態（表示の秒数と小節の数）を待つ
     for _ in range(3):
         page.click(".wave-tools button[aria-label='縮小']")
-    page.wait_for_timeout(200)
+    page.wait_for_function(f"() => {view}.wave.zoomSeconds === 32")
     total = len(beats["downbeats"])
-    assert int(page.get_attribute("#wave-zoom", "data-bars") or 0) == total
+    page.wait_for_function(
+        "(n) => document.querySelector('#wave-zoom').dataset.bars === String(n)", arg=total
+    )
     assert not page.errors  # type: ignore[attr-defined]
 
 

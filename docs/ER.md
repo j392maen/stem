@@ -21,8 +21,9 @@
 | LISTEN_PRESET_ITEM | item_id PK, listen_preset_id FK, stem_type_id FK（どちらか一方）, group_id FK（どちらか一方）, gain_db |
 | PLAYBACK_STATE | device_id PK FK, track_id PK FK, listen_preset_id FK, channel_gains_json, position_sec, updated_at |
 | CUE_POINT | cue_id PK, track_id FK, position_sec, loop_end_sec(null可), label, color |
-| BEAT_GRID | track_id PK FK, analyzer(解析器の名前と版。例 beat_this 1.1.0 final0), beats_json(拍の時刻・秒の配列), downbeats_json(小節の頭の時刻・秒の配列), time_signature(推定の拍子。1小節の拍数), created_at |
-| BEAT_ANCHOR | anchor_id PK, track_id FK, position_sec, kind(downbeat/beat), bar_number(null可), bpm(null可), created_at |
+| BEAT_GRID | track_id PK FK, analyzer(解析器の名前と版。例 beat_this 1.1.0 final0), beats_json(拍の時刻・秒の配列), downbeats_json(小節の頭の時刻・秒の配列), time_signature(推定の拍子。1小節の拍数), created_at, edited_beats_json(null可。ユーザーが直した拍), edited_downbeats_json(null可), edited_time_signature(null可) |
+| BEAT_EDIT | edit_id PK, track_id FK, op(downbeat/double/half/meter/shift/tap/cues/reset/reanalyze), params_json(操作の引数), before_json(操作の前の直した結果 {beats, downbeats, time_signature}。null=自動の結果のままだった), created_at |
+| BEAT_ANCHOR | anchor_id PK, track_id FK, position_sec, kind(downbeat/beat), bar_number(null可), bpm(null可), created_at（T10c では未使用。将来のワープマーカー用） |
 | EXPORT | export_id PK, job_id FK, listen_preset_id FK(mix のみ), export_type(single/all/mix), format(wav/flac/mp3。all は ZIP にまとめ中身がこの形式), output_path, created_at, status(queued/running/done/failed), progress, stage, error_message, filename, bytes, mix_gain_db(mix で ±1 を超えたとき全体にかけた dB), finished_at |
 | EXPORT_ITEM | export_id PK FK, stem_id PK FK, gain_db(mix の音量) |
 | OFFLINE_CACHE | device_id PK FK, track_id PK FK, cached_at, bytes |
@@ -31,4 +32,5 @@
 - LISTEN_PRESET_ITEM は stem_type_id と group_id のどちらか一方だけが非NULL（CHECK 制約）。
 - STEM の子（parent_stem_id が同じ）は合計すると親に一致するよう、is_residual=true の stem を1つ含む。
 - TRACK.audio_hash は正規化後PCMの SHA-256（同じ曲の再分割防止）。
-- BEAT_GRID は自動解析の結果（再解析で上書き）。区間ごとの BPM は保存せず beats_json から計算する（`stemapp.beats.tempo`）。ユーザーの補正は BEAT_ANCHOR に別に持ち、再解析で消さない（T10c で使う）。拍の時刻はすべて元の曲の時刻（速度変更の影響を受けない）。
+- BEAT_GRID の beats_json など（自動の結果）は解析だけが書き、補正では書き換えない。ユーザーが直した結果は edited_*（3つとも NULL か、3つとも値あり）。画面と API は「有効な拍」（edited_* があればそれ、無ければ自動の結果）を使う。区間ごとの BPM は保存せず、有効な拍から毎回計算する（`stemapp.beats.tempo`）。拍の時刻はすべて元の曲の時刻（速度変更の影響を受けない）。
+- BEAT_EDIT は補正の履歴（元に戻す用。新しいものから取り消す。曲ごとに最大 100 件、古いものから消す）。「自動に戻す」も履歴に残し、元に戻せる。再解析すると新しい自動の結果を使い、それまでの直した結果は op=reanalyze の履歴に移す（解析の後に「元に戻す」で戻せる）。

@@ -1,4 +1,4 @@
-"""DB モデル（docs/ER.md の全22実体）。
+"""DB モデル（docs/ER.md の全23実体）。
 
 列挙的な値（status 等）は文字列で保存し、取りうる値はコメントに書く。
 """
@@ -323,10 +323,11 @@ class CuePoint(Base):
 
 
 class BeatGrid(Base):
-    """曲の拍・小節の頭の自動解析の結果（再解析で上書きする）。
+    """曲の拍・小節の頭の自動解析の結果（再解析で上書きする）と、ユーザーが直した結果。
 
-    区間ごとの BPM は保存せず、beats から毎回計算する（`stemapp.beats.tempo`）。
-    ユーザーの補正は BEAT_ANCHOR に別に持つ（再解析で消さない）。
+    区間ごとの BPM は保存せず、「有効な拍」から毎回計算する（`stemapp.beats.tempo`）。
+    有効な拍 = edited_* があればそれ、無ければ自動の結果（beats_json など）。
+    自動の結果は補正では書き換えない。操作の履歴は BEAT_EDIT（元に戻す用）。
     """
 
     __tablename__ = "beat_grid"
@@ -339,10 +340,35 @@ class BeatGrid(Base):
     downbeats_json: Mapped[Any] = mapped_column(JSON)  # 小節の頭の時刻（秒）の配列
     time_signature: Mapped[int | None] = mapped_column(Integer)  # 推定の拍子（1小節の拍数。例 4）
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # ユーザーが直した結果（T10c）。NULL なら自動の結果を使う（3つとも NULL か、3つとも値あり）
+    edited_beats_json: Mapped[Any | None] = mapped_column(JSON(none_as_null=True))
+    edited_downbeats_json: Mapped[Any | None] = mapped_column(JSON(none_as_null=True))
+    edited_time_signature: Mapped[int | None] = mapped_column(Integer)
+
+
+class BeatEdit(Base):
+    """拍の補正の操作の履歴（T10c。元に戻す用。新しいものから取り消す）。
+
+    before_json は操作の前の「直した結果」（{beats, downbeats, time_signature}）。
+    NULL は操作の前が自動の結果のままだったこと。op は downbeat / double / half / meter / shift /
+    tap / cues / reset（自動に戻す）/ reanalyze（再解析で自動の結果に戻った）。
+    """
+
+    __tablename__ = "beat_edit"
+
+    edit_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    track_id: Mapped[int] = mapped_column(
+        ForeignKey("track.track_id", ondelete="CASCADE"), index=True
+    )
+    op: Mapped[str] = mapped_column(String(20))
+    params_json: Mapped[Any | None] = mapped_column(JSON(none_as_null=True))
+    before_json: Mapped[Any | None] = mapped_column(JSON(none_as_null=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class BeatAnchor(Base):
-    """拍の手動補正の目印（T10c で使う。ワープマーカーと同じ考え方）。"""
+    """拍の手動補正の目印（ワープマーカー）。T10c では使っていない（補正は BEAT_GRID.edited_* と
+    BEAT_EDIT に持つ）。将来、区間ごとに拍を等間隔に置き直す形にするときのために残す。"""
 
     __tablename__ = "beat_anchor"
 
@@ -436,6 +462,7 @@ ALL_MODELS: tuple[type[Base], ...] = (
     PlaybackState,
     CuePoint,
     BeatGrid,
+    BeatEdit,
     BeatAnchor,
     Export,
     ExportItem,
