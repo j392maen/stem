@@ -155,6 +155,10 @@ class SeparationJob(Base):
     input_stem_id: Mapped[int | None] = mapped_column(
         ForeignKey("stem.stem_id", ondelete="SET NULL", use_alter=True)
     )  # refine のみ
+    # 詳細分割の方法（refine のみ）。MODEL の行（HPSS も architecture="hpss" の行）
+    refine_model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model.model_id", ondelete="SET NULL")
+    )
     requested_by: Mapped[int | None] = mapped_column(
         ForeignKey("device.device_id", ondelete="SET NULL")
     )
