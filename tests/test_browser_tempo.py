@@ -454,4 +454,20 @@ def test_swap_continuity_range_blur_lowmem(
         f" && {VIEW}.tempo.loadingKey === null && {VIEW}.engine.playing",
         timeout=10_000,
     )
+    # 省メモリで前の組を捨てた後に読み込めなかったら、無音のままにせず元の音声（1.0 倍）で鳴らす
+    page.route("**/api/files/tempo/**", lambda route: route.abort())
+    page.evaluate(f"() => {VIEW}.tempo.setRatio(1.25)")
+    page.wait_for_function(
+        f"() => {VIEW}.tempo.activeKey === 'orig' && {VIEW}.engine.bufScale === 1"
+        f" && {VIEW}.engine.rate === 1 && {VIEW}.engine.playing"
+        f" && {VIEW}.tempo.loadingKey === null",
+        timeout=20_000,
+    )
+    _wait_status(page, "読み込めませんでした（元の速度で再生中）")
+    lengths = _engine(page, BUF_LENGTHS)
+    assert lengths and all(d == pytest.approx(24.0, abs=0.01) for d in lengths)
+    page.wait_for_timeout(500)  # 読み直しを繰り返さない（落ち着いている）
+    assert page.evaluate(f"() => {VIEW}.tempo.activeKey") == "orig"
+    page.unroute("**/api/files/tempo/**")
+    page.evaluate("() => { document.getElementById('toast').hidden = true; }")
     assert not page.errors  # type: ignore[attr-defined]

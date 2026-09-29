@@ -143,7 +143,7 @@ export class TempoPanel {
     this.resumeAfterLoad = false; // 省メモリで止めた: 読み込み終わったら再生を続ける
     this.activeKey = ORIGINAL; // 今鳴らしている音声の組（元の音声 or 倍率）
     this.loadingKey = null; // 読み込み中の組
-    this.failedKey = null; // 読み込みに失敗した組（速度・方式を変えるまで読み直さない）
+    this.failedKeys = new Set(); // 読み込みに失敗した組（速度・方式を変えるまで読み直さない）
     this.render = null; // 今の目標の倍率の作成（サーバーの TEMPO_RENDER）
     this.source = null; // EventSource
     this.requestTimer = 0;
@@ -293,6 +293,8 @@ export class TempoPanel {
       text = "読み込み中…";
       busy = true;
       progress = 1;
+    } else if (this.failedKeys.has(want)) {
+      text = "読み込めませんでした（元の速度で再生中）";
     } else if (this.activeKey === want) {
       text = `ピッチを保って再生中（×${want}）`;
     } else if (mine && (r.status === "queued" || r.status === "running")) {
@@ -333,7 +335,7 @@ export class TempoPanel {
     if (v === this.ratio && !fromSlider) { this.refresh(); return; }
     this.ratio = v;
     this.range = rangeFor(v, this.range);
-    this.failedKey = null;
+    this.failedKeys.clear();
     this.save();
     this.refresh();
     this.apply();
@@ -346,7 +348,7 @@ export class TempoPanel {
   setMode(mode) {
     if (!MODES.includes(mode) || mode === this.mode) return;
     this.mode = mode;
-    this.failedKey = null;
+    this.failedKeys.clear();
     this.save();
     this.refresh();
     this.apply();
@@ -402,9 +404,16 @@ export class TempoPanel {
     if (r === 1 || this.mode === "pitch") return { key: ORIGINAL, scale: 1, rate: r, urls: this.urls };
     const want = ratioKey(r);
     const rd = this.render;
+    const original = { key: ORIGINAL, scale: 1, rate: 1, urls: this.urls };
     if (rd && rd.ratio_key === want && rd.status === "done") {
+      // 省メモリで前の組を捨てた後に読み込めなかった: 無音のままにせず元の音声（1.0 倍）で鳴らす
+      const lost = this.activeKey === null && !this.failedKeys.has(ORIGINAL);
+      if (this.failedKeys.has(want) && lost) return original;
       return { key: want, scale: Number(want), rate: 1, urls: rd.files };
     }
+    // 何も読み込んでいない（省メモリで捨てた後に作り直しになった等）: できるまで元の音声で鳴らす
+    const idle = this.activeKey === null && this.loadingKey === null;
+    if (idle && !this.failedKeys.has(ORIGINAL)) return original;
     return null;
   }
 
@@ -412,11 +421,14 @@ export class TempoPanel {
   apply() {
     const engine = this.engine;
     if (!engine || !this.urls || this.disposed) return;
-    const d = this.desired();
+    let d = this.desired();
     if (this.mode === "keep" && this.ratio !== 1) this.scheduleRequest();
     else this.dropRender();
     // 読み込み中の組がもう要らなくなったら止める（同時に持つ組を最大2組にする）
-    if (this.loadingKey && (!d || d.key !== this.loadingKey)) this.abortLoad();
+    if (this.loadingKey && (!d || d.key !== this.loadingKey)) {
+      this.abortLoad();
+      d = this.desired(); // 省メモリで何も持っていなければ元の音声になる
+    }
     if (d && d.key === this.activeKey) {
       engine.setRate(d.rate);
       this.refreshStatus();
@@ -425,7 +437,7 @@ export class TempoPanel {
     // 目標の組がまだ無い・読み込み中: 今の組で鳴らしておく
     const speedNow = this.mode === "pitch" || this.ratio === 1 || this.pending === "pitch";
     if (speedNow) engine.setRate(this.ratio / engine.bufScale);
-    if (d && d.key !== this.failedKey) this.loadSet(d);
+    if (d && !this.failedKeys.has(d.key)) this.loadSet(d);
     this.refreshStatus();
   }
 
@@ -440,7 +452,7 @@ export class TempoPanel {
     const codes = Object.keys(this.urls || {});
     const missing = codes.filter((c) => !d.urls || !d.urls[c]);
     if (missing.length) {
-      this.failedKey = d.key;
+      this.failedKeys.add(d.key);
       toast(`速度を変えた音声がそろっていません（${missing.join(", ")}）。`);
       return;
     }
@@ -483,7 +495,7 @@ export class TempoPanel {
         // キャッシュから消えていた: 作り直しを頼む
         this.render = null;
       } else if (e.name !== "AbortError" && !this.disposed) {
-        this.failedKey = d.key; // 速度・方式を変えるまで読み直さない
+        this.failedKeys.add(d.key); // 速度・方式を変えるまで読み直さない
         toast(`音声を読み込めませんでした: ${e.message}`);
       }
     } finally {

@@ -633,8 +633,6 @@ def test_real_rubberband_keeps_pitch_and_aligns(tmp_path: Path) -> None:
 
 @pytest.mark.ffmpeg
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg がありません")
-@pytest.mark.ffmpeg
-@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg がありません")
 @pytest.mark.parametrize("ratio", [0.5, 0.9, 1.1, 2.0])
 def test_real_rubberband_time_matches_song_time(tmp_path: Path, ratio: float) -> None:
     """伸縮した音の位置が「元の時刻 ÷ 倍率」と ±5ms 以内（曲の時刻に直して）。
@@ -667,6 +665,8 @@ def test_real_rubberband_time_matches_song_time(tmp_path: Path, ratio: float) ->
     assert abs(mean) < 5.0, (ratio, mean, errors)
 
 
+@pytest.mark.ffmpeg
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg がありません")
 def test_real_rubberband_stop_kills_ffmpeg(tmp_path: Path) -> None:
     sr = SAMPLE_RATE
     data = (0.1 * np.random.default_rng(0).standard_normal((sr * 120, 2))).astype(np.float32)
