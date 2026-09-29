@@ -1,4 +1,4 @@
-"""DB モデル（docs/ER.md の全23実体）。
+"""DB モデル（docs/ER.md の全25実体）。
 
 列挙的な値（status 等）は文字列で保存し、取りうる値はコメントに書く。
 """
@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -443,6 +444,59 @@ class ExportItem(Base):
     gain_db: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0.0"))
 
 
+# --- 速度変更（ピッチを保つ方式。T11） ------------------------------------------------
+
+
+class TempoRender(Base):
+    """ジョブの全 stem を倍率 ratio で伸縮した配信用の音声（キャッシュ）と、その作成の状態。
+
+    ファイルは `data/cache/tempo/<job_id>/<ratio を小数3桁>/`（stem の保存フォルダとは別）。
+    作成はワーカーが1件ずつ行う（queued → running → done / failed / canceled）。
+    キャッシュの上限（曲ごとの倍率の数・全体の容量）を超えたら last_used_at の古いものから消す。
+    """
+
+    __tablename__ = "tempo_render"
+    __table_args__ = (UniqueConstraint("job_id", "ratio", name="ux_tempo_render_job_ratio"),)
+
+    render_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("separation_job.job_id", ondelete="CASCADE"), index=True
+    )
+    ratio: Mapped[float] = mapped_column(Float)  # 速度の倍率（小数3桁に丸める。1.1 = 1.1 倍速）
+    pitch_mode: Mapped[str] = mapped_column(String(10), default="keep")  # keep（ピッチを保つ）
+    # queued / running / done / failed / canceled
+    status: Mapped[str] = mapped_column(String(10), default="queued")
+    progress: Mapped[float] = mapped_column(Float, default=0.0)  # 0-1
+    stage: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    # データフォルダからの相対パス（できあがったフォルダ）
+    dir_path: Mapped[str | None] = mapped_column(Text)
+    bytes: Mapped[int | None] = mapped_column(Integer)  # 全 stem の合計
+    frames: Mapped[int | None] = mapped_column(Integer)  # 伸縮後の長さ（44.1kHz のサンプル数）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TempoRendition(Base):
+    """TEMPO_RENDER の stem ごとのファイル（形式は stream と同じ）。"""
+
+    __tablename__ = "tempo_rendition"
+
+    render_id: Mapped[int] = mapped_column(
+        ForeignKey("tempo_render.render_id", ondelete="CASCADE"), primary_key=True
+    )
+    stem_id: Mapped[int] = mapped_column(
+        ForeignKey("stem.stem_id", ondelete="CASCADE"), primary_key=True
+    )
+    codec: Mapped[str] = mapped_column(String(10))
+    bitrate_kbps: Mapped[int | None] = mapped_column(Integer)
+    file_path: Mapped[str] = mapped_column(Text)  # データフォルダからの相対パス
+    bytes: Mapped[int | None] = mapped_column(Integer)
+
+
 ALL_MODELS: tuple[type[Base], ...] = (
     Track,
     InputSource,
@@ -467,4 +521,6 @@ ALL_MODELS: tuple[type[Base], ...] = (
     Export,
     ExportItem,
     OfflineCache,
+    TempoRender,
+    TempoRendition,
 )

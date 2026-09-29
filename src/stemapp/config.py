@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # 書き出し（data/exports）を残す時間と、合計の大きさの上限（超えた分は古い順に消す）
     export_ttl_hours: float = 24.0
     export_max_mb: int = 2048
+    # 速度変更（ピッチを保つ方式）のキャッシュ（data/cache/tempo）: 全体の上限（MB）と、
+    # 1曲あたりに残す倍率の数。超えたら最も長く使っていないものから消す
+    tempo_cache_max_mb: int = 2048
+    tempo_cache_per_track: int = 3
+    # 伸縮を同時に何 stem 実行するか（0 = CPU の論理コア数の半分。最大 8）
+    tempo_workers: int = 0
 
     @property
     def data_root(self) -> Path:
