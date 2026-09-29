@@ -52,3 +52,6 @@
 - 任意（T12 より）: 拍の解析 API に job_id を渡せるようにし、警告を表示中のジョブに付ける。コード名 exp_resid_split は中身（SW のみ）と合わない（識別子なので据え置き）。gabox v1（未使用、約 871MB）は削除可。
 - 仕上げ（T08 レビューより）: exports の cleanup を Lock で1本ずつに（StaleDataError のログ）。mix の合計を float32 に（メモリ半分）。CLI export のエラー表示を markup=False に。完了後の「作成する」ボタンを控えめに。書き出しの一覧・再ダウンロード画面、MP3 のタグ（提案）。
 - 仕上げ（T06a レビューより）: data/diag の件数上限（例 200 件）。Service Worker が /api/ をキャッシュしないことのブラウザテストを強く。Host なし（400）と WebSocket（1008）のテスト。ポート判定を isascii かつ isdigit に。manifest の any/maskable を分けて書く。
+- T07 マージ時（T11 レビューより）: 詳細分割で stem の構成が変わったら、そのジョブの速度変更キャッシュ（TEMPO_RENDER と data/cache/tempo/<job_id>）を消す（T11 で用意する公開関数を呼ぶ）。
+- 後続候補（T11 レビューより）: 伸縮ジョブを分割と別スレッドで動かし、分割中の待ちを無くす。
+- 不安定なテスト: test_browser_diag.py::test_diag_page_desktop が別担当の GPU 使用中に1回失敗（単独では成功）。
