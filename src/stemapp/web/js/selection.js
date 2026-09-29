@@ -88,10 +88,28 @@ export function dbToGain(db) {
 }
 
 /**
+ * code の葉。この曲に無い詳細 stem（例: 分けていない曲の kick）は、STEM_TYPE の親をたどって
+ * この曲にある stem（drums）として扱う。types は /api/stem-types の stem_types（parent_code 付き）。
+ */
+export function leavesOrAncestor(tree, code, types = []) {
+  const parentOf = new Map(types.map((t) => [t.code, t.parent_code]));
+  const seen = new Set();
+  let c = code;
+  while (c && !seen.has(c)) {
+    const leaves = leavesOf(tree, c);
+    if (leaves.length) return leaves;
+    seen.add(c);
+    c = parentOf.get(c);
+  }
+  return [];
+}
+
+/**
  * 組み合わせプリセットを選択にする。groups は /api/stem-groups の stem_groups。
+ * types（/api/stem-types の stem_types）を渡すと、この曲に無い詳細 stem を親として扱う。
  * 戻り値: { sel: Set（葉）, gainsDb: Map（葉 → dB。複数の項目に入る葉は後の項目が優先） }
  */
-export function presetToSelection(tree, preset, groups) {
+export function presetToSelection(tree, preset, groups, types = []) {
   const byGroupCode = new Map(groups.map((g) => [g.code, g]));
   const byGroupId = new Map(groups.map((g) => [g.group_id, g]));
   const sel = new Set();
@@ -99,7 +117,7 @@ export function presetToSelection(tree, preset, groups) {
   for (const item of preset.items || []) {
     let leaves = [];
     if (item.stem_type_code) {
-      leaves = leavesOf(tree, item.stem_type_code);
+      leaves = leavesOrAncestor(tree, item.stem_type_code, types);
     } else {
       const g = byGroupCode.get(item.group_code) || byGroupId.get(item.group_id);
       if (g) leaves = groupLeaves(tree, g);
