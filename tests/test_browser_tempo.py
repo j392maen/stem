@@ -338,6 +338,32 @@ def test_keep_mode_render_and_swap(page: Any, server: LiveServer, tmp_path: Path
     assert not page.errors  # type: ignore[attr-defined]
 
 
+def test_cue_loop_independent_of_speed(
+    page: Any, server: LiveServer, tmp_path: Path  # noqa: F811
+) -> None:
+    """キューのループ（engine.setLoop、曲の時刻）は速度を変えても同じ区間で折り返す。"""
+    track_id, _ = _done_track(server, tmp_path, seconds=24.0)
+    with httpx.Client(base_url=server.base_url) as c:
+        res = c.post(f"/api/tracks/{track_id}/cues",
+                     json={"position_sec": 3.0, "loop_end_sec": 4.5, "label": "A"})
+        assert res.status_code == 201, res.text
+    _open(page, server, track_id)
+    page.click("#play-btn")
+    page.wait_for_function(f"() => {VIEW}.engine.playing")
+    page.click("#cues li .name")  # キューへ（ループ付きのキューがループの対象になる）
+    page.click("#loop-btn")
+    assert page.evaluate(f"() => {VIEW}.engine.loop") == {"start": 3.0, "end": 4.5}
+    for ratio in (1.25, 0.8):
+        page.evaluate(f"(r) => {VIEW}.tempo.setRatio(r)", ratio)
+        page.wait_for_timeout(100)
+        assert page.evaluate(f"() => {VIEW}.engine.loop") == {"start": 3.0, "end": 4.5}
+        assert all(r == pytest.approx(ratio) for r in _engine(page, "e.sourceRates()"))
+        seen = _positions(page, 50)  # 2.5 秒: 1.5 秒の区間を必ず1回以上折り返す
+        assert all(2.99 <= p <= 4.51 for p in seen), seen
+        assert any(b < a for a, b in zip(seen, seen[1:], strict=False))
+    assert not page.errors  # type: ignore[attr-defined]
+
+
 def test_tempo_screens_phone(browser: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811
     track_id, _ = _done_track(server, tmp_path)
     ctx = browser.new_context(viewport=PHONE, locale="ja-JP", is_mobile=True, has_touch=True)
