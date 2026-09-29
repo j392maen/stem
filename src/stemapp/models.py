@@ -185,6 +185,9 @@ class SeparationJob(Base):
     # 拍の解析に失敗したときの警告（画面に出す）。拍が無くても再生はできるのでジョブは done のまま。
     # 解析に成功すると NULL に戻す
     beat_warning: Mapped[str | None] = mapped_column(Text)
+    # stem の保存フォルダ（データフォルダからの相対パス。例 "stems/曲名/standard"）。
+    # 保存を始めるときに一度決める（`stemapp.stem_folders`）。NULL は T13 より前の stems/<job_id>
+    output_dir: Mapped[str | None] = mapped_column(Text)
 
 
 class Stem(Base):

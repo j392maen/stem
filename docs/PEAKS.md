@@ -3,7 +3,7 @@
 波形表示用に事前計算したデータ。stem ごと・解像度ごとに1ファイル。
 作成: `src/stemapp/peaks.py`（`compute_peaks` / `encode_peaks`）。
 
-- 置き場所: `data/stems/<job_id>/peaks/<stem code>_<samples_per_px>.stpk`
+- 置き場所: `data/stems/<元のファイル名>/<分け方>/peaks/<stem code>_<samples_per_px>.stpk`（T13 より前は `data/stems/<job_id>/peaks/`）
 - DB: WAVEFORM（stem_id, samples_per_px, peaks_path）
 - 配信: `GET /api/files/peaks/{stem_id}/{samples_per_px}`（`application/octet-stream`）
 - 解像度（samples_per_px）: 256, 1024, 4096, 16384
