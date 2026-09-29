@@ -20,6 +20,7 @@ from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
 from stemapp.library import find_done_job
 from stemapp.models import SeparationJob, Track
 from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
+from stemapp.tempo.service import remove_job_tempo_dirs
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +177,7 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
     shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
     remove_export_dirs(settings, export_ids)  # 書き出したファイル（data/exports/<id>）
+    remove_job_tempo_dirs(settings, [job_id])  # 速度を変えた音声（data/cache/tempo/<job_id>）
     log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
     return job
 

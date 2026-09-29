@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import shutil
-import time
-from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from stemapp.api.common import SessionDep, iso, job_to_dict, not_found, preset_codes
+from stemapp.api.common import (
+    SessionDep,
+    iso,
+    job_to_dict,
+    not_found,
+    preset_codes,
+    sse_response,
+)
 from stemapp.beats.edit import BeatEditError
 from stemapp.beats.service import (
     beats_payload,
@@ -55,14 +57,11 @@ from stemapp.models import (
     Waveform,
 )
 from stemapp.separation.pipeline import SeparationError
+from stemapp.tempo.service import remove_job_tempo_dirs
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["tracks"])
-
-SSE_POLL_SEC = 0.5
-SSE_KEEPALIVE_SEC = 15.0
-
 
 # --- 曲 ---------------------------------------------------------------------------
 
@@ -186,6 +185,7 @@ def delete_track(
     shutil.rmtree(settings.tracks_dir / str(track_id), ignore_errors=True)
     for job_id in job_ids:
         shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
+    remove_job_tempo_dirs(settings, job_ids)  # 速度を変えた音声（行は CASCADE で消える）
     log.info("曲を削除しました（track %d, job %s）。", track_id, job_ids)
     return {"deleted": True, "track_id": track_id, "job_ids": job_ids}
 
@@ -480,40 +480,15 @@ def job_events(job_id: int, request: Request) -> StreamingResponse:
     factory = request.app.state.session_factory
     with factory() as session:
         _get_job(session, job_id)
-    poll_sec: float = getattr(request.app.state, "sse_poll_sec", SSE_POLL_SEC)
 
     def load() -> dict[str, Any] | None:
         with factory() as s:
             job = s.get(SeparationJob, job_id)
             return job_to_dict(job, preset_codes(s)) if job is not None else None
 
-    async def stream() -> AsyncIterator[str]:
-        last: tuple[object, ...] | None = None
-        last_sent = time.monotonic()
-        while True:
-            if await request.is_disconnected():
-                return
-            data = await run_in_threadpool(load)
-            if data is None:
-                payload = json.dumps({"detail": "ジョブが削除されました。"}, ensure_ascii=False)
-                yield f"event: error\ndata: {payload}\n\n"
-                return
-            key = (data["status"], data["progress"], data["stage"])
-            if key != last:
-                yield f"event: job\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-                last = key
-                last_sent = time.monotonic()
-            elif time.monotonic() - last_sent >= SSE_KEEPALIVE_SEC:
-                yield ": keepalive\n\n"
-                last_sent = time.monotonic()
-            if data["status"] in FINISHED_STATUSES:
-                return
-            await asyncio.sleep(poll_sec)
-
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    return sse_response(
+        request, load, event="job", gone_message="ジョブが削除されました。",
+        finished=FINISHED_STATUSES,
     )
 
 
