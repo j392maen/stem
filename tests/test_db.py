@@ -20,11 +20,12 @@ EXPECTED_TABLES = {
     "separation_job", "stem_type", "stem", "stem_rendition", "waveform", "stem_group",
     "stem_group_member", "listen_preset", "listen_preset_item", "playback_state",
     "cue_point", "export", "export_item", "offline_cache", "beat_grid", "beat_anchor", "beat_edit",
+    "tempo_render", "tempo_rendition",
 }
 
 
 def test_all_tables_created(engine: Engine) -> None:
-    assert len(ALL_MODELS) == 23
+    assert len(ALL_MODELS) == 25
     assert set(inspect(engine).get_table_names()) == EXPECTED_TABLES
 
 

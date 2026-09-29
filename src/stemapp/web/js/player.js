@@ -1,5 +1,6 @@
 // プレイヤー画面: 波形、再生・シーク、stem の ON/OFF、グループ、組み合わせプリセット、キュー・ループ、
-// 拍・小節線と再生位置の BPM、拍の補正（T10c）、小節単位のループ、キューの拍へのスナップ。
+// 拍・小節線と再生位置の BPM、拍の補正（T10c）、小節単位のループ、キューの拍へのスナップ、
+// 速度の変更（T11。ピッチも変わる方式・ピッチを保つ方式）。
 
 import { api, fetchBinary } from "./api.js";
 import { BeatEditPanel } from "./beatedit.js";
@@ -8,6 +9,7 @@ import { Engine, clampTime } from "./engine.js";
 import { Exporter } from "./export.js";
 import { parsePeaks } from "./peaks.js";
 import * as S from "./selection.js";
+import { COARSE_STEP, FINE_STEP, TempoPanel } from "./tempo.js";
 import { confirmDialog, el, formatTime, icon, ICONS, promptDialog, toast } from "./ui.js";
 import { WaveformView, ZOOM_STEPS } from "./waveform.js";
 
@@ -96,6 +98,7 @@ export class PlayerView {
     this.beatJobId = null;
     this.tempoKey = "";
     this.beatEdit = null; // 拍の補正パネル
+    this.tempo = null; // 速度の変更パネル
     // 小節ループ（キューに保存しない一時的なループ。{start, end, bars}）。キューのループより優先
     this.barLoop = null;
     this.loopBars = 4; // B キーで作る小節ループの長さ（最後に選んだもの）
@@ -310,6 +313,9 @@ export class PlayerView {
       this.ready = true;
       cover.hidden = true;
       this.root.querySelector("#play-btn").disabled = false;
+      this.tempo.start(Object.fromEntries(loaded.map((x) => [
+        x.stem.code, x.stem.renditions.find((r) => r.purpose === "stream").url,
+      ])));
       this.frame();
       await this.applyRestore();
     } catch (e) {
@@ -473,6 +479,7 @@ export class PlayerView {
     document.removeEventListener("keydown", this.onKey);
     cancelAnimationFrame(this.raf);
     if (this.beatEdit) this.beatEdit.dispose();
+    if (this.tempo) this.tempo.dispose();
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
     if (this.engine) this.engine.close();
@@ -497,17 +504,36 @@ export class PlayerView {
     this.raf = requestAnimationFrame(() => this.frame());
   }
 
-  /** 再生位置の区間の BPM と拍子を表示する（変わったときだけ書き換える）。 */
+  /** 聞こえている速さ（曲の時刻の進む速さ。元の速度なら 1）。 */
+  playSpeed() {
+    return this.engine ? this.engine.speed : 1;
+  }
+
+  /**
+   * 再生位置の区間の BPM（× 速さ）と拍子を表示する（変わったときだけ書き換える）。
+   * 速度を変えているときは元の BPM も小さく出す。
+   */
   updateTempo(pos) {
     const grid = this.beatGrid;
-    const bpm = grid ? grid.bpmAt(pos) : null;
+    const base = grid ? grid.bpmAt(pos) : null;
+    const speed = this.playSpeed();
+    const bpm = base ? base * speed : null;
     const meter = grid ? grid.meterAt(pos) : null;
-    const key = `${formatBpm(bpm)}|${meter}`;
+    const changed = Math.abs(speed - 1) > 1e-9;
+    const key = `${formatBpm(bpm)}|${formatBpm(base)}|${changed}|${meter}`;
     if (key === this.tempoKey) return;
     this.tempoKey = key;
     const v = this.root.querySelector("#bpm-value");
     const m = this.root.querySelector("#meter");
+    const orig = this.root.querySelector("#bpm-orig");
     if (v) v.textContent = formatBpm(bpm);
+    if (orig) {
+      orig.hidden = !changed || !grid;
+      orig.textContent = `元 ${formatBpm(base)}`;
+    }
+    const box = this.root.querySelector("#tempo");
+    if (box) box.classList.toggle("shifted", changed);
+    if (this.tempo) this.tempo.syncBpm(bpm);
     if (grid && this.beatEdit) this.beatEdit.syncMeter(meter);
     if (m) {
       m.textContent = grid ? `${meter}/4` : "";
@@ -528,6 +554,7 @@ export class PlayerView {
     this.updateTempo(this.engine ? this.engine.position : 0);
     this.renderBeatButton();
     this.renderBarLoop();
+    if (this.tempo) this.tempo.refresh();
   }
 
   renderBeatButton() {
@@ -597,6 +624,8 @@ export class PlayerView {
 
   async togglePlay() {
     if (!this.ready) return;
+    // 省メモリの読み込み中に押した: 読み込みの後に勝手に鳴らさない（押した結果を優先する）
+    if (this.tempo) this.tempo.resumeAfterLoad = false;
     if (this.engine.playing) this.engine.pause();
     else await this.engine.play();
     this.updateTransport();
@@ -985,6 +1014,16 @@ export class PlayerView {
     } else if (e.key === "]") {
       e.preventDefault();
       this.scaleLoop(2);
+    } else if (e.key === "," || e.key === "<") {
+      // 速度 −0.1%（Shift で −1%）
+      e.preventDefault();
+      if (this.tempo) this.tempo.nudge(e.key === "<" ? -COARSE_STEP : -FINE_STEP);
+    } else if (e.key === "." || e.key === ">") {
+      e.preventDefault();
+      if (this.tempo) this.tempo.nudge(e.key === ">" ? COARSE_STEP : FINE_STEP);
+    } else if ((e.key === "r" || e.key === "R") && !e.shiftKey) {
+      e.preventDefault();
+      if (this.tempo) this.tempo.setRatio(1);
     } else if ((e.key === "t" || e.key === "T") && this.beatEdit && this.beatEdit.open && this.beatGrid) {
       // タップは補正パネルを開いているときだけ（うっかり押して拍を置き換えないように）
       e.preventDefault();
@@ -1052,6 +1091,8 @@ export class PlayerView {
         if (this.engine) this.engine.setVolume(v);
         try { localStorage.setItem(VOLUME_KEY, String(v)); } catch { /* 保存できなくても動く */ }
       },
+      // 動かし終わったらフォーカスを外す（Space・数字キーなどをプレイヤーに戻す）
+      onchange: (e) => e.target.blur(),
     });
     const transport = el("section", { class: "panel transport" },
       el("button", {
@@ -1064,6 +1105,7 @@ export class PlayerView {
       el("div", { class: `tempo${this.beatGrid ? "" : " none"}`, id: "tempo", title: this.tempoTitle() },
         el("span", { class: "bpm", id: "bpm-value", text: "—" }),
         el("span", { class: "unit", text: "BPM" }),
+        el("span", { class: "bpm-orig", id: "bpm-orig", hidden: true }),
         el("span", { class: "meter", id: "meter", hidden: true })),
       el("button", {
         class: "btn small", id: "beats-btn", type: "button", onclick: () => this.requestBeats(),
@@ -1117,12 +1159,17 @@ export class PlayerView {
       ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ　",
       el("kbd", { text: "B" }), " 小節ループ　", el("kbd", { text: "[" }), el("kbd", { text: "]" }),
       " ループ ½/×2　", el("kbd", { text: "T" }), " タップ（拍の補正を開いているとき）　",
-      el("kbd", { text: "Ctrl+Z" }), " 拍の補正を元に戻す（拍の補正を開いているとき）");
+      el("kbd", { text: "Ctrl+Z" }), " 拍の補正を元に戻す（拍の補正を開いているとき）　",
+      el("kbd", { text: "," }), el("kbd", { text: "." }), " 速度 −/+0.1%（Shift で 1%）　",
+      el("kbd", { text: "R" }), " 元の速度に戻す");
 
     if (this.beatEdit) this.beatEdit.dispose();
     this.beatEdit = new BeatEditPanel(this);
+    if (this.tempo) this.tempo.dispose();
+    this.tempo = new TempoPanel(this);
     this.root.replaceChildren(el("div", { class: "player" },
-      el("div", { class: "player-main" }, this.headEl(), this.jobBarEl(), wave, transport, this.beatEdit.root, stems),
+      el("div", { class: "player-main" }, this.headEl(), this.jobBarEl(), wave, transport, this.tempo.root,
+        this.beatEdit.root, stems),
       el("div", { class: "player-side" }, presets, cues, help)));
     this.tempoKey = "";
     this.updateTempo(0);

@@ -11,6 +11,8 @@
   1件ずつ、このプロセスの中で実行する（GPU は使わない。ffmpeg は Job Object に入る）。
   配信用データがそろっていて曲の拍が無ければ、拍の解析を子プロセス（`stemapp.beats.child`）で行う
   （GPU を使うため。失敗しても作り直しは done とし、警告を JOB.beat_warning に残す）。
+- 分割も作り直しも無いとき、速度変更（ピッチを保つ方式）の伸縮済み音声（TEMPO_RENDER）を
+  1件ずつ作る（GPU は使わない。stem ごとに ffmpeg を並列で起動し、Job Object に入れる）。
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from stemapp.jobs.queue import (
 )
 from stemapp.models import SeparationJob
 from stemapp.proc import start_bound_process
+from stemapp.tempo.stretch import Stretcher
 
 log = logging.getLogger(__name__)
 
@@ -195,6 +198,7 @@ class Worker:
         stop_file: Path | None = None,
         postprocess_encoder: FfmpegRunner | None = None,
         beat_runner: BeatRunner | None = None,
+        tempo_stretcher: Stretcher | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -207,14 +211,26 @@ class Worker:
         self.postprocess_encoder = postprocess_encoder  # テスト用（None なら ffmpeg）
         # 作り直しのときの拍の解析（None なら拍は作らない）
         self.beat_runner = beat_runner
+        # 速度変更の伸縮（None なら ffmpeg の rubberband）
+        self.tempo_stretcher = tempo_stretcher
         self.current_job_id: int | None = None
         self.current_child: ChildHandle | None = None
 
     # --- 起動時・停止時 ---------------------------------------------------------------
 
     def recover(self) -> list[int]:
+        from stemapp.tempo.service import recover_interrupted_renders
+
         with self.session_factory() as session:
-            return recover_interrupted_jobs(session, self.settings)
+            ids = recover_interrupted_jobs(session, self.settings)
+            try:
+                renders = recover_interrupted_renders(session, self.settings)
+            except Exception:
+                log.exception("速度変更のキャッシュを片付けられませんでした。")
+                renders = []
+            if renders:
+                log.warning("中断された速度変更の作成を failed にしました: %s", renders)
+            return ids
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -238,12 +254,32 @@ class Worker:
 
     # --- 1ジョブの実行 ----------------------------------------------------------------
 
+    def run_tempo_one(self) -> int | None:
+        """速度変更の伸縮済み音声の作成を1件実行する。無ければ None。"""
+        from stemapp.tempo.service import claim_next_render, run_render
+        from stemapp.tempo.stretch import FfmpegStretcher
+
+        with self.session_factory() as session:
+            render_id = claim_next_render(session)
+        if render_id is None:
+            return None
+        stretcher = self.tempo_stretcher or FfmpegStretcher()
+        try:
+            run_render(
+                self.settings, self.session_factory, render_id, stretcher,
+                should_stop=self.should_stop,
+            )
+        except Exception:
+            log.exception("速度変更の作成で想定外のエラー（render %d）", render_id)
+        return render_id
+
     def run_postprocess_one(self) -> int | None:
         """配信用データの作り直しを1件実行する。無ければ None。
 
         欠けている配信用データを作り直し、続けて曲の拍が無ければ拍を解析する。
         """
         from stemapp.delivery import missing_delivery, rebuild_delivery_files
+        from stemapp.tempo.service import invalidate_job_tempo
 
         with self.session_factory() as session:
             job_id = claim_next_postprocess(session)
@@ -255,6 +291,8 @@ class Worker:
                     rebuild_delivery_files(
                         session, self.settings, job_id, encoder=self.postprocess_encoder
                     )
+                    # 配信用データを作り直したら、古い音声を伸縮した速度変更のキャッシュは使わない
+                    invalidate_job_tempo(session, self.settings, job_id)
                     log.info("配信用データを作り直しました（job %d）。", job_id)
             except Exception:
                 log.exception("配信用データを作れませんでした（job %d）", job_id)
@@ -370,6 +408,8 @@ class Worker:
             job_id = self.run_one()
             if job_id is None:
                 job_id = self.run_postprocess_one()
+            if job_id is None:
+                job_id = self.run_tempo_one()
             if job_id is None:
                 self.stop_event.wait(self.poll_interval)
         log.info("ワーカーを停止しました。")

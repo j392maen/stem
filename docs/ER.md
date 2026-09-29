@@ -27,10 +27,13 @@
 | EXPORT | export_id PK, job_id FK, listen_preset_id FK(mix のみ), export_type(single/all/mix), format(wav/flac/mp3。all は ZIP にまとめ中身がこの形式), output_path, created_at, status(queued/running/done/failed), progress, stage, error_message, filename, bytes, mix_gain_db(mix で ±1 を超えたとき全体にかけた dB), finished_at |
 | EXPORT_ITEM | export_id PK FK, stem_id PK FK, gain_db(mix の音量) |
 | OFFLINE_CACHE | device_id PK FK, track_id PK FK, cached_at, bytes |
+| TEMPO_RENDER | render_id PK, job_id FK, ratio(速度の倍率。小数3桁。job_id と組で UK), pitch_mode(keep＝ピッチを保つ), status(queued/running/done/failed/canceled), progress(0-1), stage, error_message, cancel_requested(bool), dir_path(データフォルダからの相対。`cache/tempo/<job_id>/<倍率>`), bytes(全 stem の合計), frames(伸縮後の長さ。44.1kHz のサンプル数), created_at, started_at, finished_at, last_used_at(最後に使った時刻。キャッシュの片付けの順) |
+| TEMPO_RENDITION | render_id PK FK, stem_id PK FK, codec(opus), bitrate_kbps, file_path(データフォルダからの相対), bytes |
 
 制約:
 - LISTEN_PRESET_ITEM は stem_type_id と group_id のどちらか一方だけが非NULL（CHECK 制約）。
 - STEM の子（parent_stem_id が同じ）は合計すると親に一致するよう、is_residual=true の stem を1つ含む。
 - TRACK.audio_hash は正規化後PCMの SHA-256（同じ曲の再分割防止）。
 - BEAT_GRID の beats_json など（自動の結果）は解析だけが書き、補正では書き換えない。ユーザーが直した結果は edited_*（3つとも NULL か、3つとも値あり）。画面と API は「有効な拍」（edited_* があればそれ、無ければ自動の結果）を使う。区間ごとの BPM は保存せず、有効な拍から毎回計算する（`stemapp.beats.tempo`）。拍の時刻はすべて元の曲の時刻（速度変更の影響を受けない）。
+- TEMPO_RENDER / TEMPO_RENDITION（T11）は「ピッチを保つ速度変更」のためにサーバーで伸縮した配信用の音声（stream と同じ Opus 128kbps / WebM）のキャッシュ。STEM_RENDITION には入れない（stem の保存フォルダとは別の `data/cache/tempo/` に置き、作成の状態・最後に使った時刻を持つため専用の表にした）。伸縮するのは子に分かれていない stem（画面で鳴らす stem）だけ。全 stem の長さは同じ（master の長さ ÷ 倍率）。上限（1曲あたりの倍率の数、全体の容量。設定で変更可）を超えたら last_used_at の古いものから行とフォルダを消す。ジョブ・曲を消すと行は CASCADE で消え、フォルダも消す。ピッチも変わる方式（playbackRate）はブラウザの中だけで完結し、DB には何も持たない。
 - BEAT_EDIT は補正の履歴（元に戻す用。新しいものから取り消す。曲ごとに最大 100 件、古いものから消す）。「自動に戻す」も履歴に残し、元に戻せる。再解析すると新しい自動の結果を使い、それまでの直した結果は op=reanalyze の履歴に移す（解析の後に「元に戻す」で戻せる）。
