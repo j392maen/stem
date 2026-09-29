@@ -1,9 +1,10 @@
 """分割後の配信用データ（stream rendition と波形 peaks）を作る。
 
 - stream rendition: 各 stem の master（FLAC）を ffmpeg で圧縮し、
-  `data/stems/<job_id>/stream/<code>.<拡張子>` に置いて STEM_RENDITION（purpose=stream）に登録する。
+  ジョブの保存フォルダ（`data/stems/<曲>/<分け方>/`）の `stream/<code>.<拡張子>` に置いて
+  STEM_RENDITION（purpose=stream）に登録する。
   形式は `StreamFormat`（今は Opus 128kbps / WebM。iPhone 用に AAC も選べる）。
-- peaks: `data/stems/<job_id>/peaks/<code>_<samples_per_px>.stpk` に置いて WAVEFORM に登録する。
+- peaks: 保存フォルダの `peaks/<code>_<samples_per_px>.stpk` に置いて WAVEFORM に登録する。
 
 DB へは flush まで（commit は呼び出し側）。
 """
@@ -24,6 +25,7 @@ from stemapp.config import Settings
 from stemapp.library import data_relative, resolve_data_path
 from stemapp.models import Stem, StemRendition, StemType, Waveform
 from stemapp.peaks import DEFAULT_LEVELS, compute_peaks, write_peaks
+from stemapp.stem_folders import job_dir_of
 
 log = logging.getLogger(__name__)
 
@@ -121,7 +123,7 @@ def create_delivery_files(
     ).all()
     if not rows:
         raise RuntimeError(f"job {job_id} に master の stem がありません。")
-    out_dir = settings.stems_dir / str(job_id)
+    out_dir = job_dir_of(session, settings, job_id)
     levels = tuple(levels)
     for i, (stem, stype, master) in enumerate(rows):
         if progress is not None:
@@ -205,7 +207,7 @@ def _drop_delivery(session: Session, settings: Settings, job_id: int) -> None:
     )
     session.execute(delete(Waveform).where(Waveform.stem_id.in_(stem_ids)))
     session.commit()
-    out_dir = settings.stems_dir / str(job_id)
+    out_dir = job_dir_of(session, settings, job_id)
     shutil.rmtree(out_dir / PURPOSE_STREAM, ignore_errors=True)
     shutil.rmtree(out_dir / "peaks", ignore_errors=True)
 

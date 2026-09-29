@@ -552,11 +552,15 @@ def test_delete_track_removes_exports(client: TestClient, job_id: int) -> None:
     exp = _export(client, job_id, {"export_type": "single", "format": "wav", "stem_code": "bass"})
     folder = settings.exports_dir / str(exp["export_id"])
     assert folder.is_dir()
+    # T13: stem は data/stems/<元のファイル名>/<分け方>（曲名を変えてもフォルダ名は元のファイル名）
+    stems_folder = settings.stems_dir / "song" / "fast"
+    assert (stems_folder / "bass.flac").is_file()
     with _factory(client)() as s:
         track_id = s.get(SeparationJob, job_id).track_id  # type: ignore[union-attr]
     assert client.delete(f"/api/tracks/{track_id}").status_code == 200
     assert client.get(f"/api/exports/{exp['export_id']}").status_code == 404
     assert not folder.exists()
+    assert not stems_folder.parent.exists()  # 書き出しも stem のフォルダも消える
     with _factory(client)() as s:
         assert s.scalars(select(ExportItem)).all() == []
 
@@ -578,8 +582,10 @@ def test_delete_job_removes_its_exports_only(client: TestClient, job_id: int) ->
     assert client.delete(f"/api/jobs/{other}").status_code == 200
     assert client.get(f"/api/exports/{gone['export_id']}").status_code == 404
     assert not (settings.exports_dir / str(gone["export_id"])).exists()
+    assert not (settings.stems_dir / "song" / "exp_resid_vocals").exists()
     assert client.get(f"/api/exports/{keep['export_id']}").status_code == 200
     assert (settings.exports_dir / str(keep["export_id"])).is_dir()
+    assert (settings.stems_dir / "song" / "fast" / "bass.flac").is_file()
     assert client.get(keep["download_url"]).status_code == 200
 
 

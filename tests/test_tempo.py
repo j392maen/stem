@@ -188,6 +188,30 @@ def test_output_frames_uses_shortest_stem(client: TestClient, tmp_path: Path) ->
     assert tempo.output_frames(sources, 2.0) == sr // 4
 
 
+def test_input_master_path_comes_from_db(client: TestClient, tmp_path: Path) -> None:
+    """伸縮の入力（master の FLAC）は STEM_RENDITION.file_path から引く（フォルダを推測しない）。"""
+    job_id = _done_job(client, tmp_path)
+    settings = _settings(client)
+    moved = settings.data_dir / "elsewhere"
+    moved.mkdir()
+    with _factory(client)() as s:
+        rows = s.scalars(
+            select(StemRendition)
+            .join(Stem, Stem.stem_id == StemRendition.stem_id)
+            .where(Stem.job_id == job_id, StemRendition.purpose == "master")
+        ).all()
+        for rend in rows:
+            src = resolve_data_path(settings, rend.file_path)
+            dst = moved / f"{rend.stem_id}.flac"
+            shutil.move(src, dst)
+            rend.file_path = f"elsewhere/{rend.stem_id}.flac"
+        s.commit()
+    _request(client, job_id, 1.1)
+    fake = FakeStretcher()
+    _worker(client, fake).run_tempo_one()
+    assert fake.calls and all(src.parent == moved for src, _r, _f in fake.calls)
+
+
 def test_render_failure_cleans_up(client: TestClient, tmp_path: Path) -> None:
     job_id = _done_job(client, tmp_path)
     r = _request(client, job_id, 0.9)
@@ -341,8 +365,30 @@ def test_delete_track_and_job_remove_cache(client: TestClient, tmp_path: Path) -
     dir_a = settings.data_dir / "cache" / "tempo" / str(a)
     dir_b = settings.data_dir / "cache" / "tempo" / str(b)
     assert dir_a.is_dir() and dir_b.is_dir()
+
+    def stems_dir(job_id: int) -> Path:
+        with _factory(client)() as s:
+            job = s.get(SeparationJob, job_id)
+            assert job is not None and job.output_dir
+            return resolve_data_path(settings, job.output_dir)
+
+    def export_dir(job_id: int) -> Path:
+        res = client.post(f"/api/jobs/{job_id}/exports",
+                          json={"export_type": "single", "format": "wav", "stem_code": "drums"})
+        assert res.status_code == 202, res.text
+        client.app.state.export_manager.join()  # type: ignore[attr-defined]
+        d = settings.data_dir / "exports" / str(res.json()["export"]["export_id"])
+        assert d.is_dir()
+        return d
+
+    # 曲の削除: 保存フォルダ（T13）・書き出し・速度変更のキャッシュがすべて消える
+    stems_a, export_a = stems_dir(a), export_dir(a)
+    assert stems_a.is_dir()
     assert client.delete(f"/api/tracks/{_track_of(client, a)}").status_code == 200
     assert not dir_a.exists() and dir_b.is_dir()
+    assert not stems_a.exists() and not export_a.exists()
+    stems_b, export_b = stems_dir(b), export_dir(b)
+    assert stems_b.is_dir() and export_b.is_dir()
     # 分け方（ジョブ）の削除でも消える（同じ曲に別の分け方を作ってから消す）
     track_b = _track_of(client, b)
     job2 = client.post(f"/api/tracks/{track_b}/jobs", json={"preset": "standard"}).json()["job"]
@@ -351,6 +397,8 @@ def test_delete_track_and_job_remove_cache(client: TestClient, tmp_path: Path) -
     assert client.get(f"/api/jobs/{job2['job_id']}").json()["status"] == "done"
     assert client.delete(f"/api/jobs/{b}").status_code == 200
     assert not dir_b.exists()
+    assert not stems_b.exists() and not export_b.exists()
+    assert stems_dir(job2["job_id"]).is_dir()  # 同じ曲のほかの分け方は残る
     with _factory(client)() as s:
         assert not list(s.scalars(select(TempoRender)))
         assert not list(s.scalars(select(TempoRendition)))

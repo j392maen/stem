@@ -94,6 +94,9 @@ def test_local_opens_master_folder(
     res = local.post(f"/api/jobs/{job_id}/open-folder")
     assert res.status_code == 200, res.text
     folder = _master_dir(local, job_id)
+    settings: Any = local.app.state.settings  # type: ignore[attr-defined]
+    # T13: data/stems/<元のファイル名>/<分け方> を開く
+    assert folder == (settings.stems_dir / "song" / "fast").resolve()
     assert opener.opened == [folder]
     assert res.json()["folder"] == str(folder)
     assert (folder / "drums.flac").is_file()  # ファイル名は <stem code>.flac のまま

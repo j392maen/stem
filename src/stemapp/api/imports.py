@@ -248,6 +248,16 @@ router = APIRouter(prefix="/api", tags=["imports"])
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+# ブラウザは multipart の filename の `"`・改行を %22 / %0A / %0D にして送る（WHATWG の仕様）
+_BROWSER_ESCAPES = re.compile(r"%(22|0A|0D)", re.IGNORECASE)
+_BROWSER_UNESCAPE = {"22": '"', "0A": "\n", "0D": "\r"}
+
+
+def browser_filename(name: str) -> str:
+    """ブラウザが変換した %22・%0A・%0D だけを元の文字に戻す（ほかの %xx はそのまま）。"""
+    return _BROWSER_ESCAPES.sub(lambda m: _BROWSER_UNESCAPE[m.group(1).upper()], name)
+
+
 def safe_filename(name: str | None) -> str:
     """受け取ったファイル名から、保存に使える名前（フォルダ部分を除く）を作る。"""
     base = (name or "").replace("\\", "/").split("/")[-1]
@@ -300,7 +310,8 @@ async def create_import(request: Request) -> JSONResponse:
                 )
             options: dict[str, Any] = {k: form.get(k) for k in ("separate", "preset", "force")}
             dest_dir = settings.cache_dir / "uploads" / uuid.uuid4().hex
-            dest = dest_dir / safe_filename(upload.filename)
+            filename = browser_filename(upload.filename)
+            dest = dest_dir / safe_filename(filename)
 
             def save() -> bool:
                 """保存する。上限を超えたら途中で消して False。"""
@@ -322,7 +333,7 @@ async def create_import(request: Request) -> JSONResponse:
             task = {
                 "source_type": SOURCE_FILE,
                 "file_path": dest,
-                "original_name": upload.filename.replace("\\", "/").split("/")[-1],
+                "original_name": filename.replace("\\", "/").split("/")[-1],
             }
     elif ctype.startswith("application/json"):
         try:

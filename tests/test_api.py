@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from audio_helpers import fake_ffmpeg, synth_mix, write_source
 from job_helpers import make_track, no_tags, sync_launcher
 from stemapp.api import auth
-from stemapp.api.imports import ImportDeps, safe_filename
+from stemapp.api.imports import ImportDeps, browser_filename, safe_filename
 from stemapp.app import create_app
 from stemapp.config import Settings
 from stemapp.jobs import enqueue_full_job
@@ -184,7 +184,7 @@ def test_delete_track(client: TestClient, done_job: tuple[int, int]) -> None:
     track_id, job_id = done_job
     settings = client.app.state.settings  # type: ignore[attr-defined]
     assert (settings.tracks_dir / str(track_id)).is_dir()
-    assert (settings.stems_dir / str(job_id)).is_dir()
+    assert (settings.stems_dir / "song" / "fast").is_dir()  # data/stems/<元のファイル名>/<分け方>
 
     # 分割待ちのジョブがあると 409
     queued = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "fast", "force": True})
@@ -196,7 +196,7 @@ def test_delete_track(client: TestClient, done_job: tuple[int, int]) -> None:
     res = client.delete(f"/api/tracks/{track_id}")
     assert res.status_code == 200 and res.json()["deleted"] is True
     assert not (settings.tracks_dir / str(track_id)).exists()
-    assert not (settings.stems_dir / str(job_id)).exists()
+    assert not (settings.stems_dir / "song").exists()  # 空になった曲のフォルダも消える
     with _factory(client)() as s:
         assert s.scalars(select(Track)).all() == []
         assert s.scalars(select(SeparationJob)).all() == []
@@ -384,6 +384,38 @@ def test_master_endpoints(client: TestClient) -> None:
 def _wait_import(client: TestClient, source_id: int) -> dict[str, Any]:
     client.app.state.import_manager.join()  # type: ignore[attr-defined]
     return client.get(f"/api/imports/{source_id}").json()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("%22曲%22.wav", '"曲".wav'),
+        ("a%0Ab%0dc.wav", "a\nb\rc.wav"),
+        ("a%0ab.wav", "a\nb.wav"),
+        ("100%25 %20曲.wav", "100%25 %20曲.wav"),  # ほかの %xx は戻さない
+        ("曲.wav", "曲.wav"),
+    ],
+)
+def test_browser_filename(raw: str, expected: str) -> None:
+    assert browser_filename(raw) == expected
+
+
+def test_import_file_browser_escaped_name(client: TestClient, tmp_path: Path) -> None:
+    """ブラウザが %22 に変えた `"` を戻して original_name に入れ、フォルダ名では取り除く。"""
+    src = write_source(tmp_path / "x.wav", synth_mix(1.0))
+    with open(src, "rb") as fh:
+        res = client.post(
+            "/api/imports",
+            files={"file": ("テスト: %22曲%22?%0A.wav", fh, "audio/wav")},
+            data={"separate": "true", "preset": "fast"},
+        )
+    assert res.status_code == 202
+    info = _wait_import(client, res.json()["source_id"])
+    assert info["status"] == "done", info
+    assert info["original_name"] == 'テスト: "曲"?\n.wav'
+    assert _run_worker_once(client) == info["job_id"]
+    settings = client.app.state.settings  # type: ignore[attr-defined]
+    assert (settings.stems_dir / "テスト 曲" / "fast" / "vocals.flac").is_file()
 
 
 def test_import_file_with_separate(client: TestClient, tmp_path: Path) -> None:
@@ -590,8 +622,8 @@ def test_multiple_jobs_per_track_and_delete_job(
     res = client.delete(f"/api/jobs/{exp_job}")
     assert res.status_code == 200
     assert res.json() == {"deleted": True, "job_id": exp_job, "track_id": track_id}
-    assert not (settings.stems_dir / str(exp_job)).exists()
-    assert (settings.stems_dir / str(fast_job)).is_dir()
+    assert not (settings.stems_dir / "song" / "exp_resid_vocals").exists()
+    assert (settings.stems_dir / "song" / "fast").is_dir()
     track = client.get(f"/api/tracks/{track_id}").json()
     assert track["playable_job_id"] == fast_job
     assert exp_job not in [j["job_id"] for j in track["jobs"]]
