@@ -31,6 +31,7 @@ from stemapp.tempo.stretch import (
     FakeStretcher,
     FfmpegStretcher,
     StretchCanceled,
+    latency_shift,
     rubberband_filter,
     stretch_args,
 )
@@ -108,7 +109,16 @@ def test_normalize_ratio_and_key() -> None:
 
 def test_rubberband_args_trim_to_frames() -> None:
     f = rubberband_filter(1.1, 40091)
-    assert f == "rubberband=tempo=1.100000,apad,atrim=end_sample=40091,aresample=48000"
+    # 速くするときは遅れの分だけ先頭を落とし、遅くするときは先頭に無音を足す
+    assert f == (
+        "rubberband=tempo=1.100000:channels=together,atrim=start_sample=145,"
+        "asetpts=PTS-STARTPTS,apad,atrim=end_sample=40091,aresample=48000"
+    )
+    assert rubberband_filter(0.9, 49000) == (
+        "rubberband=tempo=0.900000:channels=together,adelay=delays=178S:all=1,"
+        "apad,atrim=end_sample=49000,aresample=48000"
+    )
+    assert latency_shift(2.0) == 800 and latency_shift(0.5) == -1600
     args = stretch_args(Path("in.flac"), Path("out.webm"), 1.1, 40091)
     assert args[args.index("-af") + 1] == f
     assert ["-c:a", "libopus", "-b:a", "128k"] == args[args.index("-c:a"):args.index("-c:a") + 4]
@@ -568,6 +578,40 @@ def test_real_rubberband_keeps_pitch_and_aligns(tmp_path: Path) -> None:
 
 @pytest.mark.ffmpeg
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg がありません")
+@pytest.mark.ffmpeg
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg がありません")
+@pytest.mark.parametrize("ratio", [0.5, 0.9, 1.1, 2.0])
+def test_real_rubberband_time_matches_song_time(tmp_path: Path, ratio: float) -> None:
+    """伸縮した音の位置が「元の時刻 ÷ 倍率」と ±5ms 以内（曲の時刻に直して）。
+
+    1 秒おきの 440Hz ガウス形バースト（σ=10ms）の重心で測る。補正しないと
+    0.5 倍で約 −17ms、2.0 倍で約 +36ms ずれる（rubberband フィルタの遅延補正の食い違い）。
+    """
+    sr = SAMPLE_RATE
+    n_sec = 12
+    t = np.arange(sr * n_sec) / sr
+    centers = np.arange(1.0, n_sec - 1)
+    x = 0.5 * sum(
+        np.exp(-0.5 * ((t - c) / 0.01) ** 2) * np.sin(2 * np.pi * 440 * t) for c in centers
+    )
+    src = tmp_path / "bursts.flac"
+    sf.write(str(src), np.stack([x, 0.7 * x], 1), sr, subtype="PCM_24", format="FLAC")
+    frames = round(len(t) / ratio)
+    FfmpegStretcher()(src, tmp_path / "out.webm", ratio, frames, lambda _f: None, lambda: False)
+    y = _decode(tmp_path / "out.webm", tmp_path)[:, 0].astype(np.float64)
+    assert abs(len(y) - frames * 48000 / sr) <= 1  # 48kHz へのリサンプルの丸め
+    env = y**2
+    errors = []
+    for c in centers:
+        at = c / ratio
+        lo, hi = int((at - 0.3 / ratio) * 48000), int((at + 0.3 / ratio) * 48000)
+        seg = env[lo:hi]
+        centroid = float((seg * np.arange(lo, hi)).sum() / seg.sum()) / 48000
+        errors.append((centroid - at) * ratio * 1000)  # 曲の時刻で ms
+    mean = float(np.mean(errors))
+    assert abs(mean) < 5.0, (ratio, mean, errors)
+
+
 def test_real_rubberband_stop_kills_ffmpeg(tmp_path: Path) -> None:
     sr = SAMPLE_RATE
     data = (0.1 * np.random.default_rng(0).standard_normal((sr * 120, 2))).astype(np.float32)
