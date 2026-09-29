@@ -321,6 +321,12 @@ def test_journal_recovers_after_kill(
     assert dry.notes and "元に戻します" in dry.notes[0]
     assert journal_path(settings).exists()
     assert (settings.stems_dir / "song" / "fast").is_dir()
+    # 中断したジョブは「対象外」ではなく、元に戻してから同じ場所へ移す予定。ほかは重ならない
+    plan = {i.job_id: (i.status, i.new_dir) for i in dry.items}
+    assert plan[bad] == (PLANNED, "stems/song/fast")
+    assert plan == {legacy[k]: (PLANNED, v) for k, v in EXPECTED.items()}
+    pending_item = next(i for i in dry.items if i.job_id == bad)
+    assert "元に戻してから" in pending_item.message and pending_item.files > 0
 
     report = migrate_folders(seeded, settings)
     assert report.notes and "元に戻します" in report.notes[0]
@@ -330,6 +336,56 @@ def test_journal_recovers_after_kill(
     assert output_dir == "stems/song/fast"
     assert paths and all(p.startswith("stems/song/fast/") for p in paths)
     assert all(resolve_data_path(settings, p).is_file() for p in paths)
+
+
+@pytest.mark.parametrize("error", [PermissionError("使用中です"), KeyboardInterrupt()])
+def test_failure_after_commit_keeps_migration(
+    seeded: Session,
+    settings: Settings,
+    legacy: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    """commit の後（記録を消すとき）に失敗・Ctrl+C があっても、フォルダを戻さない（DB と一致）。"""
+    job_id = legacy["song_fast"]
+    real_clear = folder_migration._clear_journal
+    calls: list[int] = []
+
+    def flaky_clear(s: Settings) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise error
+        real_clear(s)
+
+    monkeypatch.setattr(folder_migration, "_clear_journal", flaky_clear)
+    if isinstance(error, Exception):
+        report = migrate_folders(seeded, settings)
+        item = next(i for i in report.items if i.job_id == job_id)
+        assert item.status == MOVED and "記録を消せませんでした" in item.message
+        assert all(i.status == MOVED for i in report.items)
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            migrate_folders(seeded, settings)
+    # DB もフォルダも新しい場所で一致している
+    output_dir, paths = _state(seeded, settings, job_id)
+    assert output_dir == "stems/song/fast"
+    assert (settings.stems_dir / "song" / "fast").is_dir()
+    assert not (settings.stems_dir / str(job_id)).exists()
+    assert all(resolve_data_path(settings, p).is_file() for p in paths)
+
+    # 残った記録は次の実行で消え、残りも移る
+    monkeypatch.setattr(folder_migration, "_clear_journal", real_clear)
+    again = migrate_folders(seeded, settings)
+    if again.notes:
+        assert "完了していました" in again.notes[0]
+    assert all(i.status == MOVED for i in again.items)
+    assert not journal_path(settings).exists()
+    seeded.expire_all()
+    assert all(j.output_dir is not None for j in seeded.scalars(select(SeparationJob)))
+    for key, rel in EXPECTED.items():
+        _, paths = _state(seeded, settings, legacy[key])
+        assert all(p.startswith(rel + "/") for p in paths)
+        assert all(resolve_data_path(settings, p).is_file() for p in paths)
 
 
 def test_journal_after_commit_is_cleared(
