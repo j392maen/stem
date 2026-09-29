@@ -11,15 +11,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from stemapp.beats.base import BeatAnalysisError, BeatAnalyzer, BeatResult
+from stemapp.beats.edit import GridState, apply_edit
 from stemapp.beats.tempo import estimate_time_signature, tempo_segments
 from stemapp.config import Settings
 from stemapp.library import resolve_data_path
-from stemapp.models import BeatGrid, SeparationJob, Track
+from stemapp.models import BeatEdit, BeatGrid, SeparationJob, Track
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +64,9 @@ def save_grid(session: Session, track_id: int, result: BeatResult) -> BeatGrid:
     if grid is None:
         grid = BeatGrid(track_id=track_id)
         session.add(grid)
+    else:
+        # 直した結果は、元に戻すで戻せるよう履歴に移し、新しい自動の結果を使う
+        reset_edits(session, grid, op="reanalyze")
     grid.analyzer = result.analyzer[:100]
     grid.beats_json = [round(float(x), 4) for x in result.beats]
     grid.downbeats_json = [round(float(x), 4) for x in result.downbeats]
@@ -159,15 +163,126 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat()
 
 
-def beats_payload(grid: BeatGrid) -> dict[str, Any]:
-    """GET /api/tracks/{id}/beats の中身。区間の BPM はここで計算する。"""
-    beats = list(grid.beats_json or [])
+def auto_state(grid: BeatGrid) -> GridState:
+    return GridState.from_dict({
+        "beats": grid.beats_json, "downbeats": grid.downbeats_json,
+        "time_signature": grid.time_signature,
+    })
+
+
+def is_edited(grid: BeatGrid) -> bool:
+    return grid.edited_beats_json is not None
+
+
+def effective_state(grid: BeatGrid) -> GridState:
+    """有効な拍（直した結果があればそれ、無ければ自動の結果）。"""
+    if not is_edited(grid):
+        return auto_state(grid)
+    return GridState.from_dict({
+        "beats": grid.edited_beats_json, "downbeats": grid.edited_downbeats_json,
+        "time_signature": grid.edited_time_signature or grid.time_signature,
+    })
+
+
+def _edited_dict(grid: BeatGrid) -> dict[str, Any] | None:
+    return effective_state(grid).as_dict() if is_edited(grid) else None
+
+
+def _set_edited(grid: BeatGrid, state: dict[str, Any] | None) -> None:
+    if state is None:
+        grid.edited_beats_json = None
+        grid.edited_downbeats_json = None
+        grid.edited_time_signature = None
+        return
+    s = GridState.from_dict(state)
+    grid.edited_beats_json = list(s.beats)
+    grid.edited_downbeats_json = list(s.downbeats)
+    grid.edited_time_signature = s.time_signature
+
+
+# 元に戻せる操作の数（曲ごと）。古いものから消す。1つ数 KB〜十数 KB
+MAX_HISTORY = 100
+
+
+def record_edit(
+    session: Session, track_id: int, op: str, params: dict[str, Any] | None,
+    before: dict[str, Any] | None,
+) -> None:
+    """操作の履歴を1つ足し、MAX_HISTORY を超えた古いものを消す（flush まで）。"""
+    session.add(BeatEdit(track_id=track_id, op=op, params_json=params, before_json=before))
+    session.flush()
+    ids = session.scalars(
+        select(BeatEdit.edit_id)
+        .where(BeatEdit.track_id == track_id)
+        .order_by(BeatEdit.edit_id.desc())
+        .offset(MAX_HISTORY)
+    ).all()
+    if ids:
+        session.execute(delete(BeatEdit).where(BeatEdit.edit_id.in_(ids)))
+        session.flush()
+
+
+def can_undo(session: Session, track_id: int) -> bool:
+    return session.scalars(
+        select(BeatEdit.edit_id).where(BeatEdit.track_id == track_id).limit(1)
+    ).first() is not None
+
+
+def edit_grid(
+    session: Session, grid: BeatGrid, op: str, params: dict[str, Any]
+) -> BeatGrid:
+    """補正の操作を1つ行い、直した結果と履歴を保存する（flush まで）。失敗は BeatEditError。"""
+    before = _edited_dict(grid)
+    new = apply_edit(effective_state(grid), op, params)
+    record_edit(session, grid.track_id, op, params, before)
+    _set_edited(grid, new.as_dict())
+    session.flush()
+    return grid
+
+
+def undo_edit(session: Session, grid: BeatGrid) -> bool:
+    """直前の操作を取り消す（flush まで）。取り消すものが無ければ False。"""
+    last = session.scalars(
+        select(BeatEdit)
+        .where(BeatEdit.track_id == grid.track_id)
+        .order_by(BeatEdit.edit_id.desc())
+        .limit(1)
+    ).first()
+    if last is None:
+        return False
+    _set_edited(grid, last.before_json)
+    session.delete(last)
+    session.flush()
+    return True
+
+
+def reset_edits(session: Session, grid: BeatGrid, op: str = "reset") -> bool:
+    """自動の結果に戻す（元に戻すで取り消せるよう履歴に残す）。直していなければ何もしない。"""
+    if not is_edited(grid):
+        return False
+    record_edit(session, grid.track_id, op, None, _edited_dict(grid))
+    _set_edited(grid, None)
+    session.flush()
+    return True
+
+
+def beats_payload(grid: BeatGrid, *, undo: bool = False) -> dict[str, Any]:
+    """GET /api/tracks/{id}/beats の中身（有効な拍）。区間の BPM はここで計算する。
+
+    edited: 直した結果を使っているか。can_undo: 元に戻せる操作があるか（undo で渡す）。
+    auto_time_signature: 自動の結果の拍子。
+    """
+    state = effective_state(grid)
+    beats = list(state.beats)
     return {
         "track_id": grid.track_id,
         "analyzer": grid.analyzer,
-        "time_signature": grid.time_signature,
+        "time_signature": state.time_signature,
+        "auto_time_signature": grid.time_signature,
         "beats": beats,
-        "downbeats": list(grid.downbeats_json or []),
+        "downbeats": list(state.downbeats),
         "segments": [s.as_dict() for s in tempo_segments(beats)],
+        "edited": is_edited(grid),
+        "can_undo": undo,
         "created_at": _iso(grid.created_at),
     }

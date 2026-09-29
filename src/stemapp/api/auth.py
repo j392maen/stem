@@ -23,7 +23,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from stemapp.api.common import is_local_request
+from stemapp.api.common import is_https, is_local_request, is_proxied
 from stemapp.api.folders import supports_open_folder
 from stemapp.config import Settings
 
@@ -168,13 +168,17 @@ def login(body: LoginRequest, request: Request, response: Response) -> dict[str,
         httponly=True,
         samesite="lax",
         path="/",
+        # HTTPS（Tailscale Serve）で開いたときは HTTPS でだけ送らせる
+        secure=is_https(request),
     )
     return {"authenticated": True, "passcode_required": True}
 
 
 @router.post("/logout")
-def logout(response: Response) -> dict[str, bool]:
-    response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="lax")
+def logout(request: Request, response: Response) -> dict[str, bool]:
+    response.delete_cookie(
+        COOKIE_NAME, path="/", httponly=True, samesite="lax", secure=is_https(request)
+    )
     return {"authenticated": False}
 
 
@@ -182,9 +186,12 @@ def logout(response: Response) -> dict[str, bool]:
 def me(request: Request) -> dict[str, bool]:
     # ここに来た時点で認証済み（未ログインならミドルウェアが 401 を返す）
     local = is_local_request(request)
+    passcode_required = passcode_of(request.app.state.settings) is not None
     return {
         "authenticated": True,
-        "passcode_required": passcode_of(request.app.state.settings) is not None,
+        "passcode_required": passcode_required,
+        # 中継（Tailscale Serve など）経由なのにパスコードが無い。画面で設定を勧める
+        "passcode_recommended": is_proxied(request) and not passcode_required,
         # サーバーと同じ PC のブラウザか（保存フォルダを開くボタンを出すかどうか）
         "local_client": local,
         "can_open_folder": local and supports_open_folder(),

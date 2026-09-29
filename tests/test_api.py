@@ -87,7 +87,7 @@ def test_no_passcode_means_no_auth(client: TestClient) -> None:
     assert client.get("/api/tracks").status_code == 200
     assert client.get("/api/me").json() == {
         "authenticated": True, "passcode_required": False,
-        "local_client": False, "can_open_folder": False,
+        "local_client": False, "can_open_folder": False, "passcode_recommended": False,
     }
     assert client.post("/api/login", json={"passcode": ""}).json()["authenticated"] is True
 
@@ -114,7 +114,7 @@ def test_passcode_login_flow(settings: Settings) -> None:
         assert c.get("/api/tracks").status_code == 200
         assert c.get("/api/me").json() == {
             "authenticated": True, "passcode_required": True,
-            "local_client": False, "can_open_folder": False,
+            "local_client": False, "can_open_folder": False, "passcode_recommended": False,
         }
 
         # 改ざんした Cookie は通らない
