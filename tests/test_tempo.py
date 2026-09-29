@@ -283,6 +283,61 @@ def test_worker_stop_requeues(client: TestClient, tmp_path: Path) -> None:
     assert cur["status"] == "queued" and cur["progress"] == 0.0
 
 
+def test_postprocess_rebuild_invalidates_tempo_cache(client: TestClient, tmp_path: Path) -> None:
+    """配信用データを作り直したら、そのジョブの速度変更のキャッシュ（行とフォルダ）を消す。"""
+    job_id = _done_job(client, tmp_path)
+    other = _done_job(client, tmp_path / "o", name="o", offset=0.3)
+    settings = _settings(client)
+    _run(client, job_id, 1.1)
+    _run(client, other, 1.1)
+    job_dir = settings.data_dir / "cache" / "tempo" / str(job_id)
+    assert job_dir.is_dir()
+    # stream を1つ消して作り直しを頼む
+    with _factory(client)() as s:
+        rend = s.scalars(
+            select(StemRendition)
+            .join(Stem, Stem.stem_id == StemRendition.stem_id)
+            .where(Stem.job_id == job_id, StemRendition.purpose == "stream")
+        ).first()
+        assert rend is not None
+        s.delete(rend)
+        s.commit()
+    assert client.post(f"/api/jobs/{job_id}/postprocess").status_code == 202
+    worker = Worker(settings, _factory(client), sync_launcher(settings),
+                    postprocess_encoder=fake_encoder)
+    assert worker.run_postprocess_one() == job_id
+    assert not job_dir.exists()
+    assert client.get(f"/api/jobs/{job_id}/tempo").json()["renders"] == []
+    # ほかのジョブのキャッシュは残る
+    assert _done_ratios(client, other) == ["1.100"]
+    # 公開関数としても使える（何も無くても失敗しない）
+    with _factory(client)() as s:
+        assert tempo.invalidate_job_tempo(s, settings, job_id) == 0
+        assert tempo.invalidate_job_tempo(s, settings, other) == 1
+    assert _done_ratios(client, other) == []
+
+
+def test_request_render_stale_state(client: TestClient, tmp_path: Path) -> None:
+    """読んだ後に別の処理が状態を変えても（片付け・失敗）、500 にせず正しく登録する。"""
+    job_id = _done_job(client, tmp_path)
+    rid = _run(client, job_id, 1.1)
+    factory = _factory(client)
+    with factory() as a:
+        stale = a.get(TempoRender, rid)
+        assert stale is not None and stale.status == "done"
+        with factory() as b:  # 別の処理が失敗にした
+            b.get(TempoRender, rid).status = "failed"  # type: ignore[union-attr]
+            b.commit()
+        res = tempo.request_render(a, job_id, 1.1)
+        assert res.created and res.render.status == "queued"
+        with factory() as b:  # 別の処理が消した（キャッシュの片付け）
+            tempo.remove_render(b, _settings(client), b.get(TempoRender, rid))  # type: ignore[arg-type]
+        res = tempo.request_render(a, job_id, 1.1)
+        assert res.created and res.render.status == "queued"
+        again = tempo.request_render(a, job_id, 1.1)
+        assert not again.created and again.render.render_id == res.render.render_id
+
+
 def test_recover_interrupted(client: TestClient, tmp_path: Path) -> None:
     job_id = _done_job(client, tmp_path)
     settings = _settings(client)

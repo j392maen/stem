@@ -279,6 +279,7 @@ class Worker:
         欠けている配信用データを作り直し、続けて曲の拍が無ければ拍を解析する。
         """
         from stemapp.delivery import missing_delivery, rebuild_delivery_files
+        from stemapp.tempo.service import invalidate_job_tempo
 
         with self.session_factory() as session:
             job_id = claim_next_postprocess(session)
@@ -290,6 +291,8 @@ class Worker:
                     rebuild_delivery_files(
                         session, self.settings, job_id, encoder=self.postprocess_encoder
                     )
+                    # 配信用データを作り直したら、古い音声を伸縮した速度変更のキャッシュは使わない
+                    invalidate_job_tempo(session, self.settings, job_id)
                     log.info("配信用データを作り直しました（job %d）。", job_id)
             except Exception:
                 log.exception("配信用データを作れませんでした（job %d）", job_id)
