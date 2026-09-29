@@ -20,6 +20,12 @@ from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
 from stemapp.library import find_done_job
 from stemapp.models import SeparationJob, Stem, Track
 from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
+from stemapp.separation.refine import (
+    ExportsBusy,
+    active_exports_of_jobs,
+    clean_orphan_refine_dirs,
+    take_exports_of_jobs,
+)
 from stemapp.stem_folders import remove_job_dir
 
 log = logging.getLogger(__name__)
@@ -194,10 +200,24 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
             "この分け方の stem を「もっと分ける」処理が分割待ち・分割中です。"
             "キャンセルしてから削除してください。"
         )
+    refine_ids = [c.job_id for c in children] + ([job_id] if job.job_kind == "refine" else [])
+    if active_exports_of_jobs(session, refine_ids):
+        # 子の stem が消えると EXPORT_ITEM だけが消え、中身の欠けた書き出しが作られてしまう
+        raise JobConflict(
+            "この stem を使った書き出しが作成待ち・作成中です。書き出しが終わってから"
+            "削除してください。"
+        )
     for child in children:
         delete_job(session, settings, child.job_id)
     output_dir = job.output_dir
     export_ids = export_ids_for_jobs(session, [job_id])
+    if job.job_kind == "refine":
+        # 詳細分割の子を使った書き出しは full ジョブの行に付くので、stem から探して一緒に消す
+        try:
+            export_ids += take_exports_of_jobs(session, [job_id])
+        except ExportsBusy as e:
+            session.rollback()
+            raise JobConflict(str(e)) from e
     # 確かめてから消すまでの間にワーカーが取り出さないよう、条件付きで消す
     res = session.execute(
         delete(SeparationJob).where(
@@ -313,6 +333,9 @@ def recover_interrupted_jobs(session: Session, settings: Settings) -> list[int]:
     removed = clean_stale_tmp(session, settings)
     if removed:
         log.info("残っていた一時フォルダを消しました: %s", removed)
+    orphans = clean_orphan_refine_dirs(session, settings)
+    if orphans:
+        log.info("使われていない詳細分割のフォルダを消しました: %s", orphans)
     return ids
 
 

@@ -502,6 +502,24 @@ def run_export(
 # --- 片付け -------------------------------------------------------------------------------
 
 
+def exports_using_stems(session: Session, stem_ids: Iterable[int]) -> list[Export]:
+    """その stem を1つでも使う書き出し（EXPORT_ITEM から探す）。"""
+    ids = list(stem_ids)
+    if not ids:
+        return []
+    return list(
+        session.scalars(
+            select(Export)
+            .where(
+                Export.export_id.in_(
+                    select(ExportItem.export_id).where(ExportItem.stem_id.in_(ids))
+                )
+            )
+            .order_by(Export.export_id)
+        )
+    )
+
+
 def export_ids_for_jobs(session: Session, job_ids: Iterable[int]) -> list[int]:
     ids = list(job_ids)
     if not ids:

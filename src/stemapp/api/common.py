@@ -50,6 +50,7 @@ def job_to_dict(job: SeparationJob, presets: dict[int, SeparationPreset]) -> dic
         # 詳細分割（refine）のみ: 分けた stem と方法（MODEL の行）
         "input_stem_id": job.input_stem_id,
         "refine_model_id": job.refine_model_id,
+        "warning": job.warning,
         "preset": preset.code if preset is not None else None,
         "preset_name": preset.display_name if preset is not None else None,
         "preset_experimental": bool(preset.is_experimental) if preset is not None else False,
