@@ -243,6 +243,13 @@ class FolderPlanner:
         self._track_folder[track_id] = name
         return name
 
+    def reserve(self, track_id: int, output_dir: str) -> None:
+        """決まっている保存先（stems/<曲>/<分け方>）を予約済みにする（移行の dry-run 用）。"""
+        parts = _parts(output_dir)
+        if len(parts) >= 3:
+            self._track_folder.setdefault(track_id, parts[1])
+            self._job_folders.setdefault(track_id, set()).add(parts[2])
+
     def job_folder(self, job: SeparationJob) -> str:
         """ジョブの保存先（データフォルダからの相対パス）。"""
         track_name = self.track_folder(job.track_id)

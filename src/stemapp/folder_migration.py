@@ -164,17 +164,25 @@ def _data_path(settings: Settings, rel: str) -> Path:
 def recover_journal(
     session: Session, settings: Settings, *, dry_run: bool = False, rename: Rename = os.rename
 ) -> str | None:
+    """`_recover_journal` の直した内容（無ければ None）だけを返す。"""
+    return _recover_journal(session, settings, dry_run=dry_run, rename=rename)[0]
+
+
+def _recover_journal(
+    session: Session, settings: Settings, *, dry_run: bool = False, rename: Rename = os.rename
+) -> tuple[str | None, tuple[int, str] | None]:
     """前回の移行が途中で止まっていたら（予定の記録が残っていたら）直す。
 
     - DB が新しい場所を指している（commit 済み）→ 記録を消すだけ。
     - DB は古いままで、フォルダだけ新しい場所にある → フォルダを元に戻す（この後の移行で移し直す）。
     - フォルダがまだ元の場所にある → 何も移っていないので記録を消す。
     - 元にも先にもある・どちらにも無い → 自動では決められないので MigrationBlocked。
-    dry_run なら何も変えず、する予定を返す。直した内容（無ければ None）を返す。
+    dry_run なら何も変えず、する予定を返す。
+    (直した内容（無ければ None）, dry_run でフォルダを戻す予定のとき (job_id, 新しい場所)) を返す。
     """
     path = journal_path(settings)
     if not path.is_file():
-        return None
+        return None, None
     try:
         entry = json.loads(path.read_text(encoding="utf-8"))
         job_id = int(entry["job_id"])
@@ -191,21 +199,22 @@ def recover_journal(
         note = f"前回の移行（job {job_id}）は完了していました。記録を消します。"
         if not dry_run:
             _clear_journal(settings)
-        return note
+        return note, None
     if new.is_dir() and not old.exists():
         note = (
             f"前回中断した移行（job {job_id}）のフォルダを元に戻します: {new_rel} → {old_rel}"
         )
-        if not dry_run:
-            rename(new, old)
-            remove_if_empty(settings, new.parent)
-            _clear_journal(settings)
-        return note
+        if dry_run:
+            return note, (job_id, new_rel)
+        rename(new, old)
+        remove_if_empty(settings, new.parent)
+        _clear_journal(settings)
+        return note, None
     if old.is_dir() and not new.exists():
         note = f"前回の移行（job {job_id}）はフォルダを移す前に止まっていました。記録を消します。"
         if not dry_run:
             _clear_journal(settings)
-        return note
+        return note, None
     raise MigrationBlocked(
         f"前回中断した移行（job {job_id}）を自動では直せません。{old} と {new} を確かめ、"
         f"直してから {path} を消してください。"
@@ -224,10 +233,15 @@ def migrate_folders(
     前回の中断の跡を直せないときは MigrationBlocked。
     """
     report = MigrationReport(dry_run=dry_run)
-    note = recover_journal(session, settings, dry_run=dry_run, rename=rename)
+    note, pending = _recover_journal(session, settings, dry_run=dry_run, rename=rename)
     if note:
         report.notes.append(note)
     planner = FolderPlanner(session, settings)
+    if pending is not None:
+        # dry-run: 前回中断したジョブは、元に戻してから同じ場所へ移す予定として扱う
+        pending_job = session.get(SeparationJob, pending[0])
+        if pending_job is not None:
+            planner.reserve(pending_job.track_id, pending[1])
     jobs = session.scalars(
         select(SeparationJob)
         .where(SeparationJob.output_dir.is_(None))
@@ -238,6 +252,18 @@ def migrate_folders(
         old = legacy_dir(settings, job.job_id)
         prefix = old_rel + "/"
         refs = _matching(_path_rows(session, job.job_id), prefix)
+        if pending is not None and pending[0] == job.job_id:
+            files, total = folder_stats(_data_path(settings, pending[1]))
+            report.items.append(
+                MigrationItem(
+                    job.job_id, job.track_id, old_rel, pending[1], files, total,
+                    db_paths=len(refs), status=PLANNED,
+                    message=(
+                        f"前回中断した移行を元に戻してから移す予定（今は {pending[1]} にあります）"
+                    ),
+                )
+            )
+            continue
         if not old.is_dir():
             if refs:
                 report.items.append(
@@ -296,6 +322,7 @@ def _move_one(
     old_prefix = item.old_dir + "/"
     new_prefix = item.new_dir + "/"
     moved = False
+    committed = False
     try:
         if new.exists():
             raise RuntimeError(f"移し先が既にあります: {new}")
@@ -324,11 +351,21 @@ def _move_one(
                 f"DB が指すファイルがありません: {missing[0]} など {len(missing)} 件"
             )
         session.commit()
-        _clear_journal(settings)
+        # ここから先は移行済み（DB もフォルダも新しい場所）。何が起きても戻さない
+        committed = True
         item.status = MOVED
         item.db_paths = len(refs)
         log.info("job %d: %s → %s", job_id, item.old_dir, item.new_dir)
+        _clear_journal(settings)
     except BaseException as e:
+        if committed:
+            # 記録の削除に失敗した・Ctrl+C など。移行は済んでいるので MOVED のまま。
+            # 残った記録は次の実行で recover_journal が（output_dir == 新しい場所として）消す
+            item.message = f"記録を消せませんでした（{type(e).__name__}: {e}）。次の実行で消します"
+            log.warning("job %d: %s", job_id, item.message)
+            if not isinstance(e, Exception):
+                raise
+            return
         # Ctrl+C などでも、このジョブの分を元に戻してから止める
         session.rollback()
         item.status = FAILED
@@ -346,7 +383,10 @@ def _move_one(
                     f"{item.old_dir} を指しています。次の実行で直します"
                 )
         if restored:
-            _clear_journal(settings)
+            try:
+                _clear_journal(settings)
+            except OSError as clear_err:  # 残っても次の実行で照合して消す
+                item.message += f"／記録を消せませんでした（{clear_err}）"
             remove_if_empty(settings, new.parent)
         if old.is_dir():
             item.after_files, item.after_bytes = folder_stats(old)
