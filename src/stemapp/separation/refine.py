@@ -55,7 +55,13 @@ from stemapp.separation.pipeline import (
     run_step,
 )
 from stemapp.stem_folders import job_dir, pick_free_name, remove_job_dir
-from stemapp.stem_view import JOB_KIND_FULL, JOB_KIND_REFINE, StemView, build_view
+from stemapp.stem_view import (
+    JOB_KIND_FULL,
+    JOB_KIND_REFINE,
+    StemView,
+    build_view,
+    root_job_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -299,8 +305,10 @@ def enqueue_refine_job(
     method = methods.get(model_filename)
     if method is None:
         raise RefineInvalid(f"詳細分割の方法「{model_filename}」はありません。")
-    from stemapp.stem_view import root_job_id
-
+    stype = types.by_id.get(stem.stem_type_id)
+    if stype is None or not method_applies(method, stype.code, types):
+        name = stype.display_name if stype is not None else "この stem"
+        raise RefineInvalid(f"「{name}」は「{method.display_name}」では分けられません。")
     root_id = root_job_id(session, stem.job_id)
     root = session.get(SeparationJob, root_id) if root_id is not None else None
     if root is None or root.job_kind != JOB_KIND_FULL or root.status != DONE:
