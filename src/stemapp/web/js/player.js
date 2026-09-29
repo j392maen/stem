@@ -1,8 +1,9 @@
 // プレイヤー画面: 波形、再生・シーク、stem の ON/OFF、グループ、組み合わせプリセット、キュー・ループ、
-// 拍・小節線と再生位置の BPM。
+// 拍・小節線と再生位置の BPM、拍の補正（T10c）、小節単位のループ、キューの拍へのスナップ。
 
 import { api, fetchBinary } from "./api.js";
-import { BeatGrid, formatBpm } from "./beats.js";
+import { BeatEditPanel } from "./beatedit.js";
+import { BeatGrid, barLoop, formatBpm } from "./beats.js";
 import { Engine, clampTime } from "./engine.js";
 import { Exporter } from "./export.js";
 import { parsePeaks } from "./peaks.js";
@@ -16,6 +17,12 @@ const POSTPROCESS_POLL_MS = 1500;
 const VOLUME_KEY = "stemapp.volume";
 // 曲ごとに最後に選んだ分け方（ジョブ）。無い・消えたときは新しい完了済みジョブ
 const JOB_KEY_PREFIX = "stemapp.job.";
+// キューを拍に合わせる（スナップ）の設定。既定は ON
+const SNAP_KEY = "stemapp.snap";
+// 小節ループの長さ（小節）。½・×2 はこの範囲で変える
+export const BAR_LOOPS = [1, 2, 4, 8, 16];
+const MIN_LOOP_BARS = 0.25;
+const MAX_LOOP_BARS = 64;
 // キューの色。stem・グループの色と重ならないよう、差し色の赤2色と白だけにする
 export const CUE_COLORS = ["#FF3B4E", "#F5F5F4", "#FF8A95"];
 
@@ -24,6 +31,10 @@ function loadVolume() {
     const v = Number(localStorage.getItem(VOLUME_KEY));
     return Number.isFinite(v) && localStorage.getItem(VOLUME_KEY) !== null ? v : 0.9;
   } catch { return 0.9; }
+}
+
+function loadSnap() {
+  try { return localStorage.getItem(SNAP_KEY) !== "0"; } catch { return true; }
 }
 
 function loadJobChoice(trackId) {
@@ -84,6 +95,11 @@ export class PlayerView {
     // 拍の解析を受け持つジョブ（拍は曲ごと。同じ曲に分け方が複数あると、表示中とは限らない）
     this.beatJobId = null;
     this.tempoKey = "";
+    this.beatEdit = null; // 拍の補正パネル
+    // 小節ループ（キューに保存しない一時的なループ。{start, end, bars}）。キューのループより優先
+    this.barLoop = null;
+    this.loopBars = 4; // B キーで作る小節ループの長さ（最後に選んだもの）
+    this.snap = loadSnap();
     this.onKey = (e) => this.handleKey(e);
   }
 
@@ -330,6 +346,7 @@ export class PlayerView {
       soloMode: this.soloMode,
       loopCueId: this.loopCueId,
       loopOn: this.loopOn,
+      barLoop: this.barLoop,
       zoom: this.wave ? this.wave.zoomSeconds : null,
     };
   }
@@ -382,9 +399,11 @@ export class PlayerView {
     this.applySelection(0);
     this.renderPresets();
     this.loopCueId = r.loopCueId;
+    this.barLoop = r.barLoop;
     this.loopOn = r.loopOn && !!this.activeLoop();
     this.engine.setLoop(this.loopOn ? this.activeLoop() : null);
     this.renderCues();
+    this.renderBarLoop();
     if (r.zoom && this.wave) this.wave.setZoom(r.zoom);
     this.engine.seek(clampTime(r.position, this.engine.duration));
     if (r.playing) await this.engine.play();
@@ -453,6 +472,7 @@ export class PlayerView {
     this.abort.abort();
     document.removeEventListener("keydown", this.onKey);
     cancelAnimationFrame(this.raf);
+    if (this.beatEdit) this.beatEdit.dispose();
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
     if (this.engine) this.engine.close();
@@ -481,14 +501,16 @@ export class PlayerView {
   updateTempo(pos) {
     const grid = this.beatGrid;
     const bpm = grid ? grid.bpmAt(pos) : null;
-    const key = `${formatBpm(bpm)}|${grid ? grid.timeSignature : ""}`;
+    const meter = grid ? grid.meterAt(pos) : null;
+    const key = `${formatBpm(bpm)}|${meter}`;
     if (key === this.tempoKey) return;
     this.tempoKey = key;
     const v = this.root.querySelector("#bpm-value");
     const m = this.root.querySelector("#meter");
     if (v) v.textContent = formatBpm(bpm);
+    if (grid && this.beatEdit) this.beatEdit.syncMeter(meter);
     if (m) {
-      m.textContent = grid ? `${grid.timeSignature}/4` : "";
+      m.textContent = grid ? `${meter}/4` : "";
       m.hidden = !grid;
     }
   }
@@ -505,6 +527,7 @@ export class PlayerView {
     this.tempoKey = "";
     this.updateTempo(this.engine ? this.engine.position : 0);
     this.renderBeatButton();
+    this.renderBarLoop();
   }
 
   renderBeatButton() {
@@ -521,7 +544,9 @@ export class PlayerView {
   async requestBeats() {
     if (this.beatBusy) return;
     if (this.beatGrid) {
-      const ok = await confirmDialog("今の拍・小節線を消して、解析し直しますか？", { ok: "解析し直す" });
+      const note = this.beatGrid.edited
+        ? "（手で直した拍は、解析の後に「拍の補正」の「元に戻す」で戻せます）" : "";
+      const ok = await confirmDialog(`今の拍・小節線を消して、解析し直しますか？${note}`, { ok: "解析し直す" });
       if (!ok || !this.alive) return;
     }
     try {
@@ -562,7 +587,10 @@ export class PlayerView {
   }
 
   tempoTitle() {
-    if (this.beatGrid) return `再生位置の BPM と拍子（自動解析: ${this.beatGrid.analyzer}）`;
+    if (this.beatGrid) {
+      const how = this.beatGrid.edited ? "手動で補正済み" : "自動解析";
+      return `再生位置の BPM と拍子（${how}: ${this.beatGrid.analyzer}）`;
+    }
     if (this.job.beat_warning) return this.job.beat_warning;
     return "拍はまだ解析されていません";
   }
@@ -583,6 +611,7 @@ export class PlayerView {
       this.loopOn = false;
       this.engine.setLoop(null);
       this.renderCues();
+      this.renderBarLoop();
       this.updateTransport();
     }
     this.engine.seek(target);
@@ -735,6 +764,7 @@ export class PlayerView {
   // --- キュー・ループ -----------------------------------------------------------
 
   activeLoop() {
+    if (this.barLoop) return { start: this.barLoop.start, end: this.barLoop.end };
     const cue = this.cues.find((c) => c.cue_id === this.loopCueId);
     return cue && cue.loop_end_sec ? { start: cue.position_sec, end: cue.loop_end_sec } : null;
   }
@@ -742,7 +772,75 @@ export class PlayerView {
   applyLoop() {
     if (this.engine) this.engine.setLoop(this.loopOn ? this.activeLoop() : null);
     this.renderCues();
+    this.renderBarLoop();
     this.updateTransport();
+  }
+
+  /** 再生位置の小節の頭から bars 小節のループを作って鳴らす（キューには保存しない）。 */
+  setBarLoop(bars) {
+    if (!this.ready) return;
+    if (!this.beatGrid) { toast("拍が解析されていないため、小節ループは使えません。"); return; }
+    const loop = barLoop(this.beatGrid, this.engine.position, bars, this.engine.duration);
+    if (!loop) { toast("ここでは小節ループを作れません。"); return; }
+    if (bars >= 1) this.loopBars = bars;
+    this.barLoop = loop;
+    this.loopOn = true;
+    this.applyLoop();
+  }
+
+  /** ループの長さを factor 倍（2 または 0.5）にする。小節ループは小節で、キューのループは時間で。 */
+  async scaleLoop(factor) {
+    if (!this.ready) return;
+    if (this.barLoop) {
+      const bars = Math.min(MAX_LOOP_BARS, Math.max(MIN_LOOP_BARS, this.barLoop.bars * factor));
+      if (bars === this.barLoop.bars || !this.beatGrid) return;
+      const loop = barLoop(this.beatGrid, this.barLoop.start, bars, this.engine.duration);
+      if (!loop) return;
+      this.barLoop = loop;
+      this.applyLoop();
+      return;
+    }
+    const cue = this.cues.find((c) => c.cue_id === this.loopCueId && c.loop_end_sec);
+    if (!cue) { toast("ループがありません。小節ループのボタンか、キューの「終点」で作ってください。"); return; }
+    const len = (cue.loop_end_sec - cue.position_sec) * factor;
+    const end = Math.round(Math.min(cue.position_sec + len, this.engine.duration) * 1000) / 1000;
+    if (end <= cue.position_sec + 0.05) return;
+    if (await this.updateCue(cue, { loop_end_sec: end })) {
+      this.applyLoop();
+      toast(`キュー「${cue.label || "キュー"}」のループの終点を ${formatTime(end, true)} に変えて保存しました。`);
+    }
+  }
+
+  toggleSnap(on) {
+    this.snap = on;
+    try { localStorage.setItem(SNAP_KEY, on ? "1" : "0"); } catch { /* 保存できなくても動く */ }
+  }
+
+  /** キューの位置を拍に合わせる（設定が ON で拍があるとき）。 */
+  snapTime(t) {
+    return this.snap && this.beatGrid ? this.beatGrid.snap(t) : t;
+  }
+
+  renderBarLoop() {
+    const box = this.root.querySelector("#bar-loops");
+    if (box) {
+      const cur = this.loopOn && this.barLoop ? this.barLoop.bars : null;
+      for (const b of box.querySelectorAll("button[data-bars]")) {
+        const on = cur !== null && Number(b.dataset.bars) === cur;
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-pressed", String(on));
+        b.disabled = !this.beatGrid;
+      }
+      const label = this.root.querySelector("#bar-loop-state");
+      const bl = this.barLoop;
+      if (label) {
+        const bars = bl ? (bl.bars < 1 ? `1/${Math.round(1 / bl.bars)}` : String(bl.bars)) : "";
+        label.textContent = bl
+          ? `${bars} 小節 ${formatTime(bl.start, true)}〜${formatTime(bl.end, true)}${this.loopOn ? "" : "（停止中）"}`
+          : "";
+      }
+    }
+    if (this.beatEdit) this.beatEdit.refresh();
   }
 
   toggleLoop() {
@@ -752,7 +850,7 @@ export class PlayerView {
       const loops = this.cues.filter((c) => c.loop_end_sec);
       const inside = loops.find((c) => pos >= c.position_sec && pos < c.loop_end_sec);
       const pick = inside || loops[loops.length - 1];
-      if (!pick) { toast("ループ区間がありません。キューに「終点」を付けてください。"); return; }
+      if (!pick) { toast("ループ区間がありません。小節ループのボタンか、キューの「終点」で作ってください。"); return; }
       this.loopCueId = pick.cue_id;
       this.loopOn = true;
     } else {
@@ -767,7 +865,7 @@ export class PlayerView {
 
   async addCue() {
     if (!this.ready) return;
-    const pos = Math.round(this.engine.position * 1000) / 1000;
+    const pos = Math.round(this.snapTime(this.engine.position) * 1000) / 1000;
     const n = this.cues.length + 1;
     try {
       const cue = await api(`/api/tracks/${this.trackId}/cues`, {
@@ -793,12 +891,13 @@ export class PlayerView {
   }
 
   async setLoopEnd(cue) {
-    const end = Math.round(this.engine.position * 1000) / 1000;
+    const end = Math.round(this.snapTime(this.engine.position) * 1000) / 1000;
     if (end <= cue.position_sec + 0.05) {
       toast("終点はキューより後ろの位置で押してください。");
       return;
     }
     if (await this.updateCue(cue, { loop_end_sec: end })) {
+      this.barLoop = null;
       this.loopCueId = cue.cue_id;
       this.loopOn = true;
       this.applyLoop();
@@ -835,19 +934,30 @@ export class PlayerView {
   jumpToCue(cue) {
     if (cue.loop_end_sec) {
       // ループ付きのキューを押したら、その区間をループの対象にする（ON/OFF は今のまま）
+      this.barLoop = null;
       this.loopCueId = cue.cue_id;
       if (this.engine) this.engine.setLoop(this.loopOn ? this.activeLoop() : null);
     }
     this.seek(cue.position_sec);
     this.renderCues();
+    this.renderBarLoop();
   }
 
   // --- キーボード -------------------------------------------------------------
 
   handleKey(e) {
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.defaultPrevented) return; // ボタンなどが自分で処理したキー（タップの Space など）
     const tag = (e.target && e.target.tagName) || "";
     if (["INPUT", "TEXTAREA", "SELECT"].includes(tag) || document.querySelector(".modal-back")) return;
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+      // 拍の補正を元に戻す（補正パネルを開いているときだけ）
+      if (this.beatEdit && this.beatEdit.open && this.beatGrid && this.beatGrid.canUndo) {
+        e.preventDefault();
+        this.beatEdit.undo();
+      }
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.code === "Space" || e.key === " ") {
       e.preventDefault();
       if (!e.repeat) this.togglePlay(); // 押しっぱなしの繰り返しは無視する
@@ -866,6 +976,19 @@ export class PlayerView {
     } else if (e.key === "l" || e.key === "L") {
       e.preventDefault();
       this.toggleLoop();
+    } else if (e.key === "b" || e.key === "B") {
+      e.preventDefault();
+      this.setBarLoop(this.loopBars);
+    } else if (e.key === "[") {
+      e.preventDefault();
+      this.scaleLoop(0.5);
+    } else if (e.key === "]") {
+      e.preventDefault();
+      this.scaleLoop(2);
+    } else if ((e.key === "t" || e.key === "T") && this.beatEdit && this.beatEdit.open && this.beatGrid) {
+      // タップは補正パネルを開いているときだけ（うっかり押して拍を置き換えないように）
+      e.preventDefault();
+      if (!e.repeat) this.beatEdit.tapNow();
     }
   }
 
@@ -969,16 +1092,37 @@ export class PlayerView {
       el("h2", { text: "キュー・ループ" }),
       el("ul", { class: "list", id: "cues" }),
       el("div", { class: "row", style: { marginTop: "8px" } },
-        el("button", { class: "btn", id: "add-cue-btn", type: "button", text: "＋ 今の位置にキュー", onclick: () => this.addCue() })));
+        el("button", { class: "btn", id: "add-cue-btn", type: "button", text: "＋ 今の位置にキュー", onclick: () => this.addCue() }),
+        el("label", { class: "snap-toggle", title: "キューを打つとき・ループの終点を決めるとき、いちばん近い拍に合わせます" },
+          el("input", {
+            type: "checkbox", id: "snap-toggle", checked: this.snap,
+            onchange: (e) => this.toggleSnap(e.target.checked),
+          }),
+          el("span", { text: "拍に合わせる" }))),
+      el("div", { class: "bar-loops", id: "bar-loops" },
+        el("span", { class: "muted", text: "小節ループ" }),
+        ...BAR_LOOPS.map((n) => el("button", {
+          class: "btn small", type: "button", text: String(n), dataset: { bars: String(n) },
+          title: `再生位置の小節の頭から ${n} 小節をループします`, "aria-pressed": "false",
+          onclick: () => this.setBarLoop(n),
+        })),
+        el("button", { class: "btn small", type: "button", id: "loop-half", text: "½", title: "ループを半分の長さに（[ キー）。キューのループは保存した終点を書き換えます", onclick: () => this.scaleLoop(0.5) }),
+        el("button", { class: "btn small", type: "button", id: "loop-double", text: "×2", title: "ループを倍の長さに（] キー）。キューのループは保存した終点を書き換えます", onclick: () => this.scaleLoop(2) }),
+        el("span", { class: "bar-loop-state", id: "bar-loop-state" })));
 
     const help = el("p", { class: "keys-help" },
       el("kbd", { text: "Space" }), " 再生/停止　", el("kbd", { text: "0" }),
       " 全部（元の曲）⇔ 直前の組み合わせ　", el("kbd", { text: "1" }), "〜", el("kbd", { text: "9" }),
       " stem の ON/OFF（Shift でソロ）　", el("kbd", { text: "←" }), el("kbd", { text: "→" }),
-      ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ");
+      ` ${SEEK_STEP_SEC}秒戻る/進む　`, el("kbd", { text: "L" }), " ループ　",
+      el("kbd", { text: "B" }), " 小節ループ　", el("kbd", { text: "[" }), el("kbd", { text: "]" }),
+      " ループ ½/×2　", el("kbd", { text: "T" }), " タップ（拍の補正を開いているとき）　",
+      el("kbd", { text: "Ctrl+Z" }), " 拍の補正を元に戻す（拍の補正を開いているとき）");
 
+    if (this.beatEdit) this.beatEdit.dispose();
+    this.beatEdit = new BeatEditPanel(this);
     this.root.replaceChildren(el("div", { class: "player" },
-      el("div", { class: "player-main" }, this.headEl(), this.jobBarEl(), wave, transport, stems),
+      el("div", { class: "player-main" }, this.headEl(), this.jobBarEl(), wave, transport, this.beatEdit.root, stems),
       el("div", { class: "player-side" }, presets, cues, help)));
     this.tempoKey = "";
     this.updateTempo(0);
@@ -988,6 +1132,7 @@ export class PlayerView {
     this.renderGroups();
     this.renderPresets();
     this.renderCues();
+    this.renderBarLoop();
   }
 
   zoomBy(dir) {
@@ -1081,13 +1226,14 @@ export class PlayerView {
   renderCues() {
     const box = this.root.querySelector("#cues");
     if (!box) return;
+    if (this.beatEdit) this.beatEdit.refresh();
     if (!this.cues.length) {
       box.replaceChildren(el("li", {}, el("span", { class: "muted", text: "キューはありません。" })));
       return;
     }
     box.replaceChildren(...this.cues.map((c) => {
       const isLoop = !!c.loop_end_sec;
-      const active = isLoop && this.loopCueId === c.cue_id && this.loopOn;
+      const active = isLoop && this.loopCueId === c.cue_id && this.loopOn && !this.barLoop;
       const swatch = el("button", {
         class: "cue-swatch", type: "button", "aria-label": "色を変える", onclick: () => this.cycleCueColor(c),
       });

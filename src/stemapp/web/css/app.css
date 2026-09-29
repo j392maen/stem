@@ -47,10 +47,10 @@ a { color: inherit; }
   display: flex; align-items: center; gap: 8px;
   font-weight: 800; letter-spacing: 0.14em; text-decoration: none; font-size: 15px;
 }
+/* アプリのアイコン（波形の棒）。赤い丸は録音ボタンに見えるので使わない */
 .brand-mark {
-  width: 14px; height: 14px; border-radius: 50%;
-  background: radial-gradient(circle at 35% 35%, var(--accent), var(--accent-deep));
-  box-shadow: 0 0 10px rgba(255, 59, 78, 0.55);
+  width: 20px; height: 20px; border-radius: 5px;
+  background: url("../icons/icon.svg") center / contain no-repeat;
 }
 .topnav { display: flex; gap: 8px; margin-left: auto; align-items: center; min-width: 0; }
 
@@ -124,6 +124,15 @@ select:focus-visible, .play-btn:focus-visible {
   padding: 10px 14px; border-radius: 6px; max-width: calc(100vw - 32px);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
 }
+
+/* 画面上部の注意（外から開いたのにパスコードが無い等）。閉じられる */
+.notice {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  max-width: 1440px; margin: 12px auto 0; padding: 10px 14px;
+  background: var(--accent-soft); border: 1px solid var(--accent-deep); border-radius: var(--radius);
+  width: calc(100% - 32px); line-height: 1.6;
+}
+.notice .grow { min-width: 12em; }
 
 /* --- ダイアログ --------------------------------------------------------------- */
 .modal-back {
@@ -351,4 +360,51 @@ select:focus-visible, .play-btn:focus-visible {
   .time { font-size: 17px; }
   .tempo .bpm { font-size: 16px; }
   .keys-help { display: none; }
+}
+
+/* --- 拍の補正（T10c）・小節ループ ------------------------------------------------ */
+/* 普段は閉じた1行（見出しと「自動／補正済み」）。開いたときだけ操作が並ぶ */
+.beat-edit { padding: 0; }
+.beat-edit > summary {
+  display: flex; align-items: center; gap: 10px; padding: 9px 14px; cursor: pointer;
+  list-style: none; user-select: none; font-size: 12px; letter-spacing: 0.08em; color: var(--muted);
+}
+.beat-edit > summary::-webkit-details-marker { display: none; }
+.beat-edit > summary::before {
+  content: ""; width: 0; height: 0; border-left: 5px solid var(--faint);
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform 0.15s;
+}
+.beat-edit[open] > summary::before { transform: rotate(90deg); }
+.beat-edit > summary:hover { color: var(--text); }
+.be-title { font-weight: 700; }
+.be-state {
+  font-size: 11px; letter-spacing: 0.04em; padding: 1px 8px; border-radius: 9px;
+  border: 1px solid var(--line); color: var(--faint);
+}
+.be-state.edited { color: var(--accent); border-color: var(--accent-deep); background: var(--accent-soft); }
+.be-body { display: grid; gap: 8px; padding: 12px 14px 14px; border-top: 1px solid var(--line); }
+.be-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.be-label { width: 7.5em; flex: none; font-size: 12px; color: var(--muted); }
+.be-note { font-size: 11px; }
+.be-inline { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; }
+.be-foot { justify-content: flex-end; border-top: 1px solid var(--line); padding-top: 8px; }
+.be-tap { min-width: 96px; }
+.be-tap.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.be-tap-info { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.select.small, .input.small { min-height: 28px; font-size: 12px; padding: 0 6px; }
+.be-bars { width: 5.5em; }
+.be-body select { max-width: 11em; }
+
+.snap-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.snap-toggle input { accent-color: var(--accent); }
+.bar-loops { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+.bar-loops > .muted { font-size: 12px; margin-right: 4px; }
+.bar-loops .btn.small { min-width: 30px; }
+.bar-loop-state { flex-basis: 100%; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 1em; }
+.wave-overview.on-mark { cursor: help; }
+
+@media (max-width: 640px) {
+  .be-label { width: 100%; }
+  .be-body select { max-width: 9em; }
+  .be-body #be-range { max-width: none; }
 }

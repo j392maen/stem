@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, select, text
 
@@ -209,6 +212,103 @@ def check_host(settings: Settings) -> CheckResult:
     )
 
 
+TAILSCALE_DEFAULT_PATH = Path(r"C:\Program Files\Tailscale\tailscale.exe")
+SERVE_SCRIPT = r"scripts\tailscale-serve.ps1"
+
+
+def find_tailscale() -> str | None:
+    exe = shutil.which("tailscale")
+    if exe:
+        return exe
+    if TAILSCALE_DEFAULT_PATH.is_file():
+        return str(TAILSCALE_DEFAULT_PATH)
+    return None
+
+
+def _tailscale_json(exe: str, args: Sequence[str]) -> Any:
+    """tailscale の --json の出力を読む。失敗は例外。"""
+    proc = subprocess.run(
+        [exe, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=15, check=True,
+    )
+    out = proc.stdout.strip()
+    return json.loads(out) if out else {}
+
+
+def serve_targets(serve: Any) -> list[tuple[str, str]]:
+    """serve の設定から（公開している URL, 転送先）の一覧を作る。"""
+    targets: list[tuple[str, str]] = []
+    web = serve.get("Web") if isinstance(serve, dict) else None
+    for hostport, conf in (web or {}).items():
+        handlers = conf.get("Handlers") if isinstance(conf, dict) else None
+        for path, handler in (handlers or {}).items():
+            if isinstance(handler, dict) and handler.get("Proxy"):
+                targets.append((f"https://{hostport}{path}", str(handler["Proxy"])))
+    return targets
+
+
+def funnel_enabled(serve: Any) -> bool:
+    allow = serve.get("AllowFunnel") if isinstance(serve, dict) else None
+    return isinstance(allow, dict) and any(bool(v) for v in allow.values())
+
+
+def _points_to_app(proxy: str, port: int) -> bool:
+    parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    return parts.hostname in ("127.0.0.1", "localhost", "::1") and parts.port == port
+
+
+def check_tailscale(settings: Settings) -> CheckResult:
+    """外出先（iPhone）から使うための Tailscale の状態。無くても使えるので「注意」止まり。"""
+    name = "Tailscale"
+    exe = find_tailscale()
+    if exe is None:
+        return CheckResult(
+            name, Status.WARN, "入っていません（外出先から使うときに必要）",
+            "https://tailscale.com/download から入れてログインしてください",
+        )
+    try:
+        status = _tailscale_json(exe, ["status", "--json"])
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return CheckResult(
+            name, Status.WARN, f"状態を取れません: {e}", "Tailscale を起動してください"
+        )
+    state = status.get("BackendState") if isinstance(status, dict) else None
+    if state != "Running":
+        return CheckResult(
+            name, Status.WARN, f"ログインしていないか停止中です（{state}）",
+            "タスクトレイの Tailscale からログインしてください",
+        )
+    self_info = status.get("Self") or {}
+    dns = str(self_info.get("DNSName") or "").rstrip(".").lower()
+    try:
+        serve = _tailscale_json(exe, ["serve", "status", "--json"])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        serve = None
+    if serve is not None and funnel_enabled(serve):
+        return CheckResult(
+            name, Status.WARN, f"{dns}: Funnel（インターネット全体への公開）が有効です",
+            f"Funnel は使いません。`tailscale funnel reset` で止め、{SERVE_SCRIPT} start を"
+            "使ってください",
+        )
+    to_app = [
+        url for url, proxy in serve_targets(serve) if _points_to_app(proxy, settings.port)
+    ]
+    serve_text = (
+        "serve の状態を取れません" if serve is None
+        else f"serve 有効（{', '.join(to_app)}）" if to_app
+        else "serve 未設定"
+    )
+    detail = f"{dns or '名前不明'}（{serve_text}）"
+    hints = []
+    host_allowed = bool(dns) and dns in settings.allowed_host_names
+    if dns and not host_allowed:
+        hints.append(f".env に STEMAPP_ALLOWED_HOSTS={dns} を書いてください")
+    if not to_app:
+        hints.append(f"外から使うときは {SERVE_SCRIPT} start")
+    status_level = Status.WARN if to_app and not host_allowed else Status.OK
+    return CheckResult(name, status_level, detail, "／".join(hints))
+
+
 DEFAULT_CHECKS: tuple[Check, ...] = (
     check_python,
     check_data_dir,
@@ -219,6 +319,7 @@ DEFAULT_CHECKS: tuple[Check, ...] = (
     check_audio_separator,
     check_ytdlp,
     check_deno,
+    check_tailscale,
 )
 
 

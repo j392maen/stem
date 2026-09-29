@@ -127,6 +127,9 @@ def test_remote_is_forbidden(
         {"X-Forwarded-For": "100.64.0.5"},  # Tailscale Serve などの中継
         {"Forwarded": "for=100.64.0.5"},
         {"Tailscale-User-Login": "someone@example.com"},
+        {"X-Forwarded-Proto": "https"},
+        {"X-Real-IP": "100.64.0.5"},
+        {"Via": "1.1 proxy"},
         {"Origin": "http://evil.example"},  # 他のサイトのページからの POST
     ],
 )
@@ -228,7 +231,7 @@ def test_open_in_explorer_breaks_away_from_job(fake_popen: type[FakePopen], tmp_
     proc.open_in_explorer(tmp_path)
     assert len(fake_popen.calls) == 1
     call = fake_popen.calls[0]
-    assert call["cmd"] == ["explorer.exe", str(tmp_path)]
+    assert call["cmd"] == [proc.explorer_path(), str(tmp_path)]
     assert call["creationflags"] & proc._CREATE_BREAKAWAY_FROM_JOB
     assert call["stdin"] is subprocess.DEVNULL
     assert fake_popen.assign == []  # type: ignore[attr-defined]  # このプロセスの Job に入れない
@@ -243,6 +246,21 @@ def test_open_in_explorer_retries_without_breakaway(
     assert len(fake_popen.calls) == 2
     assert not fake_popen.calls[1]["creationflags"] & proc._CREATE_BREAKAWAY_FROM_JOB
     assert fake_popen.assign == []  # type: ignore[attr-defined]
+
+
+def test_explorer_path_is_absolute(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SystemRoot", r"D:\Win")
+    assert proc.explorer_path() == str(Path(r"D:\Win") / "explorer.exe")
+    monkeypatch.delenv("SystemRoot")
+    monkeypatch.delenv("windir", raising=False)
+    assert proc.explorer_path() == str(Path(r"C:\Windows") / "explorer.exe")
+
+
+@pytest.mark.skipif(proc.os.name != "nt", reason="Windows の実際のパス")
+def test_explorer_path_exists_on_windows() -> None:
+    path = Path(proc.explorer_path())
+    assert path.is_absolute()
+    assert path.is_file()
 
 
 def test_start_detached_other_os(

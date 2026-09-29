@@ -39,6 +39,22 @@ class Settings(BaseSettings):
     model_dir: Path | None = None
     # アップロードできるファイルの大きさの上限（MB）
     max_upload_mb: int = 1024
+    # この PC 以外の名前で開くときに許可する Host（カンマ区切り）。
+    # 例: Tailscale Serve で開くなら "unagi.tail8b25a2.ts.net"。
+    # 127.0.0.1・localhost・[::1] は常に許可。
+    allowed_hosts: str = ""
+
+    @property
+    def allowed_host_names(self) -> frozenset[str]:
+        """Host ヘッダーとして受け付ける名前（小文字、ポートなし、IPv6 は角かっこなし）。"""
+        from stemapp.hosts import ALWAYS_ALLOWED, normalize_host
+
+        names = set(ALWAYS_ALLOWED)
+        for item in self.allowed_hosts.split(","):
+            name = normalize_host(item.strip())
+            if name:
+                names.add(name)
+        return frozenset(names)
     # 書き出し（data/exports）を残す時間と、合計の大きさの上限（超えた分は古い順に消す）
     export_ttl_hours: float = 24.0
     export_max_mb: int = 2048
