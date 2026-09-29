@@ -111,7 +111,7 @@ def test_worker_runs_job_to_done(
             assert set(by_purpose) == {"master", "stream"}
             stream = by_purpose["stream"]
             assert (stream.codec, stream.bitrate_kbps) == ("opus", 128)
-            assert stream.file_path.startswith(f"stems/{job_id}/stream/")
+            assert stream.file_path.startswith("stems/song/fast/stream/")
             assert stream.bytes and stream.bytes > 0
             levels = s.scalars(
                 select(Waveform.samples_per_px).where(Waveform.stem_id == st.stem_id)
@@ -161,7 +161,8 @@ def test_failure_marks_failed(
     job = _job(factory, job_id)
     assert job.status == "failed"
     assert job.error_message and "fake failure" in job.error_message
-    assert not (settings.stems_dir / str(job_id)).exists()
+    assert job.output_dir is None
+    assert not (settings.stems_dir / "song").exists()
     with factory() as s:
         assert s.scalars(select(Stem).where(Stem.job_id == job_id)).all() == []
 
@@ -185,7 +186,7 @@ def test_postprocess_failure_marks_failed(
     assert job.error_message and "配信用データを作成中" in job.error_message
     with factory() as s:
         assert s.scalars(select(Stem).where(Stem.job_id == job_id)).all() == []
-    assert not (settings.stems_dir / str(job_id)).exists()
+    assert not (settings.stems_dir / "song").exists()
 
 
 def test_child_crash_marks_failed(
@@ -365,7 +366,7 @@ def test_recover_marks_running_as_failed(
         job.status = "running"
         job.finished_at = None
         s.commit()
-    partial = settings.stems_dir / str(job_id)
+    partial = settings.stems_dir / "song" / "fast"
     assert partial.is_dir()
 
     queued = enqueue_full_job(seeded, track_id, "fast")
@@ -375,7 +376,8 @@ def test_recover_marks_running_as_failed(
     job = _job(factory, job_id)
     assert job.status == "failed" and job.error_message == INTERRUPTED_MESSAGE
     assert job.finished_at is not None
-    assert not partial.exists()
+    assert not partial.exists() and not partial.parent.exists()
+    assert job.output_dir is None
     with factory() as s:
         assert s.scalars(select(Stem).where(Stem.job_id == job_id)).all() == []
     assert worker.recover() == []
@@ -459,6 +461,7 @@ def test_abandoned_job_does_not_write_done(
     with factory() as s:
         assert s.scalars(select(Stem).where(Stem.job_id == job_id)).all() == []
     assert not (settings.stems_dir / str(job_id)).exists()
+    assert not (settings.stems_dir / "song").exists()
     assert not (settings.cache_dir / "tmp" / f"job-{job_id}").exists()
 
 

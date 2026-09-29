@@ -65,6 +65,7 @@ from stemapp.separation.base import (
     Separator,
     is_oom_error,
 )
+from stemapp.stem_folders import assign_job_dir, job_dir, remove_job_dir
 
 log = logging.getLogger(__name__)
 
@@ -559,7 +560,7 @@ def _save_stems(
         return d
 
     codes = sorted(output.stems, key=lambda c: (depth(c), types[c].display_order))
-    out_dir = settings.stems_dir / str(job.job_id)
+    out_dir = job_dir(settings, job.job_id, job.output_dir)
     stems: dict[str, Stem] = {}
     infos: list[StemInfo] = []
     for code in codes:
@@ -798,8 +799,10 @@ def separate_track(
         raise SeparationError(f"正規化した音声を読めません: {normalized_path}: {e}") from e
 
     tmp_dir: Path | None = None
+    out_rel: str | None = None  # 決めた保存フォルダ（失敗時に消す）
     try:
         job = _prepare_job(session, track, plan, device, job_id)
+        current_job_id = job.job_id
         tmp_dir = job_tmp_dir(settings, job.job_id)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -846,6 +849,10 @@ def separate_track(
             job.output_gain_db = round(gain_to_db(gain), 4) if gain != 1.0 else 0.0
             job.residual_rms_db = round(output.residual_rms_db, 2)
             job.mixture_rms_db = round(output.mixture_rms_db, 2)
+            # 保存フォルダを決めて先に commit する（失敗して rollback しても消す場所が分かるように）
+            assign_job_dir(session, settings, job)
+            out_rel = job.output_dir
+            session.commit()
             infos = _save_stems(session, settings, job, output)
             if postprocess is not None:
                 set_progress(0.92, "配信用データを作成中")
@@ -884,9 +891,14 @@ def separate_track(
                 )
                 .values(status="canceled", stage="キャンセルしました", finished_at=_utcnow())
             )
+            session.execute(
+                update(SeparationJob)
+                .where(SeparationJob.job_id == current_job_id)
+                .values(output_dir=None)
+            )
             session.commit()
-            shutil.rmtree(settings.stems_dir / str(job.job_id), ignore_errors=True)
-            log.warning("job %d の処理をやめました（結果は書き込みません）。", job.job_id)
+            remove_job_dir(session, settings, current_job_id, out_rel)
+            log.warning("job %d の処理をやめました（結果は書き込みません）。", current_job_id)
             raise
         except Exception as e:
             session.rollback()
@@ -895,8 +907,9 @@ def separate_track(
             job.status = "failed"
             job.finished_at = _utcnow()
             job.error_message = f"分割に失敗しました（{stage}）: {type(e).__name__}: {e}"
+            job.output_dir = None
             session.commit()
-            shutil.rmtree(settings.stems_dir / str(job.job_id), ignore_errors=True)
+            remove_job_dir(session, settings, current_job_id, out_rel)
             log.error("job %d 失敗: %s", job.job_id, job.error_message)
             raise SeparationError(job.error_message) from e
 

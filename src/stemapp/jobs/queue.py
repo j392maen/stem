@@ -20,6 +20,7 @@ from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
 from stemapp.library import find_done_job
 from stemapp.models import SeparationJob, Track
 from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
+from stemapp.stem_folders import remove_job_dir
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
     job = session.get(SeparationJob, job_id)
     if job is None:
         raise JobNotFound(f"ジョブが見つかりません（job {job_id}）。")
+    output_dir = job.output_dir
     export_ids = export_ids_for_jobs(session, [job_id])
     # 確かめてから消すまでの間にワーカーが取り出さないよう、条件付きで消す
     res = session.execute(
@@ -173,7 +175,7 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
         raise JobConflict("配信用データを作成待ち・作成中です。終わってから削除してください。")
     session.commit()  # STEM・STEM_RENDITION・WAVEFORM・EXPORT は外部キーの CASCADE で消える
     session.expunge(job)
-    shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
+    remove_job_dir(session, settings, job_id, output_dir)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
     remove_export_dirs(settings, export_ids)  # 書き出したファイル（data/exports/<id>）
     log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
@@ -188,10 +190,19 @@ def is_cancel_requested(session: Session, job_id: int) -> bool:
 
 
 def discard_job_outputs(session: Session, settings: Settings, job_id: int) -> None:
-    """ジョブの STEM 行、`data/stems/<job_id>`、一時フォルダを消す（commit まで行う）。"""
+    """ジョブの STEM 行、保存フォルダ、一時フォルダを消す（commit まで行う）。
+
+    保存フォルダの名前（SEPARATION_JOB.output_dir）も空に戻す。
+    """
+    output_dir = session.scalar(
+        select(SeparationJob.output_dir).where(SeparationJob.job_id == job_id)
+    )
     delete_job_stems(session, job_id)
+    session.execute(
+        update(SeparationJob).where(SeparationJob.job_id == job_id).values(output_dir=None)
+    )
     session.commit()
-    shutil.rmtree(settings.stems_dir / str(job_id), ignore_errors=True)
+    remove_job_dir(session, settings, job_id, output_dir)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
 
 

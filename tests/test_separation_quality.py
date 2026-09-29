@@ -281,16 +281,16 @@ def test_delete_job(seeded: Session, settings: Settings, tmp_path: Path) -> None
     track_id = make_track(seeded, settings, tmp_path)
     keep = _separate(seeded, settings, track_id, "fast")
     gone = _separate(seeded, settings, track_id, "exp_resid_vocals")
-    assert (settings.stems_dir / str(gone.job_id)).is_dir()
+    assert (settings.stems_dir / "song" / "exp_resid_vocals").is_dir()
 
     deleted = delete_job(seeded, settings, gone.job_id)
     assert deleted.job_id == gone.job_id and deleted.track_id == track_id
     assert seeded.get(SeparationJob, gone.job_id) is None
     assert seeded.scalars(select(Stem).where(Stem.job_id == gone.job_id)).all() == []
-    assert not (settings.stems_dir / str(gone.job_id)).exists()
+    assert not (settings.stems_dir / "song" / "exp_resid_vocals").exists()
     # ほかの分け方は残る
     assert seeded.get(SeparationJob, keep.job_id) is not None
-    assert (settings.stems_dir / str(keep.job_id)).is_dir()
+    assert (settings.stems_dir / "song" / "fast").is_dir()
     assert seeded.scalars(select(Stem).where(Stem.job_id == keep.job_id)).all()
 
     with pytest.raises(JobNotFound):
