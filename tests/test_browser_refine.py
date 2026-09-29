@@ -68,7 +68,8 @@ def test_refine_drums_flow(page: Any, server: LiveServer, tmp_path: Path) -> Non
     page.wait_for_selector(".refine-modal")
     option = page.locator(".refine-option")
     assert option.count() == 1
-    assert "キック・スネア・タム・ハイハット・ライド・クラッシュ・残り（ドラム）" in option.inner_text()
+    names = "キック・スネア・タム・ハイハット・ライド・クラッシュ・残り（ドラム）"
+    assert names in option.inner_text()
     assert "GPU" in option.inner_text()
     _shot(page, "refine_menu_pc.png")
     # 開いている間はキー操作が再生に効かない
@@ -124,13 +125,15 @@ def test_refine_other_and_undo(page: Any, server: LiveServer, tmp_path: Path) ->
         "els => els.map(e => e.dataset.code)"
     )
     assert kids == ["other", "sustained", "transient", "other_rest"]
-    assert page.locator(".stem-btn[data-code='sustained'] .name").inner_text() == "持続音（パッド等）"
+    name = page.locator(".stem-btn[data-code='sustained'] .name").inner_text()
+    assert name == "持続音（パッド等）"
     # 子を1つだけ鳴らしてから戻す → 親が鳴る
     page.click(".stem-btn[data-code='transient']", modifiers=["Shift"])
     _wait_gains(page, {"transient": 1.0, "sustained": 0.0})
     page.click(".stem-cell[data-code='other'] .refine-act.undo")
     page.wait_for_selector(".modal .danger-confirm")
-    assert "持続音（パッド等）・短い音（ヒット等）・残り（その他）" in page.locator(".modal").inner_text()
+    kids_text = "持続音（パッド等）・短い音（ヒット等）・残り（その他）"
+    assert kids_text in page.locator(".modal").inner_text()
     page.click(".modal .danger-confirm")
     page.wait_for_function(
         "() => !document.querySelector(\".stem-btn[data-code='sustained']\")", timeout=30_000
@@ -155,7 +158,8 @@ def test_refine_conflict_and_preset_fallback(
         const { selection: S } = window.__stemapp.modules;
         const v = window.__stemapp.view;
         const kick = v.stemTypes.find((t) => t.code === "kick");
-        const preset = { items: [{ stem_type_code: "kick", stem_type_id: kick.stem_type_id, gain_db: -6 }] };
+        const item = { stem_type_code: "kick", stem_type_id: kick.stem_type_id, gain_db: -6 };
+        const preset = { items: [item] };
         const r = S.presetToSelection(v.tree, preset, v.groups, v.stemTypes);
         const without = S.presetToSelection(v.tree, preset, v.groups);
         return [[...r.sel], r.gainsDb.get("drums"), [...without.sel]];
@@ -191,7 +195,7 @@ def test_refine_cancel(page: Any, slow_server: LiveServer, tmp_path: Path) -> No
     _refine(page, "drums", "MDX23C")
     page.wait_for_selector(".stem-cell[data-code='drums'] .refine-act.stop")
     page.wait_for_function(
-        """() => (document.querySelector('#refine-status')?.textContent || '').includes('分離中')""",
+        "() => (document.querySelector('#refine-status')?.textContent || '').includes('分離中')",
         timeout=20_000,
     )
     page.click(".stem-cell[data-code='drums'] .refine-act.stop")

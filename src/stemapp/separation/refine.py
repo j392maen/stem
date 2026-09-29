@@ -416,7 +416,9 @@ def run_refine(
 
     if method.is_hpss:
         report(0.0, "持続音と短い音に分けています")
+        t_hpss = time.perf_counter()
         out = hpss(parent, progress=lambda p, s: report(0.95 * p, s))
+        log.info("HPSS: %.1f 秒（CPU）", time.perf_counter() - t_hpss)
     else:
         if separator is None:
             raise SeparationError("分離器がありません。")
