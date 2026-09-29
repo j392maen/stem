@@ -379,7 +379,8 @@ def test_postprocess_failure_leaves_no_partial_rows(
         assert streams == 0
         assert len(missing_delivery(s, job_id)) == 8
     settings = client.app.state.settings  # type: ignore[attr-defined]
-    assert not (settings.stems_dir / str(job_id) / "stream").exists()
+    assert (settings.stems_dir / "song" / "fast").is_dir()
+    assert not (settings.stems_dir / "song" / "fast" / "stream").exists()
     # もう一度頼める
     assert client.post(f"/api/jobs/{job_id}/postprocess").status_code == 202
 

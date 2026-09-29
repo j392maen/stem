@@ -288,7 +288,7 @@ def test_separate_file_registers_everything(
         rends = seeded.scalars(select(StemRendition).where(StemRendition.stem_id == stem.stem_id))
         (rend,) = list(rends)
         assert (rend.purpose, rend.codec) == ("master", "flac")
-        assert rend.file_path == f"stems/{job.job_id}/{code}.flac"
+        assert rend.file_path == f"stems/song/standard/{code}.flac"
         path = resolve_data_path(settings, rend.file_path)
         assert rend.bytes == path.stat().st_size
         info = sf.info(str(path))
@@ -354,7 +354,8 @@ def test_failure_marks_job_failed(seeded: Session, settings: Settings, src: Path
     assert job.error_message is not None and "分割に失敗しました" in job.error_message
     assert "fake failure" in job.error_message
     assert seeded.scalars(select(Stem)).all() == []
-    assert not (settings.stems_dir / str(job.job_id)).exists()
+    assert job.output_dir is None
+    assert list(settings.stems_dir.iterdir()) == []  # 作りかけのフォルダも曲のフォルダも消える
 
     # 失敗した曲は次に分割できる（完了済みではないので skip しない）
     res = _run(seeded, settings, src, FakeSeparator(), preset_code="standard")
