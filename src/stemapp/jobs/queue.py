@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from stemapp.config import Settings
 from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
 from stemapp.library import find_done_job
-from stemapp.models import SeparationJob, Track
+from stemapp.models import SeparationJob, Stem, Track
 from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
 from stemapp.stem_folders import remove_job_dir
 
@@ -64,9 +64,14 @@ class EnqueueResult:
 def active_job(
     session: Session, track_id: int, preset_id: int | None = None
 ) -> SeparationJob | None:
-    """その曲の queued / running のジョブ（古いもの）。preset_id でプリセットを絞る。"""
+    """その曲の queued / running の分割（full）ジョブ（古いもの）。preset_id でプリセットを絞る。
+
+    詳細分割（refine）のジョブは含めない。
+    """
     stmt = select(SeparationJob).where(
-        SeparationJob.track_id == track_id, SeparationJob.status.in_(ACTIVE_STATUSES)
+        SeparationJob.track_id == track_id,
+        SeparationJob.job_kind == "full",
+        SeparationJob.status.in_(ACTIVE_STATUSES),
     )
     if preset_id is not None:
         stmt = stmt.where(SeparationJob.preset_id == preset_id)
@@ -143,15 +148,54 @@ def request_cancel(session: Session, job_id: int) -> SeparationJob:
     return job
 
 
+def refine_descendants(session: Session, job_id: int) -> list[SeparationJob]:
+    """そのジョブの stem を詳細分割したジョブ（子の子も。深い順）。"""
+    out: list[SeparationJob] = []
+    frontier = [job_id]
+    seen = {job_id}
+    while frontier:
+        found = [
+            j
+            for j in session.scalars(
+                select(SeparationJob)
+                .where(
+                    SeparationJob.job_kind == "refine",
+                    SeparationJob.input_stem_id.in_(
+                        select(Stem.stem_id).where(Stem.job_id.in_(frontier))
+                    ),
+                )
+                .order_by(SeparationJob.job_id)
+            )
+            if j.job_id not in seen
+        ]
+        seen.update(j.job_id for j in found)
+        out.extend(found)
+        frontier = [j.job_id for j in found]
+    return list(reversed(out))
+
+
 def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJob:
     """終わったジョブ（done / failed / canceled）を消す。stem・配信用データ・ファイルも消える。
 
-    分割待ち・分割中、配信用データの作成待ち・作成中のジョブは JobConflict。
+    その stem を詳細分割したジョブ（refine）も一緒に消す。
+    分割待ち・分割中、配信用データの作成待ち・作成中のジョブ（詳細分割を含む）は JobConflict。
     消したジョブ（DB からは消えた後の値）を返す。
     """
     job = session.get(SeparationJob, job_id)
     if job is None:
         raise JobNotFound(f"ジョブが見つかりません（job {job_id}）。")
+    children = refine_descendants(session, job_id)
+    if children and (
+        job.status in ACTIVE_STATUSES or job.postprocess_status in ACTIVE_STATUSES
+    ):
+        raise JobConflict("分割中・配信用データの作成中のジョブは削除できません。")
+    if any(c.status in ACTIVE_STATUSES for c in children):
+        raise JobConflict(
+            "この分け方の stem を「もっと分ける」処理が分割待ち・分割中です。"
+            "キャンセルしてから削除してください。"
+        )
+    for child in children:
+        delete_job(session, settings, child.job_id)
     output_dir = job.output_dir
     export_ids = export_ids_for_jobs(session, [job_id])
     # 確かめてから消すまでの間にワーカーが取り出さないよう、条件付きで消す

@@ -10,7 +10,7 @@
 | SEPARATION_PRESET | preset_id PK, code UK(fast/standard/best、実験は exp_*), display_name, is_default, is_experimental(bool、聴き比べ用の実験), options_json(パイプライン全体の選択肢。例 {"residual_to": "other/vocals/split"}) |
 | PRESET_STEP | preset_id PK FK, step_order PK, model_id FK, input(mixture/vocals。karaoke のみ vocals も可、1プリセット内で同じ), role(multistem/vocals/karaoke), ensemble_weight, options_json |
 | MODEL | model_id PK, filename UK, display_name, architecture, output_stems_json, min_vram_mb, checkpoint_sha256, license, source_url |
-| SEPARATION_JOB | job_id PK, track_id FK, job_kind(full/refine), preset_id FK(full のみ), input_stem_id FK(refine のみ), requested_by FK→DEVICE, status(queued/running/done/failed/canceled), run_on(gpu/cpu/nightly), progress(0-1), stage, created_at, started_at, finished_at, error_message, cancel_requested(bool、キャンセル依頼), output_gain_db(float、既定0。保存前に全 stem にかけた倍率), postprocess_status(NULL/queued/running/done/failed、配信用データ・拍の作り直し), beat_warning(拍の解析に失敗したときの警告。NULL=なし), residual_rms_db / mixture_rms_db(float、補正前の残差と元の曲の RMS dBFS。聴き比べの参考), output_dir(stem の保存フォルダ。データフォルダからの相対パス `stems/<元のファイル名>/<分け方>`。保存を始めるときに一度決める。NULL は T13 より前の `stems/<job_id>`) |
+| SEPARATION_JOB | job_id PK, track_id FK, job_kind(full/refine), preset_id FK(full のみ), input_stem_id FK(refine のみ), refine_model_id FK→MODEL(refine のみ。詳細分割の方法。HPSS も architecture=hpss の MODEL 行), requested_by FK→DEVICE, status(queued/running/done/failed/canceled), run_on(gpu/cpu/nightly), progress(0-1), stage, created_at, started_at, finished_at, error_message, cancel_requested(bool、キャンセル依頼), output_gain_db(float、既定0。保存前に全 stem にかけた倍率), postprocess_status(NULL/queued/running/done/failed、配信用データ・拍の作り直し), beat_warning(拍の解析に失敗したときの警告。NULL=なし), residual_rms_db / mixture_rms_db(float、補正前の残差と元の曲の RMS dBFS。聴き比べの参考), output_dir(stem の保存フォルダ。データフォルダからの相対パス `stems/<元のファイル名>/<分け方>`。保存を始めるときに一度決める。NULL は T13 より前の `stems/<job_id>`。refine は分けた stem のジョブのフォルダの下 `…/<分け方>/<親の code>`) |
 | STEM_TYPE | stem_type_id PK, code UK, display_name(日本語), parent_id FK→STEM_TYPE, tier(base/detail), refine_model_id FK→MODEL, experimental, color(#RRGGBB), display_order |
 | STEM | stem_id PK, job_id FK, stem_type_id FK, parent_stem_id FK→STEM, is_residual, rms_db, is_silent |
 | STEM_RENDITION | rendition_id PK, stem_id FK, purpose(master/stream), codec(flac/opus/wav), bitrate_kbps, file_path, bytes |
@@ -31,6 +31,7 @@
 制約:
 - LISTEN_PRESET_ITEM は stem_type_id と group_id のどちらか一方だけが非NULL（CHECK 制約）。
 - STEM の子（parent_stem_id が同じ）は合計すると親に一致するよう、is_residual=true の stem を1つ含む。
+- 詳細分割（refine）の子 STEM は refine ジョブの行（job_id=refine ジョブ）。残りの STEM_TYPE は親ごとに `<親の code>_rest`（表示名「残り（親の表示名）」）。1つの stem を分けた結果は1組だけ（別の方法で分け直すと置き換え）。1つの分け方（full ジョブ）の木の中で STEM_TYPE の code は重ならない。
 - TRACK.audio_hash は正規化後PCMの SHA-256（同じ曲の再分割防止）。
 - BEAT_GRID の beats_json など（自動の結果）は解析だけが書き、補正では書き換えない。ユーザーが直した結果は edited_*（3つとも NULL か、3つとも値あり）。画面と API は「有効な拍」（edited_* があればそれ、無ければ自動の結果）を使う。区間ごとの BPM は保存せず、有効な拍から毎回計算する（`stemapp.beats.tempo`）。拍の時刻はすべて元の曲の時刻（速度変更の影響を受けない）。
 - BEAT_EDIT は補正の履歴（元に戻す用。新しいものから取り消す。曲ごとに最大 100 件、古いものから消す）。「自動に戻す」も履歴に残し、元に戻せる。再解析すると新しい自動の結果を使い、それまでの直した結果は op=reanalyze の履歴に移す（解析の後に「元に戻す」で戻せる）。

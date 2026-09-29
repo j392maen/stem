@@ -41,12 +41,12 @@ from stemapp.models import (
     ListenPreset,
     ListenPresetItem,
     SeparationJob,
-    Stem,
     StemGroupMember,
     StemRendition,
     StemType,
     Track,
 )
+from stemapp.stem_view import build_view
 
 log = logging.getLogger(__name__)
 
@@ -135,11 +135,8 @@ class JobTree:
 
 
 def load_tree(session: Session, job_id: int) -> JobTree:
-    rows = session.execute(
-        select(Stem, StemType)
-        .join(StemType, StemType.stem_type_id == Stem.stem_type_id)
-        .where(Stem.job_id == job_id)
-    ).all()
+    """ジョブの stem の木。詳細分割（refine）の子も入る（`stemapp.stem_view`）。"""
+    rows = build_view(session, job_id).rows
     return JobTree(
         [
             JobStem(
@@ -186,7 +183,21 @@ def _preset_items(
     preset = session.get(ListenPreset, preset_id)
     if preset is None or preset.hidden:
         raise ExportNotFound("組み合わせが見つかりません。")
-    code_of = {t.stem_type_id: t.code for t in session.scalars(select(StemType))}
+    all_types = list(session.scalars(select(StemType)))
+    code_of = {t.stem_type_id: t.code for t in all_types}
+    parent_of = {t.stem_type_id: t.parent_id for t in all_types}
+
+    def in_tree(type_id: int) -> JobStem | None:
+        """その型の stem。この曲に無い詳細 stem（子）は、ある親までさかのぼる（画面と同じ）。"""
+        stem = tree.by_code.get(code_of.get(type_id, ""))
+        seen = {type_id}
+        parent = parent_of.get(type_id)
+        while stem is None and parent is not None and parent not in seen:
+            seen.add(parent)
+            stem = tree.by_code.get(code_of.get(parent, ""))
+            parent = parent_of.get(parent)
+        return stem
+
     members: dict[int, list[int]] = {}
     for m in session.scalars(select(StemGroupMember)):
         members.setdefault(m.group_id, []).append(m.stem_type_id)
@@ -200,7 +211,12 @@ def _preset_items(
             it.group_id or -1, []
         )
         for type_id in type_ids:
-            stem = tree.by_code.get(code_of.get(type_id, ""))
+            # グループのメンバーは基本 stem なので、さかのぼるのは直接指定した型だけ
+            stem = (
+                in_tree(type_id)
+                if it.stem_type_id is not None
+                else tree.by_code.get(code_of.get(type_id, ""))
+            )
             if stem is None:
                 continue
             for leaf in tree.leaves_of(stem):

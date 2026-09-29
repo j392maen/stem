@@ -33,6 +33,7 @@ from stemapp.exports import export_ids_for_jobs, remove_export_dirs
 from stemapp.jobs import (
     ACTIVE_STATUSES,
     DONE,
+    FAILED,
     FINISHED_STATUSES,
     QUEUED,
     RUNNING,
@@ -55,7 +56,19 @@ from stemapp.models import (
     Waveform,
 )
 from stemapp.separation.pipeline import SeparationError
+from stemapp.separation.refine import (
+    RefineConflict,
+    RefineInvalid,
+    RefineNotFound,
+    TypeIndex,
+    check_refine,
+    enqueue_refine_job,
+    load_methods,
+    method_applies,
+    refine_payload,
+)
 from stemapp.stem_folders import remove_job_dir
+from stemapp.stem_view import build_view
 
 log = logging.getLogger(__name__)
 
@@ -79,8 +92,13 @@ def _jobs_by_track(session: Session) -> dict[int, list[SeparationJob]]:
 def _track_summary(
     track: Track, jobs: list[SeparationJob], presets: dict[int, SeparationPreset]
 ) -> dict[str, Any]:
-    """jobs はその曲のジョブ（新しい順）。"""
-    done = [j for j in jobs if j.job_kind == "full" and j.status == "done"]
+    """jobs はその曲のジョブ（新しい順）。
+
+    一覧の状態（latest_job・active_job・active_count）は分割（full）のジョブだけで決める
+    （詳細分割は曲の中の1つの stem の処理なので、一覧には出さない）。
+    """
+    jobs = [j for j in jobs if j.job_kind == "full"]
+    done = [j for j in jobs if j.status == "done"]
 
     def experimental(j: SeparationJob) -> bool:
         p = presets.get(j.preset_id) if j.preset_id is not None else None
@@ -524,13 +542,15 @@ def job_events(job_id: int, request: Request) -> StreamingResponse:
 
 @router.get("/jobs/{job_id}/stems")
 def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
+    """分け方（ジョブ）の stem。詳細分割（refine）の子も木の順（親の直後に子）で入る。
+
+    stem ごとの refine_methods は「もっと分ける」の方法（子を持たない stem だけ。available が
+    false なら reason に理由）、refined_by は子を作った詳細分割のジョブ（戻すときに消すもの）。
+    refine_jobs は分割待ち・分割中・失敗した詳細分割（stem ごとに新しいもの1つ）。
+    """
     job = _get_job(session, job_id)
-    rows = session.execute(
-        select(Stem, StemType)
-        .join(StemType, StemType.stem_type_id == Stem.stem_type_id)
-        .where(Stem.job_id == job_id)
-        .order_by(StemType.display_order)
-    ).all()
+    view = build_view(session, job_id)
+    rows = view.rows
     code_of = {s.stem_id: t.code for s, t in rows}
     stem_ids = list(code_of)
     renditions: dict[int, list[StemRendition]] = {}
@@ -546,11 +566,63 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
     ):
         waves.setdefault(w.stem_id, []).append(w)
 
+    types = TypeIndex.load(session)
+    methods = load_methods(session, types)
+    methods_by_id = {m.model_id: m for m in methods.values()}
+    refine_rows = (
+        list(
+            session.scalars(
+                select(SeparationJob)
+                .where(
+                    SeparationJob.job_kind == "refine",
+                    SeparationJob.input_stem_id.in_(stem_ids),
+                )
+                .order_by(SeparationJob.job_id)
+            )
+        )
+        if stem_ids
+        else []
+    )
+    active_refines = [j for j in refine_rows if j.status in ACTIVE_STATUSES]
+    busy_stems = {j.input_stem_id for j in active_refines}
+    can_refine = job.job_kind == "full" and job.status == DONE and job.output_dir is not None
+
+    def methods_of(stem: Stem, stype: StemType) -> list[dict[str, Any]]:
+        if not can_refine or view.children_of(stem.stem_id):
+            return []
+        out = []
+        for m in methods.values():
+            if not method_applies(m, stype.code, types):
+                continue
+            item = refine_payload(m, types, stype.code)
+            if stem.stem_id in busy_stems:
+                item.update(available=False, reason="分割待ち・分割中です。")
+            else:
+                chk = check_refine(
+                    session, view, stem.stem_id, m, types,
+                    active_jobs=active_refines, methods_by_id=methods_by_id,
+                )
+                item.update(available=chk.ok, reason=chk.reason)
+            out.append(item)
+        return out
+
+    def refined_by(stem_id: int) -> dict[str, Any] | None:
+        rj = view.refined_by.get(stem_id)
+        if rj is None:
+            return None
+        m = methods_by_id.get(rj.refine_model_id or -1)
+        return {
+            "job_id": rj.job_id,
+            "model": m.filename if m else None,
+            "display_name": m.display_name if m else None,
+        }
+
     stems = []
     for s, t in rows:
         stems.append(
             {
                 "stem_id": s.stem_id,
+                "job_id": s.job_id,
                 "stem_type_id": t.stem_type_id,
                 "code": t.code,
                 "display_name": t.display_name,
@@ -578,8 +650,29 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
                     }
                     for w in waves.get(s.stem_id, [])
                 ],
+                "refine_methods": methods_of(s, t),
+                "refined_by": refined_by(s.stem_id),
             }
         )
+    # stem ごとに新しい詳細分割（done 以外）。done の結果は子として木に入っている
+    latest: dict[int, SeparationJob] = {}
+    for rj in refine_rows:
+        if rj.input_stem_id is not None:
+            latest[rj.input_stem_id] = rj
+    presets = preset_codes(session)
+    refine_jobs = [
+        {
+            **job_to_dict(rj, presets),
+            "input_code": code_of.get(rj.input_stem_id or -1),
+            "model": (
+                methods_by_id[rj.refine_model_id].filename
+                if rj.refine_model_id in methods_by_id
+                else None
+            ),
+        }
+        for rj in latest.values()
+        if rj.status in (QUEUED, RUNNING, FAILED)
+    ]
     missing = missing_delivery(session, job_id) if job.status == "done" else []
     return {
         "job_id": job.job_id,
@@ -592,4 +685,47 @@ def job_stems(job_id: int, session: SessionDep) -> dict[str, Any]:
         "delivery_ready": job.status == "done" and not missing,
         "delivery_missing": missing,
         "stems": stems,
+        "refine_jobs": refine_jobs,
+    }
+
+
+# --- 詳細分割（もっと分ける） ------------------------------------------------------------
+
+
+class RefineRequest(BaseModel):
+    # 方法（MODEL.filename。例 "MDX23C-DrumSep-aufr33-jarredou.ckpt"。HPSS は "hpss"）
+    model: str = Field(min_length=1, max_length=300)
+    force: bool = False
+
+
+REFINE_MESSAGES = {
+    None: "「もっと分ける」を登録しました。",
+    "active": "この stem はこの方法で分割待ち・分割中です。",
+    "done": "この stem はこの方法で分けてあります（分け直すには force を指定してください）。",
+}
+
+
+@router.post("/stems/{stem_id}/refine")
+def refine_stem(
+    stem_id: int, body: RefineRequest, response: Response, session: SessionDep
+) -> dict[str, Any]:
+    """stem をさらに分けるジョブを登録する（登録したら 201、既にあれば 200）。
+
+    分けられない stem・方法は 400、今の状態ではできない（別の方法で分けてある等）は 409。
+    子を消して分ける前に戻すには、refined_by のジョブを DELETE /api/jobs/{job_id} で消す。
+    """
+    try:
+        res = enqueue_refine_job(session, stem_id, body.model, force=body.force)
+    except RefineNotFound as e:
+        raise not_found("stem") from e
+    except RefineInvalid as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RefineConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    response.status_code = 201 if res.created else 200
+    return {
+        "created": res.created,
+        "reason": res.reason,
+        "message": REFINE_MESSAGES.get(res.reason, ""),
+        "job": job_to_dict(res.job, preset_codes(session)),
     }

@@ -36,7 +36,9 @@ from stemapp.jobs.queue import ACTIVE_STATUSES, FAILED, finish_job
 from stemapp.models import SeparationJob
 from stemapp.proc import watch_parent
 from stemapp.separation.base import DEVICE_CPU, DEVICE_CUDA, Separator
+from stemapp.separation.hpss import split_sustained_transient
 from stemapp.separation.pipeline import ProgressCallback, SeparationError, separate_track
+from stemapp.separation.refine import HpssFunc, run_refine_job
 
 log = logging.getLogger(__name__)
 
@@ -52,10 +54,13 @@ def run_job(
     *,
     encoder: FfmpegRunner | None = None,
     beat_analyzer: BeatAnalyzer | None = None,
+    hpss: HpssFunc | None = None,
 ) -> int:
     """登録済みのジョブを実行する（子プロセスの本体。テストではそのまま呼べる）。
 
     beat_analyzer を渡すと、配信用データの後に拍を解析する（None なら拍の段階を飛ばす）。
+    詳細分割（job_kind=refine）のジョブは `run_refine_job` で実行する。hpss は HPSS の関数
+    （None なら librosa の本物）。
     """
     engine = make_engine(settings.db_path)
     factory = make_session_factory(engine)
@@ -80,6 +85,20 @@ def run_job(
                 analyze_job_beats(s, st, jid, beat_analyzer)
 
             try:
+                if job.job_kind == "refine":
+                    # 詳細分割（T07）: 配信用データまで作る（拍は曲ごとなので作らない）
+                    run_refine_job(
+                        session,
+                        settings,
+                        job_id,
+                        separator,
+                        device=device,
+                        hpss=hpss or split_sustained_transient,
+                        postprocess=lambda s, st, jid, progress: create_delivery_files(
+                            s, st, jid, encoder=encoder, progress=progress
+                        ),
+                    )
+                    return EXIT_DONE
                 separate_track(
                     session,
                     settings,
@@ -143,16 +162,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     encoder: FfmpegRunner | None = None
     separator: Separator
     beat_analyzer: BeatAnalyzer
+    hpss: HpssFunc | None = None
     if args.fake:
         from stemapp.beats.fake import FakeBeatAnalyzer
-        from stemapp.seed import SW
-        from stemapp.separation.fake import FakeSeparator
+        from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, SW
+        from stemapp.separation.fake import FakeSeparator, fake_hpss
 
         beat_analyzer = FakeBeatAnalyzer()
         separator = FakeSeparator(
-            delay_sec=args.fake_delay, fail_models={SW} if args.fake_fail else ()
+            delay_sec=args.fake_delay,
+            fail_models={SW, DRUMSEP, MALE_FEMALE, ASPIRATION} if args.fake_fail else (),
         )
         encoder = fake_encoder
+        hpss = fake_hpss
     else:
         separator = _real_separator(settings)
         beat_analyzer = _real_beat_analyzer(settings)
@@ -160,7 +182,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name in args.preimport:
             importlib.import_module(name)
         return run_job(
-            settings, args.job_id, separator, encoder=encoder, beat_analyzer=beat_analyzer
+            settings, args.job_id, separator, encoder=encoder, beat_analyzer=beat_analyzer,
+            hpss=hpss,
         )
     except Exception:
         log.exception("job %d で想定外のエラー", args.job_id)
