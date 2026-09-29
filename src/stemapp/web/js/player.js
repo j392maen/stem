@@ -624,6 +624,8 @@ export class PlayerView {
 
   async togglePlay() {
     if (!this.ready) return;
+    // 省メモリの読み込み中に押した: 読み込みの後に勝手に鳴らさない（押した結果を優先する）
+    if (this.tempo) this.tempo.resumeAfterLoad = false;
     if (this.engine.playing) this.engine.pause();
     else await this.engine.play();
     this.updateTransport();
@@ -1089,6 +1091,8 @@ export class PlayerView {
         if (this.engine) this.engine.setVolume(v);
         try { localStorage.setItem(VOLUME_KEY, String(v)); } catch { /* 保存できなくても動く */ }
       },
+      // 動かし終わったらフォーカスを外す（Space・数字キーなどをプレイヤーに戻す）
+      onchange: (e) => e.target.blur(),
     });
     const transport = el("section", { class: "panel transport" },
       el("button", {

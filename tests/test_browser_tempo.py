@@ -127,6 +127,11 @@ def test_tempo_pure_functions(page: Any, server: LiveServer) -> None:  # noqa: F
           ],
           key: T.ratioKey(1.1),
           tap: [B.tapSongTime(10, 0.05, 1), B.tapSongTime(10, 0.05, 1.2)],
+          // 幅に入らない倍率なら幅を広げる（2.0 倍は ±50 のまま端に寄せる）
+          widen: [T.rangeFor(1.05, 8), T.rangeFor(1.1, 8), T.rangeFor(0.7, 16), T.rangeFor(2.0, 8),
+                  T.rangeFor(1.03, 50)],
+          lowmem: [T.defaultLowMemory(true, 100), T.defaultLowMemory(false, 100),
+                   T.defaultLowMemory(false, 600)],
         };
     }"""
     )
@@ -144,6 +149,8 @@ def test_tempo_pure_functions(page: Any, server: LiveServer) -> None:  # noqa: F
     assert res["key"] == "1.100"
     # タップの出力遅延は「遅延 × 速さ」を曲の時刻から引く
     assert res["tap"] == [pytest.approx(9.95), pytest.approx(9.94)]
+    assert res["widen"] == [8, 16, 50, 50, 50]
+    assert res["lowmem"] == [True, False, True]
 
 
 def test_pitch_mode_rate_keeps_sync(page: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811
@@ -386,3 +393,65 @@ def test_tempo_screens_phone(browser: Any, server: LiveServer, tmp_path: Path) -
     finally:
         ctx.close()
 
+
+def test_swap_continuity_range_blur_lowmem(
+    page: Any, server: LiveServer, tmp_path: Path  # noqa: F811
+) -> None:
+    track_id, _ = _done_track(server, tmp_path, seconds=24.0)
+    _open(page, server, track_id)
+    page.click("#play-btn")
+    page.wait_for_function(f"() => {VIEW}.engine.position > 0.5")
+
+    # 音声の差し替え（setBuffers）の前後で位置が戻らず飛ばない（繰り返し・欠けが無い）
+    trace = page.evaluate(
+        """async () => {
+        const e = window.__stemapp.view.engine;
+        const bufs = Object.fromEntries([...e.tracks].map(([c, t]) => [c, t.buffer]));
+        const out = [];
+        for (let i = 0; i < 40; i++) {
+          if (i === 20) e.setBuffers(bufs, 1, 1);
+          out.push([e.ctx.currentTime, e.position]);
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        return out;
+    }"""
+    )
+    steps = [(p1 - p0) - (c1 - c0) for (c0, p0), (c1, p1) in zip(trace, trace[1:], strict=False)]
+    assert all(abs(d) < 0.005 for d in steps), steps  # 実時間どおりに進む（5ms 未満の誤差）
+
+    # スライダーの幅を超える倍率なら幅が自動で広がる
+    assert page.get_attribute("#tp-range .seg-btn[data-value='8']", "aria-pressed") == "true"
+    page.evaluate(f"() => {VIEW}.tempo.setRatio(1.3)")
+    assert page.get_attribute("#tp-range .seg-btn[data-value='50']", "aria-pressed") == "true"
+    assert page.input_value("#tp-slider") == "300"
+
+    # ボタン・スライダーを操作した後はフォーカスが外れ、キー操作がプレイヤーに戻る
+    page.click("#tp-plus")
+    assert page.evaluate("() => document.activeElement === document.body")
+    page.keyboard.press("Space")
+    page.wait_for_function(f"() => !{VIEW}.engine.playing")
+    page.locator("#tp-slider").focus()
+    page.keyboard.press("ArrowLeft")  # 動かし終わり（change）で外れる
+    assert page.evaluate("() => document.activeElement !== document.querySelector('#tp-slider')")
+    page.keyboard.press("Space")
+    page.wait_for_function(f"() => {VIEW}.engine.playing")
+
+    # 省メモリ: 前の組を捨ててから読み込み、終わったら同じ位置から続ける
+    page.evaluate(f"() => {VIEW}.tempo.setRatio(1)")
+    page.click("#tp-mode .seg-btn[data-value='keep']")
+    page.check("#tp-lowmem")
+    page.evaluate(f"() => {VIEW}.tempo.setRatio(1.2)")
+    _wait_status(page, "ピッチを保って再生中（×1.200）")
+    page.wait_for_function(f"() => {VIEW}.engine.playing")
+    assert _engine(page, "e.bufScale") == pytest.approx(1.2)
+    lengths = _engine(page, BUF_LENGTHS)
+    assert lengths and all(d == pytest.approx(24.0 / 1.2, abs=0.01) for d in lengths)
+    assert _speed_over(page) == pytest.approx(1.2, abs=0.05)
+    # 読み込み中に別の組に変えると、前の読み込みは止まる（ピッチも変わる方式 = 元の音声へ）
+    page.evaluate(f"() => {{ {VIEW}.tempo.setMode('pitch'); {VIEW}.tempo.setMode('keep'); }}")
+    page.wait_for_function(
+        f"() => {VIEW}.engine.bufScale === 1.2 && {VIEW}.tempo.activeKey === '1.200'"
+        f" && {VIEW}.tempo.loadingKey === null && {VIEW}.engine.playing",
+        timeout=10_000,
+    )
+    assert not page.errors  # type: ignore[attr-defined]
