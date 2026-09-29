@@ -27,6 +27,7 @@ from typing import Any
 
 import soundfile as sf
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from stemapp.config import Settings
@@ -164,29 +165,68 @@ def request_render(session: Session, job_id: int, ratio: float) -> RenderRequest
         raise TempoNotFound("ジョブが見つかりません。")
     if job.status != DONE:
         raise TempoConflict("分割が終わっていないジョブです。速度を変えた音声は作れません。")
-    render = session.scalars(
-        select(TempoRender).where(TempoRender.job_id == job_id, TempoRender.ratio == r)
-    ).first()
-    now = _utcnow()
-    if render is not None and render.status in (DONE, QUEUED, RUNNING):
-        render.last_used_at = now
+    # ワーカーの片付け（キャッシュの上限）や別の要求と同時になっても 500 にしないよう、
+    # 行の更新は条件付きの update の件数で判定し、作成と重なったら読み直す
+    for _attempt in range(3):
+        now = _utcnow()
+        render = session.scalars(
+            select(TempoRender).where(TempoRender.job_id == job_id, TempoRender.ratio == r)
+        ).first()
+        if render is None:
+            # 別の処理が消した行の古いオブジェクトを手放す（同じ番号が使い回されることがある）
+            for obj in [o for o in session.identity_map.values() if isinstance(o, TempoRender)]:
+                session.expunge(obj)
+            render = TempoRender(
+                job_id=job_id, ratio=r, pitch_mode=PITCH_KEEP, status=QUEUED, progress=0.0,
+                stage=STAGE_QUEUED, cancel_requested=False, created_at=now, last_used_at=now,
+            )
+            session.add(render)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()  # 同じ倍率を同時に登録した: 読み直す
+                continue
+            log.info("速度を変えた音声の作成を登録しました（job %d, %s 倍）。",
+                     job_id, ratio_key(r))
+            return RenderRequest(render, True)
+        render_id = render.render_id
+        res = session.execute(
+            update(TempoRender)
+            .where(
+                TempoRender.render_id == render_id,
+                TempoRender.status.in_((DONE, QUEUED, RUNNING)),
+            )
+            .values(last_used_at=now)
+        )
+        if res.rowcount == 1:  # type: ignore[attr-defined]
+            session.commit()
+            session.expire_all()
+            fresh = session.get(TempoRender, render_id)
+            if fresh is not None:
+                return RenderRequest(fresh, False)
+            continue
+        # 失敗・キャンセルしたもの: 作成待ちに戻す
+        res = session.execute(
+            update(TempoRender)
+            .where(
+                TempoRender.render_id == render_id,
+                TempoRender.status.in_((FAILED, CANCELED)),
+            )
+            .values(
+                status=QUEUED, progress=0.0, stage=STAGE_QUEUED, error_message=None,
+                cancel_requested=False, created_at=now, started_at=None, finished_at=None,
+                last_used_at=now,
+            )
+        )
         session.commit()
-        return RenderRequest(render, False)
-    if render is None:
-        render = TempoRender(job_id=job_id, ratio=r, pitch_mode=PITCH_KEEP)
-        session.add(render)
-    render.status = QUEUED
-    render.progress = 0.0
-    render.stage = STAGE_QUEUED
-    render.error_message = None
-    render.cancel_requested = False
-    render.created_at = now
-    render.started_at = None
-    render.finished_at = None
-    render.last_used_at = now
-    session.commit()
-    log.info("速度を変えた音声の作成を登録しました（job %d, %s 倍）。", job_id, ratio_key(r))
-    return RenderRequest(render, True)
+        session.expire_all()
+        if res.rowcount == 1:  # type: ignore[attr-defined]
+            fresh = session.get(TempoRender, render_id)
+            if fresh is not None:
+                log.info("速度を変えた音声の作成を登録し直しました（render %d）。", render_id)
+                return RenderRequest(fresh, True)
+        # 行が消えた・状態が変わった: 読み直す
+    raise TempoConflict("ほかの操作と重なりました。もう一度お試しください。")
 
 
 def cancel_render(session: Session, settings: Settings, render_id: int) -> TempoRender:
@@ -446,6 +486,26 @@ def _finish(
 
 
 # --- キャッシュの片付け -------------------------------------------------------------------
+
+
+def invalidate_job_tempo(session: Session, settings: Settings, job_id: int) -> int:
+    """ジョブの速度変更のキャッシュ（TEMPO_RENDER の全行と `data/cache/tempo/<job_id>`）を消す。
+
+    stem の音声や構成が変わった後（配信用データの作り直し、詳細分割など）に呼ぶ。古い音声を
+    伸縮したものを使い続けないため。作成中のものは行が消えるので、ワーカーが止めて片付ける。
+    commit まで行う。消した行の数を返す。
+    """
+    ids = list(
+        session.scalars(select(TempoRender.render_id).where(TempoRender.job_id == job_id))
+    )
+    if ids:
+        session.execute(delete(TempoRendition).where(TempoRendition.render_id.in_(ids)))
+        session.execute(delete(TempoRender).where(TempoRender.render_id.in_(ids)))
+    session.commit()
+    shutil.rmtree(job_tempo_dir(settings, job_id), ignore_errors=True)
+    if ids:
+        log.info("job %d の速度変更のキャッシュを消しました（%d 件）。", job_id, len(ids))
+    return len(ids)
 
 
 def remove_render(session: Session, settings: Settings, render: TempoRender) -> None:
