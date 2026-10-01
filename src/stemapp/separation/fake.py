@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from stemapp.audio import read_audio
+from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE
 from stemapp.separation.base import DEVICE_CUDA, OPT_CHUNK_SCALE
 
 # 合計 0.97（1 にならない）
@@ -29,6 +30,17 @@ DEFAULT_MULTISTEM_COEFS: dict[str, float] = {
 DEFAULT_VOCALS_COEF = 0.40  # vocals モデルの vocals（instrumental は 1 − これ）
 DEFAULT_KARAOKE_COEF = 0.70  # karaoke の lead（backing は 0.25 にして合計をずらす）
 KARAOKE_BACKING_COEF = 0.25
+# 詳細分割（role=refine）の出力（stem 名に対応づけた後の名前）と係数。合計は 1 にしない
+# （残り＝親 − 子の合計 が 0 にならないように）
+DEFAULT_REFINE_COEFS: dict[str, dict[str, float]] = {
+    DRUMSEP: {
+        "kick": 0.20, "snare": 0.15, "toms": 0.05, "hihat": 0.10, "ride": 0.05, "crash": 0.05,
+    },
+    MALE_FEMALE: {"male": 0.45, "female": 0.35},
+    ASPIRATION: {"breath": 0.08, "no_breath": 0.85},
+}
+# fake_hpss の係数（持続音・短い音）
+FAKE_HPSS_COEFS: dict[str, float] = {"sustained": 0.5, "transient": 0.2}
 
 
 @dataclass(frozen=True)
@@ -97,6 +109,10 @@ class FakeSeparator:
         elif role == "karaoke":
             c = self.model_coefs.get(model_filename, DEFAULT_KARAOKE_COEF)
             coefs = {"lead_vocal": c, "backing_vocal": KARAOKE_BACKING_COEF}
+        elif role == "refine":
+            if model_filename not in DEFAULT_REFINE_COEFS:
+                raise ValueError(f"詳細分割の係数が無いモデル: {model_filename}")
+            coefs = DEFAULT_REFINE_COEFS[model_filename]
         else:
             raise ValueError(f"未知の role: {role}")
         out: dict[str, np.ndarray] = {}
@@ -112,3 +128,13 @@ class FakeSeparator:
 
     def peak_memory_mb(self) -> float | None:
         return self.peak_mb
+
+
+def fake_hpss(
+    x: np.ndarray, *, sample_rate: int = 44100, progress: Any = None
+) -> dict[str, np.ndarray]:
+    """テスト用の HPSS の代わり（librosa 不要）: 入力に固定の係数を掛ける。"""
+    if progress is not None:
+        progress(0.5, "分けています（テスト用）")
+    x = np.asarray(x, dtype=np.float32)
+    return {name: (x * np.float32(c)).astype(np.float32) for name, c in FAKE_HPSS_COEFS.items()}

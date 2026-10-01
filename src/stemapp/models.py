@@ -156,6 +156,10 @@ class SeparationJob(Base):
     input_stem_id: Mapped[int | None] = mapped_column(
         ForeignKey("stem.stem_id", ondelete="SET NULL", use_alter=True)
     )  # refine のみ
+    # 詳細分割の方法（refine のみ）。MODEL の行（HPSS も architecture="hpss" の行）
+    refine_model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model.model_id", ondelete="SET NULL")
+    )
     requested_by: Mapped[int | None] = mapped_column(
         ForeignKey("device.device_id", ondelete="SET NULL")
     )
@@ -188,6 +192,8 @@ class SeparationJob(Base):
     # stem の保存フォルダ（データフォルダからの相対パス。例 "stems/曲名/standard"）。
     # 保存を始めるときに一度決める（`stemapp.stem_folders`）。NULL は T13 より前の stems/<job_id>
     output_dir: Mapped[str | None] = mapped_column(Text)
+    # 処理は終わったが注意がある（詳細分割で残りが 24bit の範囲を超えた等）。NULL=なし
+    warning: Mapped[str | None] = mapped_column(Text)
 
 
 class Stem(Base):

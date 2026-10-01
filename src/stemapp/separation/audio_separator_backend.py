@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 
 from stemapp.audio import read_audio
+from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE
 from stemapp.separation.base import (
     DEVICE_CPU,
     DEVICE_CUDA,
@@ -60,12 +61,50 @@ OUTPUT_NAME_MAP: dict[str, dict[str, str]] = {
     },
 }
 
+# 詳細分割（role=refine）はモデルごとに出力名が違うので、モデルのファイル名で引く。
+# yaml（training.instruments）で確かめた名前だけを載せる（T07）:
+# - MDX23C-DrumSep-aufr33-jarredou.ckpt（config_drumsep_mdx23c.yaml）
+#   → kick, snare, toms, hh, ride, crash
+# - bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt（config_chorus_male_female_bs_roformer.yaml）
+#   → male, female
+# - aspiration_mel_band_roformer_sdr_18.9845.ckpt（config_aspiration_mel_band_roformer.yaml）
+#   → aspiration, other（other は「息以外」。子には使わず、残りは親 − 息 で作る）
+ROLE_REFINE = "refine"
+REFINE_OUTPUT_NAME_MAP: dict[str, dict[str, str]] = {
+    DRUMSEP: {
+        "kick": "kick",
+        "snare": "snare",
+        "toms": "toms",
+        "hh": "hihat",
+        "ride": "ride",
+        "crash": "crash",
+    },
+    MALE_FEMALE: {
+        "male": "male",
+        "female": "female",
+    },
+    ASPIRATION: {
+        "aspiration": "breath",
+        "other": "no_breath",
+    },
+}
+
 MIN_SEGMENT = 32  # チャンクを縮めるときの下限（dim_t）
 
 
-def map_outputs(role: str, outputs: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """audio-separator の出力名を stem 名に置き換える。表に無い名前はエラー。"""
-    table = OUTPUT_NAME_MAP.get(role)
+def map_outputs(
+    role: str, outputs: Mapping[str, np.ndarray], model_filename: str | None = None
+) -> dict[str, np.ndarray]:
+    """audio-separator の出力名を stem 名に置き換える。表に無い名前はエラー。
+
+    role=refine のときは model_filename で表を選ぶ。
+    """
+    if role == ROLE_REFINE:
+        table = REFINE_OUTPUT_NAME_MAP.get(model_filename or "")
+        if table is None:
+            raise ValueError(f"詳細分割の出力名の表に無いモデルです: {model_filename}")
+    else:
+        table = OUTPUT_NAME_MAP.get(role)
     if table is None:
         raise ValueError(f"未知の role: {role}")
     mapped: dict[str, np.ndarray] = {}
@@ -213,7 +252,7 @@ class AudioSeparatorBackend:
                 return {k: np.asarray(v, dtype=np.float32).T for k, v in src.items()}
 
             outputs = tta_combine(demix, mix) if options.get(OPT_TTA) else demix(mix)
-            mapped = map_outputs(role, outputs)
+            mapped = map_outputs(role, outputs, model_filename)
             return {k: _fit(v, n) for k, v in mapped.items()}
         finally:
             self._release(sep, instance)

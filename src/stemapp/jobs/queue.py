@@ -18,10 +18,17 @@ from sqlalchemy.orm import Session
 from stemapp.config import Settings
 from stemapp.exports.service import export_ids_for_jobs, remove_export_dirs
 from stemapp.library import find_done_job
-from stemapp.models import SeparationJob, Track
+from stemapp.models import SeparationJob, Stem, Track
 from stemapp.separation.pipeline import delete_job_stems, job_tmp_dir, load_plan
+from stemapp.separation.refine import (
+    ExportsBusy,
+    active_exports_of_jobs,
+    clean_orphan_refine_dirs,
+    take_exports_of_jobs,
+)
 from stemapp.stem_folders import remove_job_dir
-from stemapp.tempo.service import remove_job_tempo_dirs
+from stemapp.stem_view import root_job_id
+from stemapp.tempo.service import invalidate_job_tempo, remove_job_tempo_dirs
 
 log = logging.getLogger(__name__)
 
@@ -65,9 +72,14 @@ class EnqueueResult:
 def active_job(
     session: Session, track_id: int, preset_id: int | None = None
 ) -> SeparationJob | None:
-    """その曲の queued / running のジョブ（古いもの）。preset_id でプリセットを絞る。"""
+    """その曲の queued / running の分割（full）ジョブ（古いもの）。preset_id でプリセットを絞る。
+
+    詳細分割（refine）のジョブは含めない。
+    """
     stmt = select(SeparationJob).where(
-        SeparationJob.track_id == track_id, SeparationJob.status.in_(ACTIVE_STATUSES)
+        SeparationJob.track_id == track_id,
+        SeparationJob.job_kind == "full",
+        SeparationJob.status.in_(ACTIVE_STATUSES),
     )
     if preset_id is not None:
         stmt = stmt.where(SeparationJob.preset_id == preset_id)
@@ -144,17 +156,76 @@ def request_cancel(session: Session, job_id: int) -> SeparationJob:
     return job
 
 
+def refine_descendants(session: Session, job_id: int) -> list[SeparationJob]:
+    """そのジョブの stem を詳細分割したジョブ（子の子も。深い順）。"""
+    out: list[SeparationJob] = []
+    frontier = [job_id]
+    seen = {job_id}
+    while frontier:
+        found = [
+            j
+            for j in session.scalars(
+                select(SeparationJob)
+                .where(
+                    SeparationJob.job_kind == "refine",
+                    SeparationJob.input_stem_id.in_(
+                        select(Stem.stem_id).where(Stem.job_id.in_(frontier))
+                    ),
+                )
+                .order_by(SeparationJob.job_id)
+            )
+            if j.job_id not in seen
+        ]
+        seen.update(j.job_id for j in found)
+        out.extend(found)
+        frontier = [j.job_id for j in found]
+    return list(reversed(out))
+
+
 def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJob:
     """終わったジョブ（done / failed / canceled）を消す。stem・配信用データ・ファイルも消える。
 
-    分割待ち・分割中、配信用データの作成待ち・作成中のジョブは JobConflict。
+    その stem を詳細分割したジョブ（refine）も一緒に消す。
+    分割待ち・分割中、配信用データの作成待ち・作成中のジョブ（詳細分割を含む）は JobConflict。
     消したジョブ（DB からは消えた後の値）を返す。
     """
     job = session.get(SeparationJob, job_id)
     if job is None:
         raise JobNotFound(f"ジョブが見つかりません（job {job_id}）。")
+    children = refine_descendants(session, job_id)
+    if children and (
+        job.status in ACTIVE_STATUSES or job.postprocess_status in ACTIVE_STATUSES
+    ):
+        raise JobConflict("分割中・配信用データの作成中のジョブは削除できません。")
+    if any(c.status in ACTIVE_STATUSES for c in children):
+        raise JobConflict(
+            "この分け方の stem を「もっと分ける」処理が分割待ち・分割中です。"
+            "キャンセルしてから削除してください。"
+        )
+    refine_ids = [c.job_id for c in children] + ([job_id] if job.job_kind == "refine" else [])
+    if active_exports_of_jobs(session, refine_ids):
+        # 子の stem が消えると EXPORT_ITEM だけが消え、中身の欠けた書き出しが作られてしまう
+        raise JobConflict(
+            "この stem を使った書き出しが作成待ち・作成中です。書き出しが終わってから"
+            "削除してください。"
+        )
+    for child in children:
+        delete_job(session, settings, child.job_id)
     output_dir = job.output_dir
     export_ids = export_ids_for_jobs(session, [job_id])
+    # 詳細分割を戻すと元の分け方の葉が変わる（速度変更のキャッシュを消す。done のときだけ）
+    tempo_owner = (
+        root_job_id(session, job_id)
+        if job.job_kind == "refine" and job.status == DONE
+        else None
+    )
+    if job.job_kind == "refine":
+        # 詳細分割の子を使った書き出しは full ジョブの行に付くので、stem から探して一緒に消す
+        try:
+            export_ids += take_exports_of_jobs(session, [job_id])
+        except ExportsBusy as e:
+            session.rollback()
+            raise JobConflict(str(e)) from e
     # 確かめてから消すまでの間にワーカーが取り出さないよう、条件付きで消す
     res = session.execute(
         delete(SeparationJob).where(
@@ -180,6 +251,8 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
     remove_export_dirs(settings, export_ids)  # 書き出したファイル（data/exports/<id>）
     remove_job_tempo_dirs(settings, [job_id])  # 速度を変えた音声（data/cache/tempo/<job_id>）
+    if tempo_owner is not None and tempo_owner != job_id:
+        invalidate_job_tempo(session, settings, tempo_owner)
     log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
     return job
 
@@ -271,6 +344,9 @@ def recover_interrupted_jobs(session: Session, settings: Settings) -> list[int]:
     removed = clean_stale_tmp(session, settings)
     if removed:
         log.info("残っていた一時フォルダを消しました: %s", removed)
+    orphans = clean_orphan_refine_dirs(session, settings)
+    if orphans:
+        log.info("使われていない詳細分割のフォルダを消しました: %s", orphans)
     return ids
 
 

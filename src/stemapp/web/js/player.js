@@ -8,6 +8,7 @@ import { BeatGrid, barLoop, formatBpm } from "./beats.js";
 import { Engine, clampTime } from "./engine.js";
 import { Exporter } from "./export.js";
 import { parsePeaks } from "./peaks.js";
+import { RefineUI } from "./refine.js";
 import * as S from "./selection.js";
 import { COARSE_STEP, FINE_STEP, TempoPanel } from "./tempo.js";
 import { confirmDialog, el, formatTime, icon, ICONS, promptDialog, toast } from "./ui.js";
@@ -165,6 +166,7 @@ export class PlayerView {
     }
     this.tree = S.buildTree(this.job.stems);
     this.sel = S.allOn(this.tree);
+    this.refine = new RefineUI(this); // 「もっと分ける」（web/js/refine.js）
     this.loading = true;
     this.render();
     document.addEventListener("keydown", this.onKey);
@@ -489,6 +491,8 @@ export class PlayerView {
     // 書き出しメニューは表示中のジョブに結びつくので、分け方の切り替え（remount）でも作り直す
     if (this.exporter) this.exporter.dispose();
     this.exporter = null;
+    if (this.refine) this.refine.dispose();
+    this.refine = null;
   }
 
   // --- 再生 -------------------------------------------------------------------
@@ -719,7 +723,7 @@ export class PlayerView {
   }
 
   applyPreset(preset) {
-    const { sel, gainsDb } = S.presetToSelection(this.tree, preset, this.groups);
+    const { sel, gainsDb } = S.presetToSelection(this.tree, preset, this.groups, this.stemTypes);
     if (!sel.size) toast("この曲には、この組み合わせの stem がありません。");
     this.setSelection(sel, { gainsDb, presetId: preset.listen_preset_id });
   }
@@ -1209,6 +1213,7 @@ export class PlayerView {
     for (const b of box.querySelectorAll(".stem-btn")) {
       b.style.setProperty("--c", this.tree.byCode.get(b.dataset.code).color);
     }
+    if (this.refine) this.refine.decorate(box);
     this.renderSelectionState();
   }
 
