@@ -1,11 +1,15 @@
 // 速度の変更（T11）。
 //
 // - ピッチも変わる方式（pitch）: 全 stem の playbackRate を同じ時刻で r にする（engine.setRate）。すぐ効く。
-// - ピッチを保つ方式（keep）: サーバーで各 stem を r 倍に伸縮した音声を作ってもらい（POST
+// - ピッチを保つ・すぐ（instant。T11c。PC 向け）: 元の音声を playbackRate = r で鳴らし、全 stem を混ぜた音を
+//   ブラウザ内の伸縮器（signalsmith-stretch）で元の高さに戻す（engine.setPitchLock）。スライダーを動かすと
+//   すぐ変わる。r = 1 では伸縮器を通さない（スライダーを動かしている間は 1 を通っても通したまま）。
+// - ピッチを保つ・高音質（keep）: サーバーで各 stem を r 倍に伸縮した音声を作ってもらい（POST
 //   /api/jobs/{id}/tempo、進み具合は SSE）、できたら同じ曲の時刻から差し替える（engine.setBuffers）。
 //   作っている間は「元の速度のまま（今の音のまま）」か「ピッチを変えて指定の速度で」鳴らす（設定）。
 // - 拍・キュー・ループ・波形・再生位置はすべて元の曲の時刻のまま（engine が音声データ上の時刻に直す）。
 // - 曲ごとの速度・方式・スライダーの幅はブラウザ（localStorage）に保存し、次に開いたときに戻す。
+//   方式の既定（保存が無いとき）: PC（ポインタが細かく画面が広い）は instant、スマホは keep。
 // - メモリ: 音声は「今鳴らしている組（元の音声 or ある倍率の伸縮済み）」と、読み込み中の組の最大2組。
 //   読み込み中に別の組に変えたら、前の読み込みは止める（AbortController）。
 //   省メモリ（スマホ幅・長い曲では既定で ON。画面で切り替えられる）: 前の組を捨ててから読み込む
@@ -20,7 +24,7 @@ export const MAX_RATIO = 2.0;
 export const FINE_STEP = 0.001; // ± ボタン（0.1%）
 export const COARSE_STEP = 0.01; // Shift＋キー（1%）
 export const RANGES = [8, 16, 50]; // スライダーの幅（±%）
-export const MODES = ["pitch", "keep"];
+export const MODES = ["pitch", "instant", "keep"];
 export const PENDING = ["original", "pitch"]; // 作成中の鳴らし方
 const KEY_PREFIX = "stemapp.tempo.";
 const PENDING_KEY = "stemapp.tempo.pending";
@@ -75,19 +79,31 @@ export function rangeFor(r, current) {
   return RANGES.find((n) => need <= n + 1e-9) ?? RANGES[RANGES.length - 1];
 }
 
+/** 方式の既定: PC（ポインタが細かく、画面が広い）は「ピッチを保つ・すぐ」、スマホはサーバーで作る方式。 */
+export function defaultMode(finePointer, narrow) {
+  return finePointer && !narrow ? "instant" : "keep";
+}
+
+/** この画面の方式の既定。 */
+function screenDefaultMode() {
+  const mq = (q) => typeof window !== "undefined" && !!window.matchMedia && window.matchMedia(q).matches;
+  const worklet = typeof window !== "undefined" && typeof window.AudioWorkletNode === "function";
+  return worklet ? defaultMode(mq("(pointer: fine)"), mq("(max-width: 640px)")) : "keep";
+}
+
 /** 省メモリの既定: スマホ幅か長い曲なら ON。 */
 export function defaultLowMemory(narrow, durationSec) {
   return !!narrow || (Number(durationSec) || 0) > LONG_TRACK_SEC;
 }
 
-export function loadTempoState(trackId) {
-  const def = { ratio: 1, mode: "pitch", range: 8 };
+export function loadTempoState(trackId, fallbackMode = screenDefaultMode()) {
+  const def = { ratio: 1, mode: fallbackMode, range: 8 };
   try {
     const raw = JSON.parse(localStorage.getItem(KEY_PREFIX + trackId) || "null");
     if (!raw || typeof raw !== "object") return def;
     return {
       ratio: clampRatio(raw.ratio ?? 1),
-      mode: MODES.includes(raw.mode) ? raw.mode : "pitch",
+      mode: MODES.includes(raw.mode) ? raw.mode : fallbackMode,
       range: RANGES.includes(raw.range) ? raw.range : 8,
     };
   } catch { return def; }
@@ -148,6 +164,8 @@ export class TempoPanel {
     this.source = null; // EventSource
     this.requestTimer = 0;
     this.urls = null; // 元の音声の URL { code: url }
+    this.dragging = false; // スライダーを動かしている間（伸縮器を外さない）
+    this.stretchState = "idle"; // ブラウザ内の伸縮器: idle / loading / ready / failed
     this.disposed = false;
     this.root = this.build();
     this.refresh();
@@ -167,7 +185,10 @@ export class TempoPanel {
       })));
     this.modeSeg = seg("速度の方式", [
       ["pitch", "ピッチも変わる", "再生の速さをそのまま変えます（すぐ効く。音の高さも変わる）"],
-      ["keep", "ピッチを保つ", "サーバーで音の高さを変えずに伸縮した音声を作ります（数秒〜十数秒かかる）"],
+      ["instant", "ピッチを保つ・すぐ（PC）",
+        "ブラウザの中で音の高さを戻します（すぐ効く。PC 向け。音が約 0.1 秒遅れて聞こえる）"],
+      ["keep", "ピッチを保つ・高音質",
+        "サーバーで音の高さを変えずに伸縮した音声を作ります（数秒〜十数秒かかる。スマホ向け）"],
     ], (v) => this.setMode(v));
     this.modeSeg.id = "tp-mode";
     this.rangeSeg = seg("スライダーの幅", RANGES.map((n) => [n, `±${n}`, `スライダーの幅を ±${n}% にします`]),
@@ -176,9 +197,16 @@ export class TempoPanel {
     this.slider = el("input", {
       type: "range", class: "tp-slider", id: "tp-slider", step: "1", value: "0",
       "aria-label": "速度",
-      oninput: (e) => this.setRatio(sliderToRatio(e.target.value), { fromSlider: true }),
+      oninput: (e) => {
+        this.dragging = true;
+        this.setRatio(sliderToRatio(e.target.value), { fromSlider: true });
+      },
       // 動かし終わったらフォーカスを外す（Space・数字キーなどをプレイヤーに戻す）
-      onchange: (e) => e.target.blur(),
+      onchange: (e) => {
+        e.target.blur();
+        this.dragging = false;
+        this.apply(); // 1.000 で離したら伸縮器を外す
+      },
       ondblclick: () => this.setRatio(1),
     });
     this.readout = el("span", { class: "tp-readout", id: "tp-readout", text: "±0.0%" });
@@ -200,6 +228,8 @@ export class TempoPanel {
       this.nudge(sign * (e.shiftKey ? COARSE_STEP : FINE_STEP));
     };
     this.status = el("span", { class: "tp-status", id: "tp-status", role: "status" });
+    this.instStatus = el("span", { class: "tp-status", id: "tp-inst-status", role: "status" });
+    this.instRow = el("div", { class: "tp-row tp-keep tp-instant", id: "tp-instant" }, this.instStatus);
     this.bar = el("div", { class: "progress tp-progress", id: "tp-progress", hidden: true },
       el("span", { style: { width: "0%" } }));
     this.retryBtn = el("button", {
@@ -251,6 +281,7 @@ export class TempoPanel {
         el("label", { class: "tp-target" }, el("span", { class: "muted", text: "目標" }), this.bpmInput,
           el("span", { class: "muted", text: "BPM" })),
         this.resetBtn),
+      this.instRow,
       this.keepRow);
   }
 
@@ -279,6 +310,7 @@ export class TempoPanel {
   }
 
   refreshStatus() {
+    this.refreshInstant();
     const keep = this.mode === "keep" && this.ratio !== 1;
     this.keepRow.hidden = this.mode !== "keep";
     const r = this.render;
@@ -317,6 +349,21 @@ export class TempoPanel {
     this.retryBtn.hidden = !(keep && mine && (r.status === "failed" || r.status === "canceled"));
   }
 
+  /** ピッチを保つ・すぐ の状態表示。 */
+  refreshInstant() {
+    this.instRow.hidden = this.mode !== "instant";
+    if (this.instRow.hidden) return;
+    const e = this.engine;
+    const st = this.stretchState;
+    let text;
+    if (st === "failed") text = "このブラウザでは使えません（ピッチも変わる方式で再生中）";
+    else if (e && e.lock) text = `ピッチを保って再生中（ブラウザ内・音の遅れ ${Math.round(e.latency * 1000)}ms）`;
+    else if (st === "loading" && this.ratio !== 1) text = "準備中…";
+    else text = "元の速度です（速度を変えるとすぐ反映）";
+    this.instStatus.textContent = text;
+    this.instStatus.classList.toggle("error-text", st === "failed");
+  }
+
   /** プレイヤーの BPM 表示の補助（目標 BPM の欄の目安）。 */
   syncBpm(bpm) {
     if (document.activeElement === this.bpmInput) return;
@@ -348,6 +395,7 @@ export class TempoPanel {
   setMode(mode) {
     if (!MODES.includes(mode) || mode === this.mode) return;
     this.mode = mode;
+    this.dragging = false;
     this.failedKeys.clear();
     this.save();
     this.refresh();
@@ -394,14 +442,47 @@ export class TempoPanel {
   start(urls) {
     this.urls = urls;
     this.activeKey = ORIGINAL;
+    if (this.mode === "instant") this.prepareStretch(); // 速度を変えたらすぐ効くよう先に作る
     this.refresh();
     this.apply();
+  }
+
+  /** ブラウザ内の伸縮器を作る（作り終えたら今の設定で合わせ直す）。 */
+  prepareStretch() {
+    const engine = this.engine;
+    if (!engine || this.stretchState === "loading" || this.stretchState === "failed") return;
+    if (engine.stretch) { this.stretchState = "ready"; return; }
+    this.stretchState = "loading";
+    engine.ensureStretch().then(() => {
+      if (this.disposed || engine !== this.engine) return;
+      this.stretchState = "ready";
+      this.apply();
+    }, (e) => {
+      if (this.disposed || engine !== this.engine) return;
+      this.stretchState = "failed";
+      toast(`ブラウザ内の伸縮を使えません: ${e.message || e}`);
+      this.apply();
+    });
+  }
+
+  /** 伸縮器を通すべきか（ピッチを保つ・すぐ で、元の音声を鳴らしていて、速度が 1 以外か動かし中）。 */
+  wantLock() {
+    return this.mode === "instant" && this.activeKey === ORIGINAL
+      && (this.ratio !== 1 || this.dragging) && this.stretchState !== "failed";
+  }
+
+  /** 伸縮器のつなぎ方を今の設定に合わせる。まだ作っていなければ作る。 */
+  syncLock() {
+    const engine = this.engine;
+    if (!this.wantLock()) { engine.setPitchLock(false); return; }
+    if (engine.stretch) { engine.setPitchLock(true); return; }
+    this.prepareStretch();
   }
 
   /** 今の設定で鳴らすべき組 { key, scale, rate, urls }。まだ無い（作成中）なら null。 */
   desired() {
     const r = this.ratio;
-    if (r === 1 || this.mode === "pitch") return { key: ORIGINAL, scale: 1, rate: r, urls: this.urls };
+    if (r === 1 || this.mode === "pitch" || this.mode === "instant") return { key: ORIGINAL, scale: 1, rate: r, urls: this.urls };
     const want = ratioKey(r);
     const rd = this.render;
     const original = { key: ORIGINAL, scale: 1, rate: 1, urls: this.urls };
@@ -430,10 +511,14 @@ export class TempoPanel {
       d = this.desired(); // 省メモリで何も持っていなければ元の音声になる
     }
     if (d && d.key === this.activeKey) {
-      engine.setRate(d.rate);
+      // ピッチを保つ・すぐ で伸縮器がまだ無いうちは、速度を変えずに待つ（音の高さが変わらないように）
+      const waiting = this.mode === "instant" && this.wantLock() && !engine.stretch;
+      if (!waiting) engine.setRate(d.rate);
+      this.syncLock();
       this.refreshStatus();
       return;
     }
+    engine.setPitchLock(false); // 音声の組を差し替える間は伸縮器を通さない
     // 目標の組がまだ無い・読み込み中: 今の組で鳴らしておく
     const speedNow = this.mode === "pitch" || this.ratio === 1 || this.pending === "pitch";
     if (speedNow) engine.setRate(this.ratio / engine.bufScale);
@@ -509,7 +594,7 @@ export class TempoPanel {
         // 読み込む間に設定が変わっていたら、今の設定で合わせ直す
         const now = this.desired();
         if (!now || now.key !== this.activeKey) this.apply();
-        else this.engine.setRate(now.rate);
+        else { this.engine.setRate(now.rate); this.syncLock(); }
       }
     }
   }
