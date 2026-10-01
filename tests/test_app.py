@@ -13,7 +13,10 @@ def test_health(settings: Settings) -> None:
     with TestClient(create_app(settings)) as client:
         res = client.get("/api/health")
     assert res.status_code == 200
-    assert res.json() == {"status": "ok", "version": __version__}
+    body = res.json()
+    assert body["status"] == "ok" and body["version"] == __version__
+    # ワーカーを起動していない（合図も見張りも無い）
+    assert body["worker"]["state"] == "unknown"
 
 
 def test_startup_creates_db_and_seeds(settings: Settings) -> None:

@@ -10,6 +10,7 @@ import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -39,6 +40,7 @@ from stemapp.db import init_db, make_engine, make_session_factory
 from stemapp.exports import ExportManager
 from stemapp.hosts import HostCheckMiddleware
 from stemapp.ingest.service import recover_interrupted_imports
+from stemapp.jobs.supervisor import worker_health
 from stemapp.seed import seed
 
 WEB_DIR: Path = Path(__file__).resolve().parent / "web"
@@ -144,8 +146,17 @@ def create_app(
     _install_error_handlers(app)
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+    def health(request: Request) -> dict[str, Any]:
+        """サーバーの状態と、ワーカー（分割・速度変更の作成）の状態。
+
+        ログインしていない（パスコードを設定していて Cookie が無い）ときは、ワーカーは状態だけ返す。
+        """
+        worker = worker_health(
+            settings.data_root,
+            getattr(app.state, "worker_supervisor", None),
+            detail=auth.is_authenticated(request),
+        )
+        return {"status": "ok", "version": __version__, "worker": worker}
 
     for module in (auth, imports, tracks, cues, files, folders, master, exports, diag, tempo):
         app.include_router(module.router)

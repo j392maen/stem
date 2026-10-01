@@ -116,7 +116,7 @@ def backup_dir_of(db_path: Path) -> Path:
 
 
 def _backup(conn: sqlite3.Connection, db_path: Path) -> Path:
-    """DB を `backup/stemapp-<日時>.db` に複製する（SQLite の backup API。書き込み中でも一貫する）。"""
+    """DB を `backup/stemapp-<日時>.db` に複製する（SQLite の backup API）。"""
     folder = backup_dir_of(db_path)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -157,11 +157,11 @@ def _fk_problems(conn: sqlite3.Connection) -> set[tuple[Any, ...]]:
 
 
 def _rebuild_table(conn: sqlite3.Connection, engine: Engine, table: Table) -> None:
-    """表を新しい定義（AUTOINCREMENT つき）で作り直し、行・索引を移す（トランザクションの中で呼ぶ）。
+    """表を新しい定義（AUTOINCREMENT つき）で作り直し、行・索引を移す。
 
-    SQLite は ALTER で AUTOINCREMENT を付けられないため、公式の手順（新しい表を作る → 行を移す →
-    古い表を消す → 名前を変える → 索引を作り直す）で行う。番号はそのまま移すので、外部キーは保たれる。
-    モデルに無い列（古い版の列）も消さずに移す。
+    トランザクションの中で呼ぶ。SQLite は ALTER で AUTOINCREMENT を付けられないため、公式の手順
+    （新しい表を作る → 行を移す → 古い表を消す → 名前を変える → 索引を作り直す）で行う。
+    番号はそのまま移すので、外部キーは保たれる。モデルに無い列（古い版の列）も消さずに移す。
     """
     name = table.name
     tmp = f"_new_{name}"
@@ -228,8 +228,8 @@ def migrate_autoincrement(engine: Engine) -> list[str]:
                 "DB を更新します（番号の使い回しを防ぐ: %s）。バックアップ: %s",
                 ", ".join(t.name for t in todo), backup,
             )
-            # 表を消して作り直す間は外部キーを止める（止めないと DROP TABLE が CASCADE で子を消す）。
-            # PRAGMA foreign_keys はトランザクションの外でしか変えられない
+            # 表を消して作り直す間は外部キーを止める（止めないと DROP TABLE が CASCADE で
+            # 子の行を消す）。PRAGMA foreign_keys はトランザクションの外でしか変えられない
             conn.execute("PRAGMA foreign_keys=OFF")
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -249,10 +249,11 @@ def migrate_autoincrement(engine: Engine) -> list[str]:
                     conn.execute("ROLLBACK")
                     where = f"（バックアップ: {backup}）" if backup is not None else ""
                     raise DbMigrationError(
-                        "DB の更新（番号の使い回しを防ぐ AUTOINCREMENT への作り直し）に失敗したため、"
-                        f"元の状態に戻しました{where}。\n原因: {e}\n"
-                        "データフォルダの空き容量と、ほかに stemapp が動いていないかを確かめてから、"
-                        "もう一度起動してください。直らないときはこの表示を開発者に伝えてください。"
+                        "DB の更新（番号の使い回しを防ぐ AUTOINCREMENT への作り直し）に"
+                        f"失敗したため、元の状態に戻しました{where}。\n原因: {e}\n"
+                        "データフォルダの空き容量と、ほかに stemapp が動いていないかを"
+                        "確かめてから、もう一度起動してください。"
+                        "直らないときはこの表示を開発者に伝えてください。"
                     ) from e
             finally:
                 conn.execute("PRAGMA foreign_keys=ON")
