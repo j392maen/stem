@@ -55,3 +55,7 @@
 - T07 マージ時（T11 レビューより）: 詳細分割で stem の構成が変わったら、そのジョブの速度変更キャッシュ（TEMPO_RENDER と data/cache/tempo/<job_id>）を消す（T11 で用意する公開関数を呼ぶ）。
 - 後続候補（T11 レビューより）: 伸縮ジョブを分割と別スレッドで動かし、分割中の待ちを無くす。
 - 不安定なテスト: test_browser_diag.py::test_diag_page_desktop が別担当の GPU 使用中に1回失敗（単独では成功）。
+| T11c | PC で速度がすぐ変わる方式（signalsmith-stretch、AudioWorklet） | 実装中 |
+| T14 | 仕上げ（AUTOINCREMENT、ワーカーの状態、伸縮の並行、書き出し・診断の仕上げ、ログ） | 実装中 |
+| T06b | iPhone 向けの再生（選択中の stem だけ読み込む、ロック画面、オフライン、通知） | iPhone の診断結果待ち |
+| T07b | Mega 53 を 8GB で試す | 未着手 |
