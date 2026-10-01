@@ -49,9 +49,9 @@ def _refine(pg: Any, code: str, model_prefix: str) -> None:
     pg.click(f".refine-option[data-model^='{model_prefix}']")
 
 
-def _wait_loaded_with(pg: Any, code: str) -> None:
-    pg.wait_for_selector(f".stem-btn[data-code='{code}']", timeout=60_000)
-    pg.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+def _wait_loaded_with(pg: Any, code: str, timeout: int = 60_000) -> None:
+    pg.wait_for_selector(f".stem-btn[data-code='{code}']", timeout=timeout)
+    pg.wait_for_selector("#play-btn:not([disabled])", timeout=timeout)
 
 
 def test_refine_drums_flow(page: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811
@@ -217,8 +217,9 @@ def test_refine_done_while_loading(page: Any, server: LiveServer, tmp_path: Path
         stems = {s["code"]: s for s in c.get(f"/api/jobs/{job_id}/stems").json()["stems"]}
         res = c.post(f"/api/stems/{stems['drums']['stem_id']}/refine", json={"model": DRUMSEP})
         assert res.status_code == 201
+        refine_id = res.json()["job"]["job_id"]
 
-    # 再生用の音声の取得を止めておき（読み込みが終わらない）、分割が終わるのを待つ
+    # 再生用の音声の取得を止めておき（画面の読み込みが終わらない）
     held: list[Any] = []
     release = {"on": False}
 
@@ -231,17 +232,26 @@ def test_refine_done_while_loading(page: Any, server: LiveServer, tmp_path: Path
     page.route("**/api/files/renditions/**", hold)
     page.goto(f"{server.base_url}/#/track/{track_id}")
     page.wait_for_selector("#loading:not([hidden])")
-    # 読み込み中に分割が終わった: 読み直し待ちの表示
-    page.wait_for_selector("#refine-status :text('読み込みが終わったら')", timeout=60_000)
+    # サーバーで詳細分割が終わるまで待つ（画面はまだ読み込み中）
+    deadline = time.monotonic() + 60
+    with httpx.Client(base_url=server.base_url, timeout=30) as c:
+        while c.get(f"/api/jobs/{refine_id}").json()["status"] != "done":
+            assert time.monotonic() < deadline, "詳細分割が終わりません"
+            page.wait_for_timeout(200)
+    # 画面の問い合わせ（1.2 秒おき）が、読み込み中に done を見た状態を確実に作る
+    page.wait_for_timeout(2500)
     assert page.locator(".stem-btn[data-code='kick']").count() == 0
+    waiting_text = page.locator("#refine-status").inner_text()
+    # 音声の取得を再開する → 読み込みが終わったら読み直して、子が出る
     release["on"] = True
     for r in held:
         r.continue_()
-    # 読み込みが終わると読み直して、子が出る
-    _wait_loaded_with(page, "kick")
+    _wait_loaded_with(page, "kick", timeout=20_000)
     assert page.locator(".stem-family[data-family='drums']").count() == 1
     assert page.locator("#refine-status").is_hidden()
     assert not page.errors  # type: ignore[attr-defined]
+    # （任意）読み込み中は「読み直し待ち」の表示が出ていた
+    assert "読み込みが終わったら" in waiting_text
 
 
 def test_refine_note_for_legacy_folder(page: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811

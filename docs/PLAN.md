@@ -43,7 +43,7 @@
 | --- | --- | --- |
 | T10 | 拍・小節の解析（beat_this）と表示、区間 BPM | 完了（2026-09-26） |
 | T10c | 拍の手動補正 UI（1小節目、×2/÷2、拍子、タップ、キューから計算） | 完了（2026-09-29） |
-| T11 | 速度変更: playbackRate（ピッチも変わる）、サーバー変換（rubberband、ピッチ保持）、PC 即時（signalsmith-stretch） | 実装中 |
+| T11 | 速度変更: playbackRate（ピッチも変わる）、サーバー変換（rubberband、ピッチ保持）、PC 即時（signalsmith-stretch） | 完了（2026-09-29）。PC 即時の伸縮（signalsmith-stretch）は T11c で未着手 |
 | T12 | 分離品質の見直し: 残差の行き先、karaoke の入力と組み合わせ、実験プリセット、同じ曲の分け方の切り替え | 完了（2026-09-26） |
 | T13 | stem の保存フォルダ名を元のファイル名に（data/stems/<元のファイル名>/<分け方>、migrate-folders） | 完了（2026-09-29）。既存データの移行はユーザーの了承待ち |
 | T07 | （追加）other → 持続音／短い音／残り（HPSS）、Mega 53 を 8GB で試す | 実装中 |
@@ -52,3 +52,6 @@
 - 任意（T12 より）: 拍の解析 API に job_id を渡せるようにし、警告を表示中のジョブに付ける。コード名 exp_resid_split は中身（SW のみ）と合わない（識別子なので据え置き）。gabox v1（未使用、約 871MB）は削除可。
 - 仕上げ（T08 レビューより）: exports の cleanup を Lock で1本ずつに（StaleDataError のログ）。mix の合計を float32 に（メモリ半分）。CLI export のエラー表示を markup=False に。完了後の「作成する」ボタンを控えめに。書き出しの一覧・再ダウンロード画面、MP3 のタグ（提案）。
 - 仕上げ（T06a レビューより）: data/diag の件数上限（例 200 件）。Service Worker が /api/ をキャッシュしないことのブラウザテストを強く。Host なし（400）と WebSocket（1008）のテスト。ポート判定を isascii かつ isdigit に。manifest の any/maskable を分けて書く。
+- T07 マージ時（T11 レビューより）: 詳細分割で stem の構成が変わったら、そのジョブの速度変更キャッシュ（TEMPO_RENDER と data/cache/tempo/<job_id>）を消す（T11 で用意する公開関数を呼ぶ）。
+- 後続候補（T11 レビューより）: 伸縮ジョブを分割と別スレッドで動かし、分割中の待ちを無くす。
+- 不安定なテスト: test_browser_diag.py::test_diag_page_desktop が別担当の GPU 使用中に1回失敗（単独では成功）。

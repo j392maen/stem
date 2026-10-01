@@ -13,6 +13,11 @@ const METERS = [3, 4, 5, 6, 7];
 const SHIFT_MS = 10;
 const FINE_SHIFT_MS = 1;
 
+/** たたいた音の曲の時刻: 再生位置から「出力の遅延（実時間）× 曲の時刻の進む速さ」を引く。 */
+export function tapSongTime(position, latencySec, speed = 1) {
+  return position - latencySec * speed;
+}
+
 export class BeatEditPanel {
   /** view: PlayerView（trackId, beatGrid, engine, cues, activeLoop(), setBeatGrid(), later()）。 */
   constructor(view) {
@@ -271,11 +276,14 @@ export class BeatEditPanel {
     });
   }
 
-  /** 今たたいた（ボタン・T キー）。再生中の曲の時刻から出力の遅延を差し引く。 */
+  /**
+   * 今たたいた（ボタン・T キー）。再生中の曲の時刻から出力の遅延を差し引く。
+   * 遅延は実時間の秒なので、速度を変えているときは曲の時刻に直して（× 速さ）引く。
+   */
   tapNow() {
     const engine = this.view.engine;
     if (!engine || !engine.playing) { toast("再生しながら拍に合わせてたたいてください。"); return; }
-    this.tap(engine.position - engine.outputLatency(), performance.now() / 1000);
+    this.tap(tapSongTime(engine.position, engine.outputLatency(), engine.speed || 1), performance.now() / 1000);
   }
 
   /** たたいた時刻（曲の時刻）を記録する（テストでは時刻を直接渡す）。 */

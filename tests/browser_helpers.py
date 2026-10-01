@@ -31,6 +31,7 @@ from stemapp.jobs.worker import ChildHandle, Worker
 from stemapp.seed import seed
 from stemapp.separation import FakeSeparator
 from stemapp.separation.fake import fake_hpss
+from stemapp.tempo.stretch import FakeStretcher, Stretcher
 
 SCREENS_DIR = REPO_ROOT / "data" / "cache" / "screens"
 EDGE_ARGS = ["--autoplay-policy=no-user-gesture-required"]
@@ -58,8 +59,12 @@ def run_server(
     fake_delay: float = 0.2,
     with_worker: bool = True,
     beat_analyzer: BeatAnalyzer | None = None,
+    tempo_stretcher: Stretcher | None = None,
 ) -> Iterator[LiveServer]:
-    """beat_analyzer を渡すと、分割の後処理と作り直しで拍を作る（省略時は拍を作らない）。"""
+    """beat_analyzer を渡すと、分割の後処理と作り直しで拍を作る（省略時は拍を作らない）。
+
+    速度変更（ピッチを保つ方式）の伸縮は tempo_stretcher（省略時は FakeStretcher）。
+    """
     engine = make_engine(settings.db_path)
     init_db(engine)
     factory = make_session_factory(engine)
@@ -103,6 +108,7 @@ def run_server(
         worker = Worker(
             settings, factory, launch, poll_interval=0.2, cancel_check_interval=0.1,
             beat_runner=beat_runner if beat_analyzer is not None else None,
+            tempo_stretcher=tempo_stretcher or FakeStretcher(delay_sec=1.0),
         )
         worker_thread = threading.Thread(target=worker.run_forever, name="test-worker", daemon=True)
         worker_thread.start()

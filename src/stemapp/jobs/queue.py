@@ -27,6 +27,8 @@ from stemapp.separation.refine import (
     take_exports_of_jobs,
 )
 from stemapp.stem_folders import remove_job_dir
+from stemapp.stem_view import root_job_id
+from stemapp.tempo.service import invalidate_job_tempo, remove_job_tempo_dirs
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +213,12 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
         delete_job(session, settings, child.job_id)
     output_dir = job.output_dir
     export_ids = export_ids_for_jobs(session, [job_id])
+    # 詳細分割を戻すと元の分け方の葉が変わる（速度変更のキャッシュを消す。done のときだけ）
+    tempo_owner = (
+        root_job_id(session, job_id)
+        if job.job_kind == "refine" and job.status == DONE
+        else None
+    )
     if job.job_kind == "refine":
         # 詳細分割の子を使った書き出しは full ジョブの行に付くので、stem から探して一緒に消す
         try:
@@ -242,6 +250,9 @@ def delete_job(session: Session, settings: Settings, job_id: int) -> SeparationJ
     remove_job_dir(session, settings, job_id, output_dir)
     shutil.rmtree(job_tmp_dir(settings, job_id), ignore_errors=True)
     remove_export_dirs(settings, export_ids)  # 書き出したファイル（data/exports/<id>）
+    remove_job_tempo_dirs(settings, [job_id])  # 速度を変えた音声（data/cache/tempo/<job_id>）
+    if tempo_owner is not None and tempo_owner != job_id:
+        invalidate_job_tempo(session, settings, tempo_owner)
     log.info("ジョブを削除しました（job %d, track %d）。", job_id, job.track_id)
     return job
 

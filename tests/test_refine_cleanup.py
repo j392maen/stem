@@ -264,3 +264,75 @@ def test_api_refine_note_for_legacy_folder(
     drums = next(st for st in body["stems"] if st["code"] == "drums")["stem_id"]
     res = client.post(f"/api/stems/{drums}/refine", json={"model": DRUMSEP})
     assert res.status_code == 409 and "migrate-folders" in res.json()["detail"]
+
+
+# --- 速度変更（T11）との整合 ------------------------------------------------------------------
+
+
+def _fake_tempo_cache(s: Session, settings: Settings, job_id: int) -> Path:
+    """作成済みの速度変更のキャッシュ（行とフォルダ）を作る。"""
+    from stemapp.models import TempoRender
+    from stemapp.tempo.service import job_tempo_dir, render_dir
+
+    s.add(TempoRender(job_id=job_id, ratio=1.2, status="done"))
+    s.commit()
+    d = render_dir(settings, job_id, 1.2)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "drums.webm").write_bytes(b"x")
+    return job_tempo_dir(settings, job_id)
+
+
+def _tempo_rows(s: Session, job_id: int) -> int:
+    from stemapp.models import TempoRender
+
+    s.expire_all()
+    return len(s.scalars(select(TempoRender).where(TempoRender.job_id == job_id)).all())
+
+
+def test_tempo_cache_is_invalidated_by_refine_changes(
+    settings: Settings, factory: sessionmaker[Session], full_job: int  # noqa: F811
+) -> None:
+    """詳細分割の完了・force の置き換え・戻すで、元の分け方の速度変更のキャッシュを消す。
+    失敗した詳細分割（stem の構成は変わらない）では消さない。"""
+    drums = _stem_id(factory, full_job, "drums")
+    with factory() as s:
+        d = _fake_tempo_cache(s, settings, full_job)
+    first = _run_refine(settings, factory, drums, DRUMSEP)  # 完了
+    with factory() as s:
+        assert _tempo_rows(s, full_job) == 0
+        assert not d.exists()
+        d = _fake_tempo_cache(s, settings, full_job)
+    second = _run_refine(settings, factory, drums, DRUMSEP, force=True)  # 置き換え
+    with factory() as s:
+        assert s.get(SeparationJob, first) is None
+        assert _tempo_rows(s, full_job) == 0 and not d.exists()
+        d = _fake_tempo_cache(s, settings, full_job)
+        lead = _stem_id(factory, full_job, "lead_vocal")
+        bad = enqueue_refine_job(s, lead, MALE_FEMALE).job.job_id
+    Worker(
+        settings, factory, _refine_launcher(settings, FakeSeparator(fail_models={MALE_FEMALE}))
+    ).run_one()
+    with factory() as s:
+        failed = s.get(SeparationJob, bad)
+        assert failed is not None and failed.status == "failed"
+        assert _tempo_rows(s, full_job) == 1 and d.exists()
+        # 戻す（refine ジョブの削除）
+        delete_job(s, settings, second)
+        assert _tempo_rows(s, full_job) == 0 and not d.exists()
+
+
+def test_tempo_sources_include_refined_children(
+    settings: Settings, factory: sessionmaker[Session], full_job: int  # noqa: F811
+) -> None:
+    """速度変更で伸縮する stem は画面で鳴らす葉（詳細分割の子を含み、分けた親は含まない）。"""
+    from stemapp.tempo.service import leaf_sources
+
+    drums = _stem_id(factory, full_job, "drums")
+    _run_refine(settings, factory, drums, DRUMSEP)
+    with factory() as s:
+        sources = leaf_sources(s, settings, full_job)
+        codes = [src.code for src in sources]
+        assert "drums" not in codes and "vocals" not in codes
+        assert {"kick", "drums_rest", "bass", "lead_vocal"} <= set(codes)
+        assert len(codes) == len(set(codes))
+        assert all(src.master.is_file() for src in sources)
