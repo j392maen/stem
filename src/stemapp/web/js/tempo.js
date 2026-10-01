@@ -357,7 +357,7 @@ export class TempoPanel {
     const st = this.stretchState;
     let text;
     if (st === "failed") text = "このブラウザでは使えません（ピッチも変わる方式で再生中）";
-    else if (e && e.lock) text = `ピッチを保って再生中（ブラウザ内・音の遅れ ${Math.round(e.latency * 1000)}ms）`;
+    else if (e && e.lock) text = `ブラウザ内でピッチを保っています（音の遅れ ${Math.round(e.latency * 1000)}ms）`;
     else if (st === "loading" && this.ratio !== 1) text = "準備中…";
     else text = "元の速度です（速度を変えるとすぐ反映）";
     this.instStatus.textContent = text;
@@ -482,7 +482,10 @@ export class TempoPanel {
   /** 今の設定で鳴らすべき組 { key, scale, rate, urls }。まだ無い（作成中）なら null。 */
   desired() {
     const r = this.ratio;
-    if (r === 1 || this.mode === "pitch" || this.mode === "instant") return { key: ORIGINAL, scale: 1, rate: r, urls: this.urls };
+    // ピッチも変わる・すぐ（PC）の方式は元の音声を playbackRate で鳴らす（すぐ は伸縮器で高さを戻す）
+    if (r === 1 || this.mode === "pitch" || this.mode === "instant") {
+      return { key: ORIGINAL, scale: 1, rate: r, urls: this.urls };
+    }
     const want = ratioKey(r);
     const rd = this.render;
     const original = { key: ORIGINAL, scale: 1, rate: 1, urls: this.urls };
