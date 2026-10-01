@@ -52,6 +52,9 @@ KARAOKE_MEL_GABOX_V2 = "mel_band_roformer_karaoke_gabox_v2.ckpt"
 DRUMSEP = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
 MALE_FEMALE = "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt"
 ASPIRATION = "aspiration_mel_band_roformer_sdr_18.9845.ckpt"
+# 信号処理（librosa の HPSS）。モデルファイルは無い。詳細分割の「方法」を MODEL の行でそろえて
+# 持つため、architecture="hpss" の行として登録する（stemapp.separation.refine が特別に扱う）
+HPSS = "hpss"
 
 KARAOKE_OUT = ["lead_vocal", "backing_vocal"]  # "(Vocals)"=lead, "(Instrumental)"=それ以外
 
@@ -80,6 +83,8 @@ MODELS: list[ModelDef] = [
              ["kick", "snare", "toms", "hihat", "ride", "crash"]),
     ModelDef(MALE_FEMALE, "BS-RoFormer 男声/女声", "bs_roformer", ["male", "female"]),
     ModelDef(ASPIRATION, "Mel-RoFormer 息", "mel_band_roformer", ["breath", "no_breath"]),
+    ModelDef(HPSS, "HPSS（持続音／短い音）", "hpss", ["sustained", "transient"],
+             license="ISC（librosa）"),
 ]
 
 # --- STEM_TYPE ---------------------------------------------------------------
@@ -117,6 +122,11 @@ STEM_TYPES: list[StemTypeDef] = [
     StemTypeDef("male", "男声", "vocals", "detail", "#7C3AED", refine_model=MALE_FEMALE),
     StemTypeDef("female", "女声", "vocals", "detail", "#C4B5FD", refine_model=MALE_FEMALE),
     StemTypeDef("breath", "息", "vocals", "detail", "#DDD6FE", refine_model=ASPIRATION),
+    # 詳細分割の「残り」（親 − 名前の付いた子の合計）。親の stem ごとに1つ（<親>_rest）。
+    # 色は親の系統の彩度を落としたもの
+    StemTypeDef("lead_vocal_rest", "残り（メインボーカル）", "lead_vocal", "detail", "#B7AFC9"),
+    StemTypeDef("backing_vocal_rest", "残り（サブボーカル）", "backing_vocal", "detail",
+                "#7E7FA6"),
     # ドラムの詳細（黄の系統）
     StemTypeDef("kick", "キック", "drums", "detail", "#EAB308", refine_model=DRUMSEP),
     StemTypeDef("snare", "スネア", "drums", "detail", "#FDE047", refine_model=DRUMSEP),
@@ -127,10 +137,17 @@ STEM_TYPES: list[StemTypeDef] = [
                 refine_model=DRUMSEP),
     StemTypeDef("crash", "クラッシュ", "drums", "detail", "#FEF9C3", experimental=True,
                 refine_model=DRUMSEP),
+    StemTypeDef("drums_rest", "残り（ドラム）", "drums", "detail", "#A8996A"),
     # ギターの詳細（シアンの系統）
     StemTypeDef("acoustic_guitar", "アコースティックギター", "guitar", "detail", "#A5F3FC"),
     StemTypeDef("electric_guitar", "エレキギター", "guitar", "detail", "#0891B2"),
     # その他の詳細（赤紫・水色・黄緑・灰色など、基本 stem と重ならないもの）
+    # 持続音・短い音は楽器の種類ではなく音の「形」で分ける（HPSS。docs/research/R01 D-3）
+    StemTypeDef("sustained", "持続音（パッド等）", "other", "detail", "#F5D0FE",
+                experimental=True, refine_model=HPSS),
+    StemTypeDef("transient", "短い音（ヒット等）", "other", "detail", "#A21CAF",
+                experimental=True, refine_model=HPSS),
+    StemTypeDef("other_rest", "残り（その他）", "other", "detail", "#A58AAB"),
     StemTypeDef("wind", "管楽器", "other", "detail", "#67E8F9", experimental=True),
     StemTypeDef("saxophone", "サックス", "other", "detail", "#06B6D4"),
     StemTypeDef("brass", "金管", "other", "detail", "#BEF264"),

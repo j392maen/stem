@@ -30,6 +30,7 @@ from stemapp.jobs.child import run_job
 from stemapp.jobs.worker import ChildHandle, Worker
 from stemapp.seed import seed
 from stemapp.separation import FakeSeparator
+from stemapp.separation.fake import fake_hpss
 from stemapp.tempo.stretch import FakeStretcher, Stretcher
 
 SCREENS_DIR = REPO_ROOT / "data" / "cache" / "screens"
@@ -92,9 +93,10 @@ def run_server(
 
         def launch(job_id: int) -> ChildHandle:
             # 子プロセスの代わりにその場で実行する（配信用データは本物の ffmpeg で作る）
+            # 詳細分割の HPSS はテスト用の関数（librosa を使わず、すぐ終わる）
             rc = run_job(
                 settings, job_id, FakeSeparator(delay_sec=fake_delay), encoder=None,
-                beat_analyzer=beat_analyzer,
+                beat_analyzer=beat_analyzer, hpss=fake_hpss,
             )
             return FinishedHandle(rc)
 

@@ -292,19 +292,28 @@ class SourceStem:
 
 
 def leaf_sources(session: Session, settings: Settings, job_id: int) -> list[SourceStem]:
-    """伸縮する stem（子に分かれていない stem = 画面で鳴らす stem）と master のパス（表示順）。"""
-    rows = session.execute(
-        select(Stem, StemType, StemRendition)
-        .join(StemType, StemType.stem_type_id == Stem.stem_type_id)
-        .join(StemRendition, StemRendition.stem_id == Stem.stem_id)
-        .where(Stem.job_id == job_id, StemRendition.purpose == PURPOSE_MASTER)
-        .order_by(StemType.display_order, Stem.stem_id)
-    ).all()
-    parents = {s.parent_stem_id for s, _, _ in rows if s.parent_stem_id is not None}
+    """伸縮する stem（子に分かれていない stem = 画面で鳴らす stem）と master のパス（木の順）。
+
+    詳細分割（T07）の子も含む（`stemapp.stem_view` の木。画面と同じ葉）。
+    """
+    from stemapp.stem_view import build_view
+
+    rows = build_view(session, job_id).rows
+    parents = {s.parent_stem_id for s, _ in rows if s.parent_stem_id is not None}
+    leaves = [(s, t) for s, t in rows if s.stem_id not in parents]
+    masters = {
+        r.stem_id: r
+        for r in session.scalars(
+            select(StemRendition).where(
+                StemRendition.stem_id.in_([s.stem_id for s, _ in leaves]),
+                StemRendition.purpose == PURPOSE_MASTER,
+            )
+        )
+    }
     return [
-        SourceStem(s.stem_id, t.code, resolve_data_path(settings, m.file_path))
-        for s, t, m in rows
-        if s.stem_id not in parents
+        SourceStem(s.stem_id, t.code, resolve_data_path(settings, masters[s.stem_id].file_path))
+        for s, t in leaves
+        if s.stem_id in masters
     ]
 
 
