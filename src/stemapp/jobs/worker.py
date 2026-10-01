@@ -11,8 +11,11 @@
   1件ずつ、このプロセスの中で実行する（GPU は使わない。ffmpeg は Job Object に入る）。
   配信用データがそろっていて曲の拍が無ければ、拍の解析を子プロセス（`stemapp.beats.child`）で行う
   （GPU を使うため。失敗しても作り直しは done とし、警告を JOB.beat_warning に残す）。
-- 分割も作り直しも無いとき、速度変更（ピッチを保つ方式）の伸縮済み音声（TEMPO_RENDER）を
-  1件ずつ作る（GPU は使わない。stem ごとに ffmpeg を並列で起動し、Job Object に入れる）。
+- 速度変更（ピッチを保つ方式）の伸縮済み音声（TEMPO_RENDER）は、分割とは別のスレッドで
+  1件ずつ作る（分割中でも待たされない。GPU は使わない。stem ごとに ffmpeg を並列で起動し、
+  Job Object に入れる）。
+- heartbeat_file を渡すと、数秒ごとに生きている時刻と実行中のものを書く
+  （`stemapp.jobs.supervisor`。`/api/health` が読む）。
 """
 
 from __future__ import annotations
@@ -199,6 +202,7 @@ class Worker:
         postprocess_encoder: FfmpegRunner | None = None,
         beat_runner: BeatRunner | None = None,
         tempo_stretcher: Stretcher | None = None,
+        heartbeat_file: Path | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
@@ -213,8 +217,13 @@ class Worker:
         self.beat_runner = beat_runner
         # 速度変更の伸縮（None なら ffmpeg の rubberband）
         self.tempo_stretcher = tempo_stretcher
+        # 生きている合図のファイル（None なら書かない）
+        self.heartbeat_file = heartbeat_file
         self.current_job_id: int | None = None
         self.current_child: ChildHandle | None = None
+        self.current_postprocess_id: int | None = None
+        self.current_render_id: int | None = None
+        self._tempo_thread: threading.Thread | None = None
 
     # --- 起動時・停止時 ---------------------------------------------------------------
 
@@ -264,6 +273,7 @@ class Worker:
         if render_id is None:
             return None
         stretcher = self.tempo_stretcher or FfmpegStretcher()
+        self.current_render_id = render_id
         try:
             run_render(
                 self.settings, self.session_factory, render_id, stretcher,
@@ -271,6 +281,8 @@ class Worker:
             )
         except Exception:
             log.exception("速度変更の作成で想定外のエラー（render %d）", render_id)
+        finally:
+            self.current_render_id = None
         return render_id
 
     def run_postprocess_one(self) -> int | None:
@@ -278,33 +290,40 @@ class Worker:
 
         欠けている配信用データを作り直し、続けて曲の拍が無ければ拍を解析する。
         """
-        from stemapp.delivery import missing_delivery, rebuild_delivery_files
-        from stemapp.tempo.service import invalidate_job_tempo
-
         with self.session_factory() as session:
             job_id = claim_next_postprocess(session)
             if job_id is None:
                 return None
+            self.current_postprocess_id = job_id
             try:
-                if missing_delivery(session, job_id):
-                    log.info("配信用データを作り直します（job %d）。", job_id)
-                    rebuild_delivery_files(
-                        session, self.settings, job_id, encoder=self.postprocess_encoder
-                    )
-                    # 配信用データを作り直したら、古い音声を伸縮した速度変更のキャッシュは使わない
-                    invalidate_job_tempo(session, self.settings, job_id)
-                    log.info("配信用データを作り直しました（job %d）。", job_id)
-            except Exception:
-                log.exception("配信用データを作れませんでした（job %d）", job_id)
-                set_postprocess_status(session, job_id, FAILED)
-                return job_id
-            if self._postprocess_beats(session, job_id):
-                set_postprocess_status(session, job_id, DONE)
-            else:
-                # 停止の指示で中断した: 次に起動したときにやり直す
-                set_postprocess_status(session, job_id, QUEUED)
-                log.info("停止の指示で中断しました。作り直しを待ちに戻します（job %d）。", job_id)
+                self._postprocess(session, job_id)
+            finally:
+                self.current_postprocess_id = None
         return job_id
+
+    def _postprocess(self, session: Session, job_id: int) -> None:
+        from stemapp.delivery import missing_delivery, rebuild_delivery_files
+        from stemapp.tempo.service import invalidate_job_tempo
+
+        try:
+            if missing_delivery(session, job_id):
+                log.info("配信用データを作り直します（job %d）。", job_id)
+                rebuild_delivery_files(
+                    session, self.settings, job_id, encoder=self.postprocess_encoder
+                )
+                # 配信用データを作り直したら、古い音声を伸縮した速度変更のキャッシュは使わない
+                invalidate_job_tempo(session, self.settings, job_id)
+                log.info("配信用データを作り直しました（job %d）。", job_id)
+        except Exception:
+            log.exception("配信用データを作れませんでした（job %d）", job_id)
+            set_postprocess_status(session, job_id, FAILED)
+            return
+        if self._postprocess_beats(session, job_id):
+            set_postprocess_status(session, job_id, DONE)
+        else:
+            # 停止の指示で中断した: 次に起動したときにやり直す
+            set_postprocess_status(session, job_id, QUEUED)
+            log.info("停止の指示で中断しました。作り直しを待ちに戻します（job %d）。", job_id)
 
     def _postprocess_beats(self, session: Session, job_id: int) -> bool:
         """曲の拍が無ければ解析する。失敗しても例外を出さず、警告を JOB に残す。
@@ -398,18 +417,65 @@ class Worker:
 
     # --- ループ ---------------------------------------------------------------------
 
+    def status_snapshot(self) -> dict[str, int | None]:
+        """実行中のもの（生きている合図に書く）。"""
+        return {
+            "job_id": self.current_job_id,
+            "postprocess_job_id": self.current_postprocess_id,
+            "tempo_render_id": self.current_render_id,
+        }
+
+    def _tempo_loop(self) -> None:
+        """速度変更の作成を1件ずつ行う（分割とは別のスレッド。同時に動かすのは1件）。"""
+        while not self.should_stop():
+            try:
+                render_id = self.run_tempo_one()
+            except Exception:
+                log.exception("速度変更の作成で想定外のエラー")
+                render_id = None
+            if render_id is None:
+                self.stop_event.wait(self.poll_interval)
+
+    def start_tempo_thread(self) -> threading.Thread:
+        t = threading.Thread(target=self._tempo_loop, name="worker-tempo", daemon=True)
+        t.start()
+        self._tempo_thread = t
+        return t
+
     def run_forever(self) -> None:
-        """stop_event が立つまでジョブを実行し続ける。"""
+        """stop_event が立つまでジョブを実行し続ける。
+
+        分割と配信用データの作り直しはこのスレッドで1件ずつ、速度変更の作成は別のスレッドで
+        1件ずつ行う（伸縮は CPU だけを使うので、分割中でも待たせない）。
+        """
+        from stemapp.jobs.supervisor import Heartbeat
+
         recovered = self.recover()
         if recovered:
             log.warning("中断されたジョブを片付けました: %s", recovered)
+        heartbeat = (
+            Heartbeat(self.heartbeat_file, self.status_snapshot)
+            if self.heartbeat_file is not None
+            else None
+        )
+        if heartbeat is not None:
+            heartbeat.start()
+        self.start_tempo_thread()
         log.info("ワーカーを開始しました。")
-        while not self.should_stop():
-            job_id = self.run_one()
-            if job_id is None:
-                job_id = self.run_postprocess_one()
-            if job_id is None:
-                job_id = self.run_tempo_one()
-            if job_id is None:
-                self.stop_event.wait(self.poll_interval)
+        try:
+            while not self.should_stop():
+                job_id = self.run_one()
+                if job_id is None:
+                    job_id = self.run_postprocess_one()
+                if job_id is None:
+                    self.stop_event.wait(self.poll_interval)
+        finally:
+            self.stop_event.set()
+            tempo = self._tempo_thread
+            if tempo is not None:
+                tempo.join(timeout=KILL_WAIT_SEC * 3)
+                if tempo.is_alive():
+                    log.error("速度変更の作成が止まりません。")
+            if heartbeat is not None:
+                heartbeat.stop()
         log.info("ワーカーを停止しました。")

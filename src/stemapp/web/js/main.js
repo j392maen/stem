@@ -83,6 +83,7 @@ onUnauthorized(() => {
 async function route() {
   unmountCurrent();
   renderNav();
+  if (!workerCheckStarted) checkWorker();
   const hash = location.hash || "#/library";
   const m = /^#\/track\/(\d+)$/.exec(hash);
   let title = "ライブラリ";
@@ -125,6 +126,36 @@ function showPasscodeNotice(show) {
     }),
   );
   box.hidden = false;
+}
+
+const HEALTH_POLL_MS = 15000;
+
+/** ワーカー（分割・速度変更の作成）が止まっていたら、画面の上に出す。 */
+function workerNoticeText(worker) {
+  if (!worker || worker.state !== "down") return "";
+  const base = worker.message || "分割の処理が止まっています。";
+  const sec = Number(worker.restart_in_sec);
+  if (worker.managed && Number.isFinite(sec)) {
+    return `${base}自動で起動し直します（あと ${Math.ceil(sec)} 秒）。分割・速度変更の作成は、動き出すと続きから進みます。`;
+  }
+  return `${base}stemapp を起動し直してください（分割・速度変更の作成が進みません）。`;
+}
+
+let workerCheckStarted = false;
+
+async function checkWorker() {
+  workerCheckStarted = true;
+  const box = document.getElementById("worker-notice");
+  if (!box) return;
+  try {
+    const res = await fetch("/api/health", { cache: "no-store" });
+    const text = res.ok ? workerNoticeText((await res.json()).worker) : "";
+    box.textContent = text;
+    box.hidden = !text;
+  } catch {
+    // サーバーにつながらないときは出さない（通信の失敗はそれぞれの画面で出す）
+  }
+  setTimeout(checkWorker, HEALTH_POLL_MS);
 }
 
 /** ホーム画面に追加したときのための Service Worker（画面ファイルだけ。音声・API は扱わない）。 */
