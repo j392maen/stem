@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import re
+import sqlite3
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event, inspect
+from sqlalchemy import Engine, Table, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-from sqlalchemy.schema import Column
+from sqlalchemy.schema import Column, CreateIndex, CreateTable
+
+log = logging.getLogger(__name__)
 
 # 他のプロセス（Web サーバー・ワーカー・分割の子プロセス）が書き込み中のとき待つ秒数
 BUSY_TIMEOUT_SEC = 30.0
@@ -88,9 +95,185 @@ def migrate_db(engine: Engine) -> list[str]:
     return added
 
 
+# --- 番号の使い回しを防ぐ（AUTOINCREMENT）への移行 ---------------------------------------------
+
+
+class DbMigrationError(RuntimeError):
+    """DB の移行に失敗した（元の状態に戻してある）。メッセージは日本語で、そのまま画面に出す。"""
+
+
+def _db_file(engine: Engine) -> Path | None:
+    """ファイルの DB ならそのパス（メモリ DB は None）。"""
+    name = engine.url.database
+    if not name or name == ":memory:":
+        return None
+    return Path(name)
+
+
+def backup_dir_of(db_path: Path) -> Path:
+    """DB のバックアップの置き場所（データフォルダの backup）。"""
+    return db_path.parent / "backup"
+
+
+def _backup(conn: sqlite3.Connection, db_path: Path) -> Path:
+    """DB を `backup/stemapp-<日時>.db` に複製する（SQLite の backup API。書き込み中でも一貫する）。"""
+    folder = backup_dir_of(db_path)
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dst = folder / f"stemapp-{stamp}.db"
+    n = 2
+    while dst.exists():
+        dst = folder / f"stemapp-{stamp}-{n}.db"
+        n += 1
+    target = sqlite3.connect(dst)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    return dst
+
+
+def _has_autoincrement(conn: sqlite3.Connection, table: str) -> bool | None:
+    """表の定義に AUTOINCREMENT があるか。表が無ければ None。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    if row is None:
+        return None
+    return "AUTOINCREMENT" in str(row[0]).upper()
+
+
+def autoincrement_tables() -> list[Table]:
+    """番号を使い回さない（sqlite_autoincrement=True の）表。"""
+    from stemapp import models  # noqa: F401  モデルを Base.metadata に登録する
+
+    return [
+        t for t in Base.metadata.sorted_tables if t.dialect_options["sqlite"].get("autoincrement")
+    ]
+
+
+def _fk_problems(conn: sqlite3.Connection) -> set[tuple[Any, ...]]:
+    return {tuple(r) for r in conn.execute("PRAGMA foreign_key_check").fetchall()}
+
+
+def _rebuild_table(conn: sqlite3.Connection, engine: Engine, table: Table) -> None:
+    """表を新しい定義（AUTOINCREMENT つき）で作り直し、行・索引を移す（トランザクションの中で呼ぶ）。
+
+    SQLite は ALTER で AUTOINCREMENT を付けられないため、公式の手順（新しい表を作る → 行を移す →
+    古い表を消す → 名前を変える → 索引を作り直す）で行う。番号はそのまま移すので、外部キーは保たれる。
+    モデルに無い列（古い版の列）も消さずに移す。
+    """
+    name = table.name
+    tmp = f"_new_{name}"
+    ddl = str(CreateTable(table).compile(dialect=engine.dialect)).strip()
+    ddl, n = re.subn(rf'^CREATE TABLE "?{re.escape(name)}"? \(', f'CREATE TABLE "{tmp}" (', ddl)
+    if n != 1:
+        raise RuntimeError(f"{name} の定義を作れませんでした。")
+    old_indexes = [
+        sql
+        for (sql,) in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? "
+            "AND sql IS NOT NULL",
+            (name,),
+        )
+    ]
+    old_cols = conn.execute(f'PRAGMA table_info("{name}")').fetchall()
+    conn.execute(f'DROP TABLE IF EXISTS "{tmp}"')
+    conn.execute(ddl)
+    new_names = {r[1] for r in conn.execute(f'PRAGMA table_info("{tmp}")')}
+    for _cid, col, col_type, _notnull, default, _pk in old_cols:
+        if col in new_names:
+            continue
+        # モデルに無い列: 型と既定値だけ付けて残す（NOT NULL は付けない）
+        extra = f'"{col}" {col_type or ""}'.rstrip()
+        if default is not None:
+            extra += f" DEFAULT {default}"
+        conn.execute(f'ALTER TABLE "{tmp}" ADD COLUMN {extra}')
+    cols = ", ".join(f'"{r[1]}"' for r in old_cols)
+    conn.execute(f'INSERT INTO "{tmp}" ({cols}) SELECT {cols} FROM "{name}"')
+    conn.execute(f'DROP TABLE "{name}"')
+    conn.execute(f'ALTER TABLE "{tmp}" RENAME TO "{name}"')
+    for sql in old_indexes:
+        conn.execute(sql)
+    for index in table.indexes:
+        conn.execute(str(CreateIndex(index, if_not_exists=True).compile(dialect=engine.dialect)))
+
+
+# テスト用: 表を1つ作り直すたびに表の名前を渡して呼ぶ（途中で失敗させ、元に戻ることを確かめる）
+after_rebuild_hook: Callable[[str], None] | None = None
+
+
+def migrate_autoincrement(engine: Engine) -> list[str]:
+    """番号を使い回さない表のうち、古い定義（AUTOINCREMENT なし）のものを作り直す。
+
+    作り直す表があれば、先に DB を `backup/stemapp-<日時>.db` に複製する。すべての表を1つの
+    トランザクションで作り直し、外部キーの確認（PRAGMA foreign_key_check）で新しい問題が出たら、
+    または途中で失敗したら、元に戻して DbMigrationError を出す。作り直した表の名前を返す
+    （何度実行しても同じ結果。2回目からは何もしない）。
+    """
+    tables = autoincrement_tables()
+    raw = engine.raw_connection()
+    try:
+        conn = raw.driver_connection
+        assert isinstance(conn, sqlite3.Connection)
+        old_isolation = conn.isolation_level
+        conn.isolation_level = None  # BEGIN / COMMIT を自分で出す
+        try:
+            todo = [t for t in tables if _has_autoincrement(conn, t.name) is False]
+            if not todo:
+                return []
+            db_path = _db_file(engine)
+            backup = _backup(conn, db_path) if db_path is not None else None
+            log.warning(
+                "DB を更新します（番号の使い回しを防ぐ: %s）。バックアップ: %s",
+                ", ".join(t.name for t in todo), backup,
+            )
+            # 表を消して作り直す間は外部キーを止める（止めないと DROP TABLE が CASCADE で子を消す）。
+            # PRAGMA foreign_keys はトランザクションの外でしか変えられない
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    # 別のプロセスが先に済ませていないか、ロックを取ってから確かめ直す
+                    todo = [t for t in todo if _has_autoincrement(conn, t.name) is False]
+                    before = _fk_problems(conn)
+                    for table in todo:
+                        _rebuild_table(conn, engine, table)
+                        if after_rebuild_hook is not None:
+                            after_rebuild_hook(table.name)
+                    new_problems = _fk_problems(conn) - before
+                    if new_problems:
+                        raise RuntimeError(f"外部キーの確認で問題が見つかりました: {new_problems}")
+                    conn.execute("COMMIT")
+                except BaseException as e:
+                    conn.execute("ROLLBACK")
+                    where = f"（バックアップ: {backup}）" if backup is not None else ""
+                    raise DbMigrationError(
+                        "DB の更新（番号の使い回しを防ぐ AUTOINCREMENT への作り直し）に失敗したため、"
+                        f"元の状態に戻しました{where}。\n原因: {e}\n"
+                        "データフォルダの空き容量と、ほかに stemapp が動いていないかを確かめてから、"
+                        "もう一度起動してください。直らないときはこの表示を開発者に伝えてください。"
+                    ) from e
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+            done = [t.name for t in todo]
+            if done:
+                log.warning("DB を更新しました（%s）。", ", ".join(done))
+            return done
+        finally:
+            conn.isolation_level = old_isolation
+    finally:
+        raw.close()
+
+
 def init_db(engine: Engine) -> None:
-    """全テーブルを作成し（既にあれば何もしない）、足りない列を追加する。"""
+    """全テーブルを作成し（既にあれば何もしない）、足りない列を追加し、
+    番号を使い回さない表（AUTOINCREMENT）への作り直しを行う。
+
+    作り直しに失敗したら元に戻して DbMigrationError（起動を止め、メッセージを表示する）。
+    """
     from stemapp import models  # noqa: F401  モデルを Base.metadata に登録する
 
     Base.metadata.create_all(engine)
     migrate_db(engine)
+    migrate_autoincrement(engine)

@@ -737,7 +737,14 @@ def migrate_folders_cmd(
 
 
 def main() -> None:
-    app()
+    from stemapp.db import DbMigrationError
+
+    try:
+        app()
+    except DbMigrationError as e:
+        # DB の更新に失敗した（元に戻してある）: 起動を止めて案内する
+        typer.echo(f"stemapp を起動できません。\n{e}", err=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
