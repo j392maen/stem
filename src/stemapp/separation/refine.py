@@ -679,6 +679,8 @@ def run_refine_job(
                 remove_job_dir(session, settings, old_id, old_dir)
                 shutil.rmtree(job_tmp_dir(settings, old_id), ignore_errors=True)
             remove_export_dirs(settings, old_exports)
+            # stem の構成（画面で鳴らす葉）が変わったので、分け方の速度変更のキャッシュは使わない
+            invalidate_root_tempo(session, settings, stem.job_id)
             if progress is not None:
                 progress(1.0, "完了")
         except JobAbandoned:
@@ -895,3 +897,15 @@ def clean_orphan_refine_dirs(session: Session, settings: Settings) -> list[str]:
             shutil.rmtree(sub, ignore_errors=True)
             removed.append(rel)
     return removed
+
+
+def invalidate_root_tempo(session: Session, settings: Settings, job_id: int) -> None:
+    """job_id（full か refine）の元の分け方（full ジョブ）の速度変更のキャッシュを消す（T11）。
+
+    詳細分割で葉が変わる（完了・戻す・置き換え）と、伸縮した音声の組が古くなるため。
+    """
+    from stemapp.tempo.service import invalidate_job_tempo
+
+    root = root_job_id(session, job_id)
+    if root is not None:
+        invalidate_job_tempo(session, settings, root)

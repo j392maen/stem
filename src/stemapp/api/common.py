@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import asyncio
+import json
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -123,3 +128,52 @@ def is_https(request: Request) -> bool:
         return True
     proto = request.headers.get("x-forwarded-proto", "")
     return proto.split(",")[0].strip().lower() == "https"
+
+
+SSE_POLL_SEC = 0.5
+SSE_KEEPALIVE_SEC = 15.0
+
+
+def sse_response(
+    request: Request,
+    load: Callable[[], dict[str, Any] | None],
+    *,
+    event: str,
+    gone_message: str,
+    finished: tuple[str, ...],
+) -> StreamingResponse:
+    """Server-Sent Events: load() の status・progress・stage が変わるたびに event を送る。
+
+    status が finished のどれかになったら送って閉じる。load() が None（消えた）なら
+    `event: error` を送って閉じる。
+    """
+    poll_sec: float = getattr(request.app.state, "sse_poll_sec", SSE_POLL_SEC)
+
+    async def stream() -> AsyncIterator[str]:
+        last: tuple[object, ...] | None = None
+        last_sent = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
+            data = await run_in_threadpool(load)
+            if data is None:
+                payload = json.dumps({"detail": gone_message}, ensure_ascii=False)
+                yield f"event: error\ndata: {payload}\n\n"
+                return
+            key = (data["status"], data["progress"], data["stage"])
+            if key != last:
+                yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                last = key
+                last_sent = time.monotonic()
+            elif time.monotonic() - last_sent >= SSE_KEEPALIVE_SEC:
+                yield ": keepalive\n\n"
+                last_sent = time.monotonic()
+            if data["status"] in finished:
+                return
+            await asyncio.sleep(poll_sec)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
