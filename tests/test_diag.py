@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -141,6 +142,25 @@ def test_same_second_does_not_overwrite(settings: Settings) -> None:
     results = diag.list_results(settings)
     # 同じ時刻の名前でも、後から保存したものが先頭（名前の順だと "-2" が後ろになる）
     assert [r["result"]["n"] for r in results] == [2, 1]
+
+
+def test_same_second_and_same_mtime_sorts_by_number(settings: Settings) -> None:
+    """ファイルの書いた時刻まで同じでも（Windows の時刻の刻みは粗く、続けて保存すると同じになる。
+    以前この場合に名前の順で並び、まれに失敗していた）、番号の大きい方（後から保存）が先頭。"""
+    now = datetime(2026, 9, 26, 12, 0, 0).astimezone()
+    names = [
+        diag.save_result(settings, {"device": "x", "n": n}, {}, now=now) for n in (1, 2, 3, 10)
+    ]
+    assert names[-1] == "20260926-120000000-x-4.json"
+    folder = diag.diag_dir(settings)
+    stamp = 1_790_000_000_000_000_000
+    for name in names:
+        os.utime(folder / name, ns=(stamp, stamp))
+    assert [r["result"]["n"] for r in diag.list_results(settings)] == [10, 3, 2, 1]
+    # 端末名に "-" と数字が入っていても一覧に出る
+    other = diag.save_result(settings, {"device": "iPhone-15", "n": 0}, {}, now=now)
+    assert other == "20260926-120000000-iPhone-15.json"
+    assert len(diag.list_results(settings)) == 5
 
 
 def test_names_have_milliseconds_and_sort_newest_first(settings: Settings) -> None:
