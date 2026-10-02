@@ -29,6 +29,15 @@ export function formatBytes(n) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+/** 書き出しの期限（ISO 8601）を「あと 3 時間」のようにする。 */
+export function expiresText(iso, now = Date.now()) {
+  const t = Date.parse(iso || "");
+  if (!Number.isFinite(t)) return "";
+  const min = Math.max(0, Math.round((t - now) / 60000));
+  if (min < 60) return `あと ${min} 分`;
+  return `あと ${Math.floor(min / 60)} 時間`;
+}
+
 /** iPhone・iPad（iPadOS はデスクトップの UA を名乗るので触れる画面かどうかでも見る）。 */
 export function isIOS(nav = navigator) {
   const ua = nav.userAgent || "";
@@ -100,6 +109,7 @@ export class Exporter {
     this.stemCode = leaves[0] || view.tree.order[0];
     this.parentsOnly = false;
     this.current = null; // 最後に作った書き出し（API の export）
+    this.history = []; // このジョブの書き出し（期限内のもの、新しい順）
     this.pollTimer = 0;
     this.back = null;
     this.onKey = (e) => {
@@ -117,6 +127,41 @@ export class Exporter {
     this.render();
     const first = this.back.querySelector(".seg-btn.on");
     if (first) first.focus();
+    this.loadHistory();
+  }
+
+  /** このジョブの書き出しの一覧（再ダウンロード用）を読み直す。 */
+  async loadHistory() {
+    try {
+      const res = await api(`/api/jobs/${this.view.job.job_id}/exports`);
+      if (!this.view.alive) return;
+      this.history = res.exports || [];
+    } catch {
+      return; // 一覧が読めなくても作成はできる
+    }
+    if (!this.back) return;
+    const box = this.back.querySelector("#export-history");
+    if (box) box.replaceWith(this.historyEl());
+  }
+
+  historyEl() {
+    // 今作ったもの（上にダウンロードのボタンがある）は除く
+    const currentId = this.current && this.current.export_id;
+    const items = this.history.filter((x) => x.status === "done" && x.download_url && x.export_id !== currentId);
+    const box = el("div", { class: "export-history", id: "export-history" });
+    if (!items.length) return box;
+    box.append(
+      el("div", { class: "export-label", text: "このジョブの書き出し（再ダウンロード）" }),
+      el("ul", { class: "export-history-list" }, items.map((x) => el("li", { dataset: { exportId: String(x.export_id) } },
+        el("div", { class: "export-history-name" },
+          el("span", { class: "export-history-file", text: x.filename, title: x.filename }),
+          el("span", { class: "muted", text: `${x.format_label}${x.zip ? "（ZIP）" : ""}・${formatBytes(x.bytes)}・${expiresText(x.expires_at)}` })),
+        el("a", {
+          class: "btn small export-history-dl", href: x.download_url, download: x.filename,
+          text: "ダウンロード", "aria-label": `${x.filename} をダウンロード`,
+        })))),
+    );
+    return box;
   }
 
   close() {
@@ -154,11 +199,14 @@ export class Exporter {
         segment("format", EXPORT_FORMATS, this.format, (v) => { this.format = v; this.render(); })),
       el("div", { class: "export-actions" },
         el("button", {
-          class: "btn primary", type: "button", id: "export-start", text: "作成する",
+          // できあがった後は「ダウンロード」を主にし、作り直しのボタンは控えめ（枠線だけ）にする
+          class: this.current && this.current.status === "done" ? "btn" : "btn primary",
+          type: "button", id: "export-start", text: "作成する",
           disabled: this.busy() || (this.type === "mix" && mixRequest(view).empty),
           onclick: () => this.start(),
         })),
-      el("div", { class: "export-status", id: "export-status", "aria-live": "polite" }, this.statusEl()));
+      el("div", { class: "export-status", id: "export-status", "aria-live": "polite" }, this.statusEl()),
+      this.historyEl());
     this.back.replaceChildren(modal);
   }
 
@@ -282,5 +330,6 @@ export class Exporter {
     if (this.busy()) this.schedulePoll();
     else if (!this.isOpen && this.current.status === "done") toast("書き出しができました。「書き出し」から保存できます。");
     this.render();
+    if (!this.busy() && this.isOpen) this.loadHistory();
   }
 }

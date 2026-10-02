@@ -20,7 +20,14 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from stemapp.audio import SAMPLE_RATE, AudioError, FfmpegRunner, read_audio, run_ffmpeg
+from stemapp.audio import (
+    SAMPLE_RATE,
+    AudioError,
+    FfmpegRunner,
+    as_stereo,
+    read_audio,
+    run_ffmpeg,
+)
 
 FORMAT_WAV = "wav"
 FORMAT_FLAC = "flac"
@@ -71,19 +78,74 @@ def _read(src: SourceStem) -> np.ndarray:
         raise ExportError(f"「{src.display_name}」の音声を読めません: {e}") from e
 
 
-def mp3_encode_args(src: Path, dst: Path) -> list[str]:
-    return [
+@dataclass(frozen=True)
+class TrackInfo:
+    """MP3 のタグに使う曲の情報。"""
+
+    title: str
+    artist: str | None = None
+
+
+@dataclass(frozen=True)
+class Mp3Tags:
+    """MP3 のタグ（ID3v2.3）。title は `<曲名> - <stem 名または組み合わせ名>`、album は曲名。"""
+
+    title: str
+    album: str
+    artist: str | None = None
+
+    @classmethod
+    def of(cls, info: TrackInfo | None, label: str) -> Mp3Tags | None:
+        if info is None:
+            return None
+        title = (info.title or "").strip() or "曲"
+        artist = (info.artist or "").strip() or None
+        return cls(title=f"{title} - {label}", album=title, artist=artist)
+
+
+def _tag_value(text: str) -> str:
+    # 改行などの制御文字はタグに入れない
+    return "".join(c if c >= " " else " " for c in text).strip()
+
+
+MIX_BLOCK = 1 << 18  # ミックスで一度に足す長さ（約 6 秒）
+
+
+def _open(src: SourceStem) -> sf.SoundFile:
+    """ミックス用に音声ファイルを開く（44.1kHz・1〜2 チャンネル）。"""
+    if not src.path.is_file():
+        raise ExportError(f"「{src.display_name}」の音声ファイルが見つかりません。")
+    try:
+        f = sf.SoundFile(str(src.path))
+    except (sf.LibsndfileError, RuntimeError) as e:
+        raise ExportError(f"「{src.display_name}」の音声を読めません: {e}") from e
+    sr, ch = f.samplerate, f.channels
+    if sr != SAMPLE_RATE or ch not in (1, 2):
+        f.close()
+        raise ExportError(f"「{src.display_name}」の音声の形式が違います（{sr}Hz・{ch}ch）。")
+    return f
+
+
+def mp3_encode_args(src: Path, dst: Path, tags: Mp3Tags | None = None) -> list[str]:
+    args = [
         "-y", "-i", str(src), "-vn",
         "-c:a", "libmp3lame", "-b:a", f"{MP3_BITRATE_KBPS}k",
         "-ar", str(SAMPLE_RATE),
-        "-f", "mp3", str(dst),
     ]
+    if tags is not None:
+        # Windows のエクスプローラーでも日本語が読める ID3v2.3（UTF-16）にする
+        args += ["-id3v2_version", "3", "-metadata", f"title={_tag_value(tags.title)}",
+                 "-metadata", f"album={_tag_value(tags.album)}"]
+        if tags.artist:
+            args += ["-metadata", f"artist={_tag_value(tags.artist)}"]
+    return [*args, "-f", "mp3", str(dst)]
 
 
 def write_audio(
-    dst: Path, data: np.ndarray, fmt: str, runner: FfmpegRunner | None = None
+    dst: Path, data: np.ndarray, fmt: str, runner: FfmpegRunner | None = None,
+    tags: Mp3Tags | None = None,
 ) -> Path:
-    """data（(samples, 2) float、±1 以内）を fmt で dst に書く。"""
+    """data（(samples, 2) float、±1 以内）を fmt で dst に書く。tags は MP3 のときだけ使う。"""
     dst.parent.mkdir(parents=True, exist_ok=True)
     # 整数の PCM に変換するとき ±1 を超えた値が折り返さないよう、念のため切り詰める
     clipped = np.clip(data, -1.0, 1.0)
@@ -97,7 +159,7 @@ def write_audio(
             sf.write(str(tmp), clipped.astype(np.float32), SAMPLE_RATE, subtype="FLOAT",
                      format="WAV")
             try:
-                (runner or run_ffmpeg)(mp3_encode_args(tmp, dst))
+                (runner or run_ffmpeg)(mp3_encode_args(tmp, dst, tags))
             except AudioError as e:
                 raise ExportError(f"MP3 に変換できませんでした: {e}") from e
         finally:
@@ -114,29 +176,46 @@ def mix_stems(
 ) -> tuple[np.ndarray, float]:
     """gain_db をかけて足す。合計が ±1 を超えたら全体を下げる。
 
-    戻り値: (混ぜた音 (samples, 2) float64, 下げた量 dB（下げなければ 0.0）)。
+    戻り値: (混ぜた音 (samples, 2) float32, 下げた量 dB（下げなければ 0.0）)。
     長さが違う stem は長いほうに合わせる（足りない部分は無音）。
+    結果は float32 で持つ（float64 の半分のメモリ）。足し算は短い区間（MIX_BLOCK）ごとに
+    全 stem を float64 で行い、float32 に丸めるのは区間ごとに1回だけなので、誤差は 24bit の
+    1 段より小さい（24bit 相当の精度を保つ）。
     """
     if not stems:
         raise ExportError("ミックスする stem がありません。")
-    total: np.ndarray | None = None
-    for i, src in enumerate(stems):
-        progress(i / len(stems), f"読み込み中（{i + 1}/{len(stems)}）: {src.display_name}")
-        data = _read(src).astype(np.float64)
-        if src.gain_db:
-            data *= 10.0 ** (src.gain_db / 20.0)
-        if total is None:
-            total = data
-        else:
-            if data.shape[0] > total.shape[0]:
-                total, data = data, total
-            total[: data.shape[0]] += data
-        del data
-    assert total is not None
+    files: list[sf.SoundFile] = []
+    try:
+        for src in stems:
+            files.append(_open(src))
+        n = max(f.frames for f in files)
+        gains = [10.0 ** (s.gain_db / 20.0) if s.gain_db else 1.0 for s in stems]
+        total = np.zeros((n, 2), dtype=np.float32)
+        for start in range(0, n, MIX_BLOCK):
+            m = min(MIX_BLOCK, n - start)
+            progress(start / max(n, 1), f"ミックス中（{len(stems)} 個の stem）")
+            acc = np.zeros((m, 2), dtype=np.float64)
+            for f, g, src in zip(files, gains, stems, strict=True):
+                if start >= f.frames:
+                    continue
+                try:
+                    block = as_stereo(f.read(min(m, f.frames - start), dtype="float32"))
+                except (AudioError, sf.LibsndfileError, RuntimeError) as e:
+                    raise ExportError(f"「{src.display_name}」の音声を読めません: {e}") from e
+                k = block.shape[0]
+                if g != 1.0:
+                    acc[:k] += block.astype(np.float64) * g
+                else:
+                    acc[:k] += block
+            total[start : start + m] = acc
+            del acc
+    finally:
+        for f in files:
+            f.close()
     peak = float(np.max(np.abs(total))) if total.size else 0.0
     gain_db = 0.0
     if peak > 1.0:
-        total /= peak
+        total /= np.float32(peak)
         gain_db = -20.0 * math.log10(peak)
     return total, gain_db
 
@@ -150,22 +229,24 @@ class RenderResult:
 
 def render_single(
     src: SourceStem, dst: Path, fmt: str, runner: FfmpegRunner | None = None,
-    progress: ProgressFn = _noop,
+    progress: ProgressFn = _noop, info: TrackInfo | None = None,
 ) -> RenderResult:
+    """info を渡すと MP3 に曲名・アーティスト・stem 名のタグを付ける。"""
     progress(0.1, f"読み込み中: {src.display_name}")
     data = _read(src)
     progress(0.5, f"{FORMAT_LABELS[fmt]} に変換中")
-    write_audio(dst, data, fmt, runner)
+    write_audio(dst, data, fmt, runner, Mp3Tags.of(info, src.display_name))
     return RenderResult(dst, dst.stat().st_size)
 
 
 def render_mix(
     stems: Sequence[SourceStem], dst: Path, fmt: str, runner: FfmpegRunner | None = None,
-    progress: ProgressFn = _noop,
+    progress: ProgressFn = _noop, info: TrackInfo | None = None, label: str = "",
 ) -> RenderResult:
+    """info を渡すと MP3 に曲名・アーティスト・label（組み合わせ名）のタグを付ける。"""
     data, gain_db = mix_stems(stems, lambda p, s: progress(p * 0.7, s))
     progress(0.75, f"{FORMAT_LABELS[fmt]} に変換中")
-    write_audio(dst, data, fmt, runner)
+    write_audio(dst, data, fmt, runner, Mp3Tags.of(info, label or "ミックス"))
     return RenderResult(dst, dst.stat().st_size, gain_db)
 
 
@@ -188,8 +269,12 @@ def _unique(name: str, used: set[str]) -> str:
 def render_zip(
     items: Sequence[tuple[SourceStem, str]], dst: Path, fmt: str,
     runner: FfmpegRunner | None = None, progress: ProgressFn = _noop,
+    info: TrackInfo | None = None,
 ) -> RenderResult:
-    """items は (stem, ZIP の中のファイル名)。音声は圧縮済みなので ZIP では圧縮しない。"""
+    """items は (stem, ZIP の中のファイル名)。音声は圧縮済みなので ZIP では圧縮しない。
+
+    info を渡すと、MP3 にはそれぞれ曲名・アーティスト・stem 名のタグを付ける。
+    """
     if not items:
         raise ExportError("書き出す stem がありません。")
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -200,7 +285,9 @@ def render_zip(
             for i, (src, name) in enumerate(items):
                 progress(i / len(items), f"変換中（{i + 1}/{len(items)}）: {src.display_name}")
                 data = _read(src)
-                part = write_audio(work / f"{i}.{fmt}", data, fmt, runner)
+                part = write_audio(
+                    work / f"{i}.{fmt}", data, fmt, runner, Mp3Tags.of(info, src.display_name)
+                )
                 del data
                 zf.write(part, arcname=_unique(name, used))
                 part.unlink(missing_ok=True)

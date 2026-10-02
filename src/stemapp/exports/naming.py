@@ -54,6 +54,18 @@ def export_base_name(track_title: str, label: str) -> str:
     return f"{title} - {label}"
 
 
+def label_from_filename(track_title: str, filename: str) -> str:
+    """`export_base_name` で作ったファイル名からラベル（stem 名・組み合わせ名）を取り出す。
+
+    取り出せないとき（長すぎて切った等）は拡張子を除いたファイル名。
+    """
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    prefix = _clean(export_base_name(track_title, ""))
+    if base.startswith(prefix) and len(base) > len(prefix):
+        return base[len(prefix):]
+    return base
+
+
 def mix_label(names: list[str]) -> str:
     """mix のラベル（選んだ stem の表示名を「＋」でつなぐ）。"""
     return MIX_JOINER.join(names)
