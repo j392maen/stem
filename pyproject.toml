@@ -78,6 +78,11 @@ torchaudio = [
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# MSST から取り込んだコード（T07b）は元のまま保つ（差分を小さくし、更新しやすくするため）
+extend-exclude = [
+    "src/stemapp/separation/msst/bs_roformer.py",
+    "src/stemapp/separation/msst/attend.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

@@ -4,6 +4,9 @@
 - 子の STEM_TYPE（refine_model_id がその MODEL の行）が、その方法で作る子。
   例: DrumSep → kick, snare, toms, hihat, ride, crash。男女 → male, female。息 → breath。
   HPSS（architecture="hpss"、信号処理）→ sustained, transient。
+  Mega 53（architecture="msst_bs_roformer"）→ strings, brass, woodwind, synth, percussion。
+  Mega 53 は曲によって多くの出力がほぼ無音になるので、実質的に無音の子（RMS が
+  SILENT_THRESHOLD_DB 未満）は作らず、その分は残りに入れる（T07b）。
 - 子の STEM_TYPE の親（例 drums、vocals、other）か、その子孫の型の stem に使える
   （vocals の方法は lead_vocal / backing_vocal にも使える）。
 - 「残り」の STEM_TYPE（`<親の code>_rest`）がある型の stem だけ分けられる。
@@ -67,6 +70,7 @@ log = logging.getLogger(__name__)
 
 REST_SUFFIX = "_rest"
 ARCH_HPSS = "hpss"
+ARCH_MSST = "msst_bs_roformer"
 ROLE_REFINE = "refine"
 INPUT_STEM = "stem"
 
@@ -120,6 +124,11 @@ class RefineMethod:
     @property
     def uses_gpu(self) -> bool:
         return not self.is_hpss
+
+    @property
+    def drops_silent(self) -> bool:
+        """実質的に無音の子を作らず残りに入れるか（Mega 53）。"""
+        return self.architecture == ARCH_MSST
 
 
 @dataclass
@@ -378,6 +387,7 @@ class RefineOutput:
     steps: list[StepResult] = field(default_factory=list)
     seconds: float = 0.0
     clipped: dict[str, int] = field(default_factory=dict)  # |x|>1 を丸めたサンプル数
+    dropped: list[str] = field(default_factory=list)  # 無音なので作らなかった子（残りに入れた）
 
     @property
     def peak_memory_mb(self) -> float | None:
@@ -477,9 +487,13 @@ def run_refine(
         )
     stems: dict[str, np.ndarray] = {}
     clipped: dict[str, int] = {}
+    dropped: list[str] = []
     total = np.zeros_like(parent64)
     for code in method.child_codes:
         arr = _fit(out[code], n)
+        if method.drops_silent and rms_db(arr) < SILENT_THRESHOLD_DB:
+            dropped.append(code)  # 子にしない（この分は残りに入る）
+            continue
         c = count_outside24(arr)
         if c:
             clipped[code] = c
@@ -499,9 +513,16 @@ def run_refine(
     stems[rest] = rest_arr.astype(np.float32)
     if clipped:
         log.warning("詳細分割で ±1 を超えた stem: %s", clipped)
+    if dropped:
+        log.info("無音なので作らなかった子（残りに入れた）: %s", ", ".join(dropped))
     report(1.0, "分割しました")
     return RefineOutput(
-        stems=stems, rest=rest, steps=steps, seconds=time.perf_counter() - t0, clipped=clipped
+        stems=stems,
+        rest=rest,
+        steps=steps,
+        seconds=time.perf_counter() - t0,
+        clipped=clipped,
+        dropped=dropped,
     )
 
 

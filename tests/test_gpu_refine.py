@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from audio_helpers import synth_drums, synth_mix
 from stemapp.config import Settings
-from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, seed
+from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, MEGA53, seed
 from stemapp.separation.refine import load_methods, rest_code, run_refine
 
 pytestmark = pytest.mark.gpu
@@ -53,3 +53,20 @@ def test_refine_on_gpu_sums_to_parent(
     peak = out.peak_memory_mb
     print(f"{model}: {out.seconds:.1f} 秒, GPU 最大 {peak:.0f} MB, 丸め {out.clipped}")
     assert peak is not None and peak > 0
+
+
+def test_mega53_on_gpu_sums_to_parent(session: Session, backend: object, tmp_path: Path) -> None:
+    """Mega 53（T07b）: 使う stem のマスク推定器だけを動かし、8GB に収まる。無音の子は作らない。"""
+    seed(session)
+    method = load_methods(session)[MEGA53]
+    x = synth_mix(8.0, amp=0.5)
+    out = run_refine(x, method, "other", backend, workdir=tmp_path)  # type: ignore[arg-type]
+    assert all(r.device == "cuda" and r.chunk_scale == 1.0 for r in out.steps)
+    kept = [c for c in out.stems if c != out.rest]
+    assert out.rest == "other_rest" and out.rest in out.stems
+    assert sorted(kept + out.dropped) == sorted(method.child_codes)
+    total = sum(a.astype(np.float64) for a in out.stems.values())
+    assert np.max(np.abs(total - x)) < 1e-5
+    peak = out.peak_memory_mb
+    print(f"{MEGA53}: {out.seconds:.1f} 秒, GPU 最大 {peak:.0f} MB, 作らなかった子 {out.dropped}")
+    assert peak is not None and 0 < peak < 4096

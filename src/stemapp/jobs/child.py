@@ -165,13 +165,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     hpss: HpssFunc | None = None
     if args.fake:
         from stemapp.beats.fake import FakeBeatAnalyzer
-        from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, SW
+        from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, MEGA53, SW
         from stemapp.separation.fake import FakeSeparator, fake_hpss
 
         beat_analyzer = FakeBeatAnalyzer()
         separator = FakeSeparator(
             delay_sec=args.fake_delay,
-            fail_models={SW, DRUMSEP, MALE_FEMALE, ASPIRATION} if args.fake_fail else (),
+            fail_models=(
+                {SW, DRUMSEP, MALE_FEMALE, ASPIRATION, MEGA53} if args.fake_fail else ()
+            ),
         )
         encoder = fake_encoder
         hpss = fake_hpss
