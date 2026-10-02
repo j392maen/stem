@@ -62,4 +62,5 @@
 - 不安定なテスト（T11c レビューより）: test_browser_tempo.py::test_swap_continuity_range_blur_lowmem が高負荷時に失敗（play 直後 30ms の開始待ちを測定に含むため。_speed_over の前に待ちを入れる）。test_offline_pitch_stays_at_rate_change の基準（3窓）は余裕がないので Edge 更新時に注意。vendor/signalsmith-stretch/README.md の改行が CRLF に（軽微）。
 - T11c の既定（PC は「ピッチを保つ・すぐ」）では 1.000 倍でも stem の ON/OFF・シーク・再生の出だしが約 0.12〜0.15 秒遅れる。ユーザーの感想しだいで既定を見直す。
 - 仕上げ（T07b レビューより）: Mega 53 の重みの自動ダウンロードでサイズ（1,368,919,887 B）かハッシュを確かめる。初回ダウンロード中は stage を「モデルをダウンロード中」にする。msst/__init__.py に lucidrains（BS-RoFormer、MIT）由来の一言。runner でサンプルレートの assert。使う stem だけの state_dict で組み立てて読み込みを速く（GPU テストで 72 秒）。STEM_TYPE は refine_model を1つしか持てないので strings/brass/woodwind/synth/percussion は Mega 53 専用の子になる（設計上の制約）。
-| T15 | 仕上げ2（Mega 53 の重みの検証と読み込みの高速化、不安定なテスト） | 実装中 |
+| T15 | 仕上げ2（Mega 53 の重みの検証と読み込みの高速化、不安定なテスト） | 完了（2026-10-03） |
+- 任意（T15 レビューより）: diag の端末名が「-数字」で終わると連番と読み違える（同時刻の重複時の並びだけ）。Mega 53 のダウンロードで http.client.HTTPException も日本語メッセージに包む。
