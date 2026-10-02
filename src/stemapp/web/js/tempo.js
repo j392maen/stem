@@ -482,7 +482,8 @@ export class TempoPanel {
   /** 今の設定で鳴らすべき組 { key, scale, rate, urls }。まだ無い（作成中）なら null。 */
   desired() {
     const r = this.ratio;
-    // ピッチも変わる・すぐ（PC）の方式は元の音声を playbackRate で鳴らす（すぐ は伸縮器で高さを戻す）
+    // 「ピッチも変わる」と「ピッチを保つ・すぐ（PC）」は元の音声を playbackRate で鳴らす
+    // （すぐ は伸縮器で高さを戻す）
     if (r === 1 || this.mode === "pitch" || this.mode === "instant") {
       return { key: ORIGINAL, scale: 1, rate: r, urls: this.urls };
     }
