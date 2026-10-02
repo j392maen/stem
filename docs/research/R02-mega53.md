@@ -71,3 +71,61 @@ VRAM の大部分は 53 個のマスク推定器の中間値と出力（stem ご
 4. batch 1。
 
 結論: 新しいパッケージは不要、重みは 1.37GB（2GB 以下）、コードは MIT、重みのライセンスは明示なし（個人利用で問題となる記述なし）。指示書の条件を満たすので 2（試用）に進む。
+
+## 2. 試用（RTX 4060 Laptop 8GB、2026-10-02）
+
+ユーザーの曲の other（SW 分割の残り）を一時フォルダにコピーして実行した（実データは読み取りのみ）。
+重みは `data/models/mvsep_mega_model_bs_roformer_53_stems_v1.ckpt`（1.37GB、中身は fp16 で 13,595 個のテンソル、
+パラメータ 6.82 億のうち 6.55 億がマスク推定器 [確認]）。推論は fp16 の autocast、batch 1、窓の重なり 2。
+
+### 2-1. 時間と GPU メモリ（184 秒の曲「水槽」の other）
+
+| 動かした stem | チャンク | 読み込み | 推論 | GPU 最大（allocated / reserved） |
+| --- | --- | --- | --- | --- |
+| 53 個すべて | 20 秒（既定） | 8.1 秒 | 66.3 秒 | **9,155 / 10,504 MB**（8GB を超える。Windows が共有メモリにあふれさせて完走した [推測]） |
+| 53 個すべて | 10 秒（0.5 倍） | 6.7 秒 | 61.8 秒 | 5,886 / 6,578 MB |
+| 53 個すべて | 5 秒（0.25 倍） | 6.7 秒 | 85.7 秒 | 4,251 / 4,664 MB |
+| 2 個（strings, synth） | 20 秒 | 6.3 秒 | 30.9 秒 | 1,446 / 1,646 MB |
+| **5 個（採用した組）** | 20 秒 | 6.8 秒 | 32.7 秒 | **1,587 / 1,796 MB** |
+
+- OOM（メモリ不足のエラー）は一度も出なかった。53 個すべてでも 0.5 倍のチャンクなら 8GB に収まる。
+- **使う stem のマスク推定器だけを動かす方式なら 1.6GB** で、チャンクを縮める必要はない。stemapp の詳細分割はこの方式（5 個）にした。
+- stemapp の詳細分割（`run_refine`、本物の分離器）で通して: 184 秒の曲 42.9 秒、154 秒の曲「春嵐」36.6 秒、どちらも GPU 最大 1,587MB。子の合計＝親（差 0）。
+
+### 2-2. 各出力の RMS（dBFS。53 個すべて、チャンク 0.5 倍）
+
+「水槽」（other の RMS −28.7dB）で −60dB 以上のもの（多い順）:
+synth −34.3、keys −38.5、marimba −42.9、organ −43.5、vocal −44.3、strings −45.7、back-vocal −46.5、percussion −46.9、accordion −48.1、violin −48.2、bowed_strings −49.5、bass −49.6、cello −52.7、double-bass −53.0、bells −53.9、dobro −56.4、lead-vocal −56.5、acoustic-guitar −56.6、sitar −59.2、wind −59.6、brass −59.6、banjo −59.8。
+ほかの 31 個は −60dB 未満（drums −100.4、snare −98.8、bassoon −95.7 など）。
+
+「春嵐」（other −25.0dB）で −60dB 以上のもの: synth −26.3、keys −34.2、violin −35.7、bowed_strings −36.7、bass −36.7、strings −39.9、accordion −49.6、vocal −49.8、double-bass −50.6、piano −51.2、organ −51.3、back-vocal −51.8、digital-piano −52.9、harpsichord −53.6、flute −58.0。
+
+stemapp の詳細分割（採用した 5 個、20 秒チャンク）での子の RMS:
+
+| 曲 | brass | woodwind | strings | synth | percussion | 残り |
+| --- | --- | --- | --- | --- | --- | --- |
+| 水槽（親 −28.7） | −57.7 | 無音（作らない） | −53.0 | −33.9 | −43.8 | −32.9 |
+| 春嵐（親 −25.0） | −53.7 | 無音（作らない） | −39.1 | −26.4 | 無音（作らない） | −36.8 |
+
+### 2-3. 重なりと、子にする組の決め方
+
+出力どうしの正規化内積（1 なら同じ音、0 なら無関係）が大きい組 [確認: 実測、水槽 / 春嵐]:
+keys–organ 0.83 / 0.59、keys–synth 0.72 / 0.63、organ–synth 0.50 / 0.34、brass–wind 0.90、back-vocal–vocal 0.93 / 0.95、bowed_strings–violin（春嵐）0.98、strings–bowed_strings 0.73 / 0.93、marimba–percussion 0.82。
+→ keys・wind・vocal は「まとめ」の stem で、細かい stem と同じ音を持つ。
+
+候補の組を other に当てはめた結果（「重なり」= 子の合計のエネルギー − 子のエネルギーの合計。同じ音が 2 回入った分。親に対する %）:
+
+| 組 | 水槽: 残り | 水槽: 重なり | 春嵐: 残り | 春嵐: 重なり |
+| --- | --- | --- | --- | --- |
+| strings, brass, woodwind, synth, keys, organ, percussion | 47.7% | +46.5% | 15.9% | +46.2% |
+| strings, brass, woodwind, synth, organ, percussion | 37.2% | +12.0% | 5.9% | +6.5% |
+| **strings, brass, woodwind, synth, percussion（採用）** | 37.9% | **+2.4%** | 5.9% | **+3.6%** |
+| bowed_strings, brass, woodwind, synth, percussion | 39.0% | +1.5% | 5.4% | +7.7% |
+
+- keys・organ を入れると同じ音が 2 回入り、「残り」がそれを打ち消す逆相の音になる。重なりの少ない **strings / brass / woodwind / synth / percussion** を子にした（`stemapp.seed.MEGA53_CHILDREN`）。organ・keys・marimba・ボーカルの漏れなどは「残り（その他）」に入る。
+- 「水槽」では残りが親のエネルギーの 38%（marimba・organ・ボーカルの漏れ・accordion など）。「春嵐」では 6%。
+- **チャンクの長さで結果が変わる**: 「水槽」の strings は 20 秒チャンクで −51.9dB、10 秒で −45.7dB、organ は −46.6 → −43.5dB。学習は 10 秒（`audio.chunk_size: 441000`）、推論の既定は 20 秒（`inference.chunk_size: 882000`）。どちらが良いかは聴かないと分からないので、作者の推論の既定（20 秒）のままにした [要試聴]。
+
+### 2-4. 判断
+
+8GB で問題なく動き（1.6GB・3 分の曲で約 40 秒）、synth（パッド等）が other の大部分を取り出せている（水槽 27%、春嵐 75% のエネルギー）。実用になると判断して、T07 の詳細分割の方法に組み込んだ（3）。分かれ方の質（オーケストラヒットがどこに入るか等）は試聴で確かめる必要がある。
