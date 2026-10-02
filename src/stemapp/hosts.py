@@ -22,6 +22,11 @@ MSG_BAD_HOST = (
 )
 
 
+def _is_port(text: str) -> bool:
+    """ポート番号の形（ASCII の数字だけ。全角数字や「²」も isdigit() は True なので除く）。"""
+    return text.isascii() and text.isdigit()
+
+
 def normalize_host(value: str) -> str:
     """Host ヘッダーや設定の値を「小文字・ポートなし・IPv6 は角かっこなし」にする。
 
@@ -35,12 +40,12 @@ def normalize_host(value: str) -> str:
         if end < 0:
             return ""
         name, rest = value[1:end], value[end + 1 :]
-        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+        if rest and not (rest.startswith(":") and _is_port(rest[1:])):
             return ""
         return name
     if value.count(":") == 1:
         name, port = value.split(":")
-        if not port.isdigit():
+        if not _is_port(port):
             return ""
         value = name
     elif value.count(":") > 1:

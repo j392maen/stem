@@ -136,10 +136,38 @@ def test_same_second_does_not_overwrite(settings: Settings) -> None:
     now = datetime(2026, 9, 26, 12, 0, 0).astimezone()
     a = diag.save_result(settings, {"device": "x", "n": 1}, {}, now=now)
     b = diag.save_result(settings, {"device": "x", "n": 2}, {}, now=now)
-    assert a == "20260926-120000-x.json"
-    assert b == "20260926-120000-x-2.json"
+    assert a == "20260926-120000000-x.json"
+    assert b == "20260926-120000000-x-2.json"
     results = diag.list_results(settings)
-    assert sorted(r["result"]["n"] for r in results) == [1, 2]
+    # 同じ時刻の名前でも、後から保存したものが先頭（名前の順だと "-2" が後ろになる）
+    assert [r["result"]["n"] for r in results] == [2, 1]
+
+
+def test_names_have_milliseconds_and_sort_newest_first(settings: Settings) -> None:
+    t = datetime(2026, 9, 26, 12, 0, 0, 5000).astimezone()
+    a = diag.save_result(settings, {"device": "x", "n": 1}, {}, now=t)
+    b = diag.save_result(settings, {"device": "x", "n": 2}, {},
+                         now=t.replace(microsecond=999000))
+    assert a == "20260926-120000005-x.json" and b == "20260926-120000999-x.json"
+    # T14 より前の名前（ミリ秒なし）も混ざって並ぶ
+    old = settings.data_dir / "diag" / "20260926-115959-old.json"
+    old.write_text('{"result": {"n": 0}}', encoding="utf-8")
+    assert [r["result"]["n"] for r in diag.list_results(settings)] == [2, 1, 0]
+
+
+def test_keeps_at_most_200(settings: Settings) -> None:
+    folder = diag.diag_dir(settings)
+    base = datetime(2026, 1, 1, 0, 0, 0).astimezone()
+    for i in range(diag.MAX_KEEP + 5):
+        name = f"{base:%Y%m%d}-{i // 60:04d}{i % 60:02d}-d{i}.json"
+        (folder / name).write_text("{}", encoding="utf-8")
+    diag.save_result(settings, {"device": "new"}, {})
+    names = sorted(p.name for p in folder.glob("*.json"))
+    assert len(names) == diag.MAX_KEEP
+    # 古い順に消え、新しく保存したものは残る
+    assert not any(n.endswith("-d0.json") or n.endswith("-d5.json") for n in names)
+    assert any(n.endswith("-new.json") for n in names)
+    assert any(n.endswith(f"-d{diag.MAX_KEEP + 4}.json") for n in names)
 
 
 @pytest.mark.parametrize(
