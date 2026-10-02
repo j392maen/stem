@@ -486,7 +486,9 @@ def run_render(
             except OSError:
                 pass
             _finish(session, settings, render_id, CANCELED, stage=STAGE_CANCELED)
-            log.info("作成中に速度変更のキャッシュが消されたため捨てました（render %d）。", render_id)
+            log.info(
+                "作成中に速度変更のキャッシュが消されたため捨てました（render %d）。", render_id
+            )
             return CANCELED
         log.info(
             "速度を変えた音声を作りました（render %d, %.1f MB）。", render_id, total / 1024 / 1024

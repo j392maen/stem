@@ -164,7 +164,7 @@ def worker(
     ] = None,
 ) -> None:
     """分割ワーカーだけを起動する（queued のジョブを1件ずつ実行する）。Ctrl+C で止まる。"""
-    from stemapp.jobs.supervisor import status_file
+    from stemapp.jobs.supervisor import EXIT_WORKER_LOCKED, status_file
     from stemapp.jobs.worker import (
         Worker,
         WorkerLock,
@@ -182,7 +182,8 @@ def worker(
         lock.acquire()
     except WorkerLockError as e:
         typer.echo(str(e))
-        raise typer.Exit(1) from e
+        # 専用の終了コード: serve の見張りはこのとき起動し直さない
+        raise typer.Exit(EXIT_WORKER_LOCKED) from e
     try:
         with _db_engine(settings) as factory:
             w = Worker(

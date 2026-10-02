@@ -15,7 +15,9 @@ from job_helpers import sync_launcher
 from stemapp.config import Settings
 from stemapp.db import make_session_factory
 from stemapp.jobs.supervisor import (
+    EXIT_WORKER_LOCKED,
     MSG_DOWN,
+    MSG_OTHER,
     Heartbeat,
     WorkerSupervisor,
     read_status,
@@ -113,6 +115,50 @@ def test_supervisor_restarts_crashed_worker_and_backs_off() -> None:
     clock.t += 1000
     sup.check_once()
     assert len(started) == n
+
+
+def test_supervisor_does_not_restart_when_other_worker_runs(tmp_path: Path) -> None:
+    """ワーカーがロックを取れずに専用の終了コードで終わったら、起動し直さない。"""
+    clock = Clock()
+    sup, started, _stopped = _supervisor(clock)
+    sup.start()
+    try:
+        started[0].rc = EXIT_WORKER_LOCKED
+        sup.check_once()
+        for _ in range(5):
+            clock.t += 120
+            sup.check_once()
+        assert len(started) == 1
+        snap = sup.snapshot()
+        assert snap["locked_out"] and not snap["alive"] and snap["restart_in_sec"] is None
+        # 別のワーカーが合図を書いている
+        write_status(status_file(tmp_path), {
+            "pid": 99, "alive_at": datetime.now(UTC).isoformat(), "job_id": 4,
+        })
+        h = worker_health(tmp_path, sup)
+        assert h["state"] == "other" and h["message"] == MSG_OTHER
+        assert "別のワーカーが動いています" in h["message"]
+        assert h["running"] is True and h["job_id"] == 4 and h["locked_out"] is True
+    finally:
+        sup.stop()
+
+
+def test_cli_worker_exit_code_when_locked(settings: Settings, monkeypatch: Any) -> None:
+    from typer.testing import CliRunner
+
+    from stemapp import cli
+    from stemapp.jobs.worker import WorkerLock
+
+    monkeypatch.setattr(cli, "_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_setup_logging", lambda: None)
+    held = WorkerLock(settings.data_root / "worker.lock")
+    held.acquire()
+    try:
+        res = CliRunner().invoke(cli.app, ["worker"])
+    finally:
+        held.release()
+    assert res.exit_code == EXIT_WORKER_LOCKED
+    assert "別のワーカー" in res.output
 
 
 def test_supervisor_thread_restarts_real_loop() -> None:

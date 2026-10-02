@@ -29,7 +29,15 @@ STATUS_FILE_NAME = "worker-status.json"
 STATE_RUNNING = "running"
 STATE_DOWN = "down"
 STATE_UNKNOWN = "unknown"  # 合図も見張りも無い（ワーカーを起動していない構成）
+STATE_OTHER = "other"  # serve のワーカーは起動できなかった（別のワーカーが同じデータで動いている）
 MSG_DOWN = "分割の処理が止まっています。"
+MSG_OTHER = (
+    "別のワーカーが動いています（stemapp serve / worker を二重に起動していないか"
+    "確かめてください）。"
+)
+# ワーカーが `data/worker.lock` を取れなかった（別のワーカーが動いている）ときの終了コード。
+# 見張りはこのときは起動し直さない（何度起動しても同じため）
+EXIT_WORKER_LOCKED = 75
 
 
 def status_file(data_root: Path) -> Path:
@@ -155,6 +163,8 @@ class WorkerSupervisor:
         self.last_exit_code: int | None = None
         self.last_exit_at: str | None = None
         self._crashes: deque[float] = deque()
+        # 別のワーカーが動いていて起動できなかった（起動し直さない）
+        self.locked_out = False
         self._restart_at: float | None = None  # 起動し直す予定（clock の値）。None は動いている
 
     def start(self) -> None:
@@ -177,7 +187,7 @@ class WorkerSupervisor:
         """1回分の見張り（テスト用にも使う）。落ちていれば記録し、時刻が来たら起動し直す。"""
         now = self._clock()
         with self._lock:
-            if self._stopping.is_set():
+            if self._stopping.is_set() or self.locked_out:
                 return
             if self._restart_at is None:
                 proc = self.proc
@@ -186,6 +196,13 @@ class WorkerSupervisor:
                     return
                 self.last_exit_code = rc
                 self.last_exit_at = _now_iso()
+                if rc == EXIT_WORKER_LOCKED:
+                    self.locked_out = True
+                    log.error(
+                        "別のワーカーが同じデータフォルダで動いているため、serve のワーカーは"
+                        "起動しません（起動し直しもしません）。"
+                    )
+                    return
                 self._crashes.append(now)
                 while self._crashes and now - self._crashes[0] > self.burst_window_sec:
                     self._crashes.popleft()
@@ -231,6 +248,7 @@ class WorkerSupervisor:
             )
             return {
                 "alive": alive,
+                "locked_out": self.locked_out,
                 "restarts": self.restarts,
                 "last_exit_code": self.last_exit_code,
                 "last_exit_at": self.last_exit_at,
@@ -266,16 +284,20 @@ def worker_health(
     alive_at = _parse_time(status.get("alive_at")) if status else None
     fresh = alive_at is not None and (now - alive_at).total_seconds() <= STALE_SEC
     sup = supervisor.snapshot() if supervisor is not None else None
-    if sup is not None:
+    if sup is not None and sup["locked_out"]:
+        # serve のワーカーは起動できなかった。動いているかは別のワーカーの合図で見る
+        state = STATE_OTHER
+    elif sup is not None:
         state = STATE_RUNNING if sup["alive"] else STATE_DOWN
     elif status is None:
         state = STATE_UNKNOWN
     else:
         state = STATE_RUNNING if fresh else STATE_DOWN
+    message = {STATE_DOWN: MSG_DOWN, STATE_OTHER: MSG_OTHER}.get(state)
     out: dict[str, Any] = {
         "state": state,
-        "running": state == STATE_RUNNING,
-        "message": MSG_DOWN if state == STATE_DOWN else None,
+        "running": state == STATE_RUNNING or (state == STATE_OTHER and fresh),
+        "message": message,
     }
     if not detail:
         return out
@@ -289,6 +311,7 @@ def worker_health(
             "job_id": current.get("job_id"),
             "postprocess_job_id": current.get("postprocess_job_id"),
             "tempo_render_id": current.get("tempo_render_id"),
+            "locked_out": bool(sup and sup["locked_out"]),
             "restarts": sup["restarts"] if sup else 0,
             "last_exit_code": sup["last_exit_code"] if sup else None,
             "last_exit_at": sup["last_exit_at"] if sup else None,
