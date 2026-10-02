@@ -96,7 +96,8 @@ def ensure_sample(settings: Settings, code: str, runner: FfmpegRunner | None = N
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9_-]+")
 # <年月日>-<時分秒><ミリ秒>-<端末>(-<番号>).json。T14 より前はミリ秒が無い
-_NAME_RE = re.compile(r"^(\d{8}-\d{6})(\d{3})?-[A-Za-z0-9_-]{1,32}(?:-\d+)?\.json$")
+# 3 つ目のグループは同じ名前を避けるために付けた番号（save_result の -2, -3 …）
+_NAME_RE = re.compile(r"^(\d{8}-\d{6})(\d{3})?-[A-Za-z0-9_-]{1,32}?(?:-(\d+))?\.json$")
 # 残す件数の上限（超えたら古い順に消す）
 MAX_KEEP = 200
 
@@ -141,18 +142,22 @@ def save_result(
     raise RuntimeError("診断結果のファイル名を決められませんでした。")
 
 
-def _sort_key(path: Path) -> tuple[str, int, str]:
-    """新しい順に並べるための鍵: (名前の日時＋ミリ秒, 書いた時刻, 名前)。
+def _sort_key(path: Path) -> tuple[str, int, int, str]:
+    """新しい順に並べるための鍵: (名前の日時＋ミリ秒, 書いた時刻, 番号, 名前)。
 
     同じミリ秒（や、ミリ秒の無い古い名前で同じ秒）のときはファイルの書いた時刻で決める。
+    書いた時刻も同じとき（Windows のファイル時刻は時計の刻み（約 1〜16ms）でしか進まないので、
+    続けて保存すると同じになる）は、名前の番号（-2 が後から保存したもの）で決める。
+    名前の順だと "x-2.json" < "x.json" になり、後から保存したものが後ろに並んでしまう。
     """
     m = _NAME_RE.match(path.name)
     stamp = (m.group(1) + (m.group(2) or "000")) if m else ""
+    seq = int(m.group(3)) if m and m.group(3) else 1
     try:
         mtime = path.stat().st_mtime_ns
     except OSError:
         mtime = 0
-    return stamp, mtime, path.name
+    return stamp, mtime, seq, path.name
 
 
 def _sorted_files(settings: Settings) -> list[Path]:
