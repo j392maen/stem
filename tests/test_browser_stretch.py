@@ -339,6 +339,7 @@ def test_instant_mode_player(page: Any, server: LiveServer, tmp_path: Path) -> N
     assert _engine(page, "e.position") >= before - 0.01
     assert _engine(page, "e.latency") == pytest.approx(_engine(page, "e.stretchLatency"))
     assert 0.05 < _engine(page, "e.latency") < 0.3
+    page.wait_for_timeout(400)  # 伸縮器をつないだ鳴らし直し（約 0.15 秒位置が止まる）を待つ
     assert _speed_over(page) == pytest.approx(1.1, abs=0.05)
     page.wait_for_function(
         "(t) => document.querySelector('#tp-inst-status').textContent.startsWith(t)",
