@@ -115,6 +115,42 @@ def test_reanalyze_beats(client: TestClient, tmp_path: Path) -> None:
     assert [s["bpm"] for s in segs] == [120.0, 150.0]
 
 
+def test_reanalyze_with_job_id_puts_warning_on_that_job(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """job_id を渡すと、そのジョブ（表示中の分け方）で解析し、失敗の警告もそこに付く。"""
+    track_id = _track(client, tmp_path)
+    first = _separate(client, track_id, FakeBeatAnalyzer(100))
+    res = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "standard"})
+    newest = res.json()["job"]["job_id"]
+    assert _worker(client).run_one() == newest
+    assert newest > first
+
+    # 指定の誤り
+    assert client.post(f"/api/tracks/{track_id}/beats", json={"job_id": 9999}).status_code == 404
+    other = _track(client, tmp_path / "o", seconds=4.0)
+    other_job = _separate(client, other, FakeBeatAnalyzer(90))
+    assert client.post(
+        f"/api/tracks/{track_id}/beats", json={"job_id": other_job}
+    ).status_code == 404
+
+    res = client.post(f"/api/tracks/{track_id}/beats", json={"job_id": first})
+    assert res.status_code == 202 and res.json()["job"]["job_id"] == first
+    settings = client.app.state.settings  # type: ignore[attr-defined]
+
+    def failing(_job_id: int, _stop: object) -> None:
+        raise RuntimeError("解析に失敗（テスト）")
+
+    worker = Worker(settings, _factory(client), sync_launcher(settings),
+                    postprocess_encoder=fake_encoder, beat_runner=failing)
+    assert worker.run_postprocess_one() == first
+    assert client.get(f"/api/jobs/{first}").json()["beat_warning"]
+    assert client.get(f"/api/jobs/{newest}").json()["beat_warning"] is None
+    # 省略時は最新の分割
+    res = client.post(f"/api/tracks/{track_id}/beats")
+    assert res.json()["job"]["job_id"] == newest
+
+
 def test_reanalyze_while_postprocess_active_drops_beats(
     client: TestClient, tmp_path: Path
 ) -> None:

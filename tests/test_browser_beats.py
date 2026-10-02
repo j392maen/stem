@@ -234,14 +234,19 @@ def test_beats_survive_job_switch(
     assert page.inner_text("#beats-btn") == "拍を解析"
     assert page.get_attribute("#wave-zoom", "data-grid") == "seconds"
 
-    # 表示中（fast）でないジョブ（新しい exp）が解析を受け持っても、そのジョブの終わりを待って
-    # 表示する。Fake の解析はすぐ終わるので、画面が exp の状態を確かめるまで拍を 404 にしておく
+    # 解析は表示中のジョブ（fast。新しい exp ではない）が受け持つ（T14: job_id を渡す）。
+    # そのジョブの終わりを待って表示する。Fake の解析はすぐ終わるので、画面が fast の状態を
+    # 確かめるまで拍を 404 にしておく
     polled: list[str] = []
+    posted: list[Any] = []
     page.on("request", lambda r: polled.append(r.url)
-            if r.url.endswith(f"/api/jobs/{exp_job}") else None)
+            if r.url.endswith(f"/api/jobs/{fast_job}") else None)
 
     def hold_beats(route: Any) -> None:
-        if route.request.method == "GET" and not polled:
+        if route.request.method == "POST":
+            posted.append(route.request.post_data_json)
+            route.continue_()
+        elif route.request.method == "GET" and not polled:
             route.fulfill(status=404, json={"detail": "テスト用: まだ無い"})
         else:
             route.continue_()
@@ -250,6 +255,7 @@ def test_beats_survive_job_switch(
     page.click("#beats-btn")
     _wait_bpm(page, "120.0", timeout_ms=20_000)
     page.unroute(f"**/api/tracks/{track_id}/beats")
+    assert posted == [{"job_id": fast_job}]
     page.wait_for_function("() => document.querySelector('#wave-zoom').dataset.grid === 'beats'")
     assert page.inner_text("#beats-btn") == "拍を再解析"
     assert "自動解析" in (page.get_attribute("#tempo", "title") or "")
