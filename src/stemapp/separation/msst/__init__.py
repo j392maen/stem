@@ -4,6 +4,8 @@
 - `bs_roformer.py` ← models/bs_roformer/bs_roformer.py
 - `attend.py` ← models/bs_roformer/attend.py
 ライセンス: MIT（同じフォルダの LICENSE。Copyright (c) 2024 Roman Solovyev (ZFTurbo)）。
+MSST のこの 2 ファイルは、lucidrains（Phil Wang）の BS-RoFormer 実装
+（https://github.com/lucidrains/BS-RoFormer、MIT）を元にしたもの。
 
 元からの変更点（`# stemapp:` の印を付けた行）:
 - import 先（`models.bs_roformer.attend` → `.attend`）
