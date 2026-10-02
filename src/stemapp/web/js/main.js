@@ -136,7 +136,7 @@ function workerNoticeText(worker) {
   const base = worker.message || "分割の処理が止まっています。";
   const sec = Number(worker.restart_in_sec);
   if (worker.managed && Number.isFinite(sec)) {
-    return `${base}自動で起動し直します（あと ${Math.ceil(sec)} 秒）。分割・速度変更の作成は、動き出すと続きから進みます。`;
+    return `${base}自動で起動し直します（あと ${Math.ceil(sec)} 秒）。待っている分割・速度変更の作成は、動き出すと順に進みます。`;
   }
   return `${base}stemapp を起動し直してください（分割・速度変更の作成が進みません）。`;
 }
