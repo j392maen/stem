@@ -157,6 +157,9 @@ def test_pitch_mode_rate_keeps_sync(page: Any, server: LiveServer, tmp_path: Pat
     track_id, _ = _done_track(server, tmp_path, seconds=24.0)
     _open(page, server, track_id)
     assert page.inner_text("#tp-readout") == "±0.0%"
+    # PC の既定は「ピッチを保つ・すぐ」（T11c）。このテストはピッチも変わる方式を選ぶ
+    assert page.get_attribute("#tp-mode .seg-btn[data-value='instant']", "aria-pressed") == "true"
+    page.click("#tp-mode .seg-btn[data-value='pitch']")
     assert page.get_attribute("#tp-mode .seg-btn[data-value='pitch']", "aria-pressed") == "true"
     # 一部の stem だけ鳴らす（1 キー = 最初の stem を OFF）
     page.evaluate(f"() => {VIEW}.seek(1.0)")
@@ -378,6 +381,9 @@ def test_tempo_screens_phone(browser: Any, server: LiveServer, tmp_path: Path) -
     try:
         pg.goto(f"{server.base_url}/#/track/{track_id}")
         pg.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
+        # スマホの既定はサーバーで作る方式（T11c）。まずピッチも変わる方式の画面
+        assert pg.evaluate(f"() => {VIEW}.tempo.mode") == "keep"
+        pg.click("#tp-mode .seg-btn[data-value='pitch']")
         pg.evaluate(f"() => {VIEW}.tempo.setRatio(0.955)")
         pg.wait_for_function("() => document.querySelector('#tp-readout').textContent === '−4.5%'")
         # はみ出さない（横スクロールが出ない）

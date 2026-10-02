@@ -465,10 +465,14 @@ select:focus-visible, .play-btn:focus-visible {
 .tp-status { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .tp-progress { width: 140px; }
 .tp-lowmem { margin-left: auto; }
+/* 方式の名前: スマホ幅では短い名前 */
+.seg-btn .lbl-short { display: none; }
 
 @media (max-width: 640px) {
   .tp-gap { display: none; }
   .tp-slider { min-width: 0; }
   .tp-keep .select { max-width: 100%; }
+  .seg-btn .lbl-long { display: none; }
+  .seg-btn .lbl-short { display: inline; }
   .tempo .bpm-orig { font-size: 10px; }
 }

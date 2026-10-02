@@ -80,6 +80,7 @@ def test_refine_keeps_speed_in_pitch_mode(
     """ピッチも変わる方式（playbackRate）で 1.1 倍にして再生中に、その他を分ける。"""
     track_id, _job_id = _done_track(server, tmp_path, seconds=60.0)
     _open(page, server, track_id)
+    page.evaluate(f"() => {VIEW}.tempo.setMode('pitch')")  # PC の既定は「すぐ」（T11c）
     page.evaluate(f"() => {VIEW}.tempo.setRatio(1.1)")
     page.click(".stem-btn[data-code='bass']")  # ベースを OFF
     page.evaluate(f"() => {VIEW}.seek(5.0)")
