@@ -76,6 +76,9 @@ def test_export_zip_and_mix(page: Any, server: LiveServer, tmp_path: Path) -> No
     assert page.locator("#export-level .seg-btn").count() == 2
     _create_and_wait(page, "用意した曲 - stems.zip")
     _shot(page, "export_done_pc.png")
+    # できた後は「ダウンロード」が主で、「作成する」は枠線だけ（primary ではない）
+    assert "primary" in (page.get_attribute("#export-download", "class") or "")
+    assert "primary" not in (page.get_attribute("#export-start", "class") or "")
     with page.expect_download() as info:
         page.click("#export-download")
     dl = info.value
@@ -97,6 +100,14 @@ def test_export_zip_and_mix(page: Any, server: LiveServer, tmp_path: Path) -> No
     _choose(page, "format", "mp3")
     expect = "用意した曲 - ボーカル＋ギター＋ピアノ＋その他.mp3"
     _create_and_wait(page, expect)
+    # 前に作った ZIP は「このジョブの書き出し」から再ダウンロードできる
+    page.wait_for_selector("#export-history .export-history-dl")
+    assert page.locator("#export-history li").count() == 1
+    assert page.inner_text("#export-history .export-history-file") == "用意した曲 - stems.zip"
+    with page.expect_download() as again:
+        page.click("#export-history .export-history-dl")
+    assert again.value.suggested_filename == "用意した曲 - stems.zip"
+    _shot(page, "export_history_pc.png")
     with page.expect_download() as info:
         page.click("#export-download")
     assert info.value.suggested_filename == expect
