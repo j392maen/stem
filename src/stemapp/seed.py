@@ -55,6 +55,13 @@ ASPIRATION = "aspiration_mel_band_roformer_sdr_18.9845.ckpt"
 # 信号処理（librosa の HPSS）。モデルファイルは無い。詳細分割の「方法」を MODEL の行でそろえて
 # 持つため、architecture="hpss" の行として登録する（stemapp.separation.refine が特別に扱う）
 HPSS = "hpss"
+# MVSep Mega 53 stems（MSST 形式の BS-Roformer。53 stem のうち other の子に使うものだけ動かす。
+# stemapp.separation.msst、docs/research/R02-mega53.md）。重みのライセンスは明示なし
+MEGA53 = "mvsep_mega_model_bs_roformer_53_stems_v1.ckpt"
+# Mega 53 から子にする stem（STEM_TYPE の code）。互いに重なりの少ない組（R02 2章）。
+# keys は synth・organ と、organ は synth と重なるので入れない（重なると同じ音が2回入り、
+# 「残り」がそれを打ち消す逆相の音になる）
+MEGA53_CHILDREN = ["strings", "brass", "woodwind", "synth", "percussion"]
 
 KARAOKE_OUT = ["lead_vocal", "backing_vocal"]  # "(Vocals)"=lead, "(Instrumental)"=それ以外
 
@@ -85,6 +92,8 @@ MODELS: list[ModelDef] = [
     ModelDef(ASPIRATION, "Mel-RoFormer 息", "mel_band_roformer", ["breath", "no_breath"]),
     ModelDef(HPSS, "HPSS（持続音／短い音）", "hpss", ["sustained", "transient"],
              license="ISC（librosa）"),
+    ModelDef(MEGA53, "Mega 53（楽器別・実験）", "msst_bs_roformer", MEGA53_CHILDREN,
+             license="不明（明示なし。コードは MIT）"),
 ]
 
 # --- STEM_TYPE ---------------------------------------------------------------
@@ -147,17 +156,18 @@ STEM_TYPES: list[StemTypeDef] = [
                 experimental=True, refine_model=HPSS),
     StemTypeDef("transient", "短い音（ヒット等）", "other", "detail", "#A21CAF",
                 experimental=True, refine_model=HPSS),
-    StemTypeDef("other_rest", "残り（その他）", "other", "detail", "#A58AAB"),
     StemTypeDef("wind", "管楽器", "other", "detail", "#67E8F9", experimental=True),
     StemTypeDef("saxophone", "サックス", "other", "detail", "#06B6D4"),
-    StemTypeDef("brass", "金管", "other", "detail", "#BEF264"),
-    StemTypeDef("woodwind", "木管", "other", "detail", "#86EFAC", experimental=True),
-    StemTypeDef("strings", "ストリングス", "other", "detail", "#F0ABFC"),
+    StemTypeDef("brass", "金管", "other", "detail", "#BEF264", refine_model=MEGA53),
+    StemTypeDef("woodwind", "木管", "other", "detail", "#86EFAC", experimental=True,
+                refine_model=MEGA53),
+    StemTypeDef("strings", "ストリングス", "other", "detail", "#F0ABFC", refine_model=MEGA53),
     StemTypeDef("organ", "オルガン", "other", "detail", "#C026D3"),
     StemTypeDef("keys", "キーボード", "other", "detail", "#93C5FD"),
-    StemTypeDef("synth", "シンセ", "other", "detail", "#D946EF", experimental=True),
+    StemTypeDef("synth", "シンセ", "other", "detail", "#D946EF", experimental=True,
+                refine_model=MEGA53),
     StemTypeDef("percussion", "パーカッション", "other", "detail", "#A3A3A3",
-                experimental=True),
+                experimental=True, refine_model=MEGA53),
     # パーカッションの詳細（灰色の系統）
     StemTypeDef("congas", "コンガ", "percussion", "detail", "#D4D4D4", experimental=True),
     StemTypeDef("tambourine", "タンバリン", "percussion", "detail", "#737373",
@@ -167,6 +177,8 @@ STEM_TYPES: list[StemTypeDef] = [
     StemTypeDef("bells", "ベル", "percussion", "detail", "#BDB76B", experimental=True),
     StemTypeDef("glockenspiel", "グロッケンシュピール", "percussion", "detail", "#8B8B6B",
                 experimental=True),
+    # 「残り」は other の子の最後に並べる（HPSS・Mega 53 のどちらで分けても子の後に出る）
+    StemTypeDef("other_rest", "残り（その他）", "other", "detail", "#A58AAB"),
 ]
 
 # --- SEPARATION_PRESET / PRESET_STEP -------------------------------------------

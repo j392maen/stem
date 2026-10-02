@@ -35,7 +35,7 @@ from stemapp.models import (
     Waveform,
 )
 from stemapp.peaks import DEFAULT_LEVELS
-from stemapp.seed import ASPIRATION, DRUMSEP, HPSS, MALE_FEMALE, seed
+from stemapp.seed import ASPIRATION, DRUMSEP, HPSS, MALE_FEMALE, MEGA53, seed
 from stemapp.separation import FakeSeparator
 from stemapp.separation.fake import DEFAULT_REFINE_COEFS, fake_hpss
 from stemapp.separation.hpss import (
@@ -151,18 +151,24 @@ def test_seed_rest_types_and_methods(seeded: Session) -> None:
         assert types.by_id[t.parent_id].code == "other"  # type: ignore[index]
 
     methods = load_methods(seeded, types)
-    assert set(methods) == {DRUMSEP, MALE_FEMALE, ASPIRATION, HPSS}
+    assert set(methods) == {DRUMSEP, MALE_FEMALE, ASPIRATION, HPSS, MEGA53}
     assert methods[DRUMSEP].child_codes == ("kick", "snare", "toms", "hihat", "ride", "crash")
     assert methods[DRUMSEP].parent_code == "drums"
     assert methods[MALE_FEMALE].child_codes == ("male", "female")
     assert methods[ASPIRATION].child_codes == ("breath",)
     assert methods[HPSS].child_codes == ("sustained", "transient")
     assert methods[HPSS].is_hpss and not methods[HPSS].uses_gpu
+    # Mega 53（T07b）: other の子。GPU を使い、無音の子は作らない（ほかの方法は作る）
+    assert methods[MEGA53].child_codes == ("brass", "woodwind", "strings", "synth", "percussion")
+    assert methods[MEGA53].parent_code == "other"
+    assert methods[MEGA53].uses_gpu and methods[MEGA53].drops_silent
+    assert not any(methods[m].drops_silent for m in (DRUMSEP, MALE_FEMALE, ASPIRATION, HPSS))
 
     def applies(model: str, code: str) -> bool:
         return method_applies(methods[model], code, types)
 
-    assert applies(DRUMSEP, "drums") and applies(HPSS, "other")
+    assert applies(DRUMSEP, "drums") and applies(HPSS, "other") and applies(MEGA53, "other")
+    assert not applies(MEGA53, "drums") and not applies(MEGA53, "synth")
     assert applies(MALE_FEMALE, "lead_vocal") and applies(MALE_FEMALE, "backing_vocal")
     assert applies(ASPIRATION, "backing_vocal")
     # vocals は分割時に lead / backing に分かれている（残りの型も無い）。子や別の親には使えない
@@ -566,7 +572,7 @@ def test_api_refine_flow(client: TestClient, api_job: tuple[int, int]) -> None:
     # 分けられる stem と方法
     assert [m["model"] for m in stems["drums"]["refine_methods"]] == [DRUMSEP]
     assert {m["model"] for m in stems["lead_vocal"]["refine_methods"]} == {MALE_FEMALE, ASPIRATION}
-    assert [m["model"] for m in stems["other"]["refine_methods"]] == [HPSS]
+    assert {m["model"] for m in stems["other"]["refine_methods"]} == {HPSS, MEGA53}
     assert stems["vocals"]["refine_methods"] == [] and stems["bass"]["refine_methods"] == []
     drum_method = stems["drums"]["refine_methods"][0]
     assert drum_method["available"] is True and drum_method["gpu"] is True

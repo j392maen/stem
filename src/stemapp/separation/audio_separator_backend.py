@@ -7,6 +7,9 @@ audio-separator の `Separator.separate()` は入力と各出力を個別に正�
 してファイルに書くため、stem の合計が元の曲と一致しなくなる。そこでモデルのロードだけ
 audio-separator に任せ、推論はロード済みインスタンスの `demix()` を直接呼んで、
 正規化せずに配列のまま受け取る。
+
+audio-separator の一覧に無い MSST 形式のモデル（MVSep Mega 53 stems）は、取り込んだ MSST の
+推論コード（`stemapp.separation.msst`）で動かす（T07b）。
 """
 
 from __future__ import annotations
@@ -17,13 +20,14 @@ import logging
 import re
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext, redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from stemapp.audio import read_audio
-from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE
+from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, MEGA53
 from stemapp.separation.base import (
     DEVICE_CPU,
     DEVICE_CUDA,
@@ -89,6 +93,36 @@ REFINE_OUTPUT_NAME_MAP: dict[str, dict[str, str]] = {
         "aspiration": "breath",
         "other": "no_breath",
     },
+    # mvsep_mega_model_bs_roformer_53_stems.yaml（training.instruments の 53 個のうち、
+    # other の子に使うものだけ。ここに載せた名前のマスク推定器だけを動かす。R02）
+    MEGA53: {
+        "strings": "strings",
+        "brass": "brass",
+        "woodwind": "woodwind",
+        "synth": "synth",
+        "percussion": "percussion",
+    },
+}
+
+
+@dataclass(frozen=True)
+class MsstModelFiles:
+    """audio-separator を通さずに動かす MSST 形式のモデル（重み・設定の入手先）。"""
+
+    config: str
+    url: str
+    config_url: str
+
+
+_MSST_RELEASE = (
+    "https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.21"
+)
+MSST_MODELS: dict[str, MsstModelFiles] = {
+    MEGA53: MsstModelFiles(
+        config="mvsep_mega_model_bs_roformer_53_stems.yaml",
+        url=f"{_MSST_RELEASE}/{MEGA53}",
+        config_url=f"{_MSST_RELEASE}/mvsep_mega_model_bs_roformer_53_stems.yaml",
+    ),
 }
 
 MIN_SEGMENT = 32  # チャンクを縮めるときの下限（dim_t）
@@ -267,6 +301,8 @@ class AudioSeparatorBackend:
     ) -> dict[str, np.ndarray]:
         import torch
 
+        if model_filename in MSST_MODELS:
+            return self._separate_msst(wav_path, model_filename, options, device, role)
         mix = read_audio(wav_path)  # (samples, 2)
         n = mix.shape[0]
         sep = instance = None
@@ -307,6 +343,69 @@ class AudioSeparatorBackend:
             return {k: _fit(v, n) for k, v in mapped.items()}
         finally:
             self._release(sep, instance)
+
+
+    # --- MSST 形式（audio-separator の一覧に無いもの） -----------------------------------
+
+    def ensure_msst_files(self, model_filename: str) -> tuple[Path, Path]:
+        """重みと設定が無ければダウンロードする（途中は .part に書き、終わったら名前を変える）"""
+        files = MSST_MODELS[model_filename]
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        out: list[Path] = []
+        for name, url in ((model_filename, files.url), (files.config, files.config_url)):
+            path = self.models_dir / name
+            if not path.is_file():
+                from torch.hub import download_url_to_file
+
+                tmp = path.with_name(path.name + ".part")
+                log.info("モデルをダウンロードします: %s → %s", url, path)
+                try:
+                    download_url_to_file(url, str(tmp), progress=False)
+                    tmp.replace(path)
+                except Exception as e:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"モデル {name} をダウンロードできませんでした（{url}）: {e}"
+                    ) from e
+            out.append(path)
+        return out[0], out[1]
+
+    def _separate_msst(
+        self,
+        wav_path: Path,
+        model_filename: str,
+        options: Mapping[str, Any],
+        device: str,
+        role: str,
+    ) -> dict[str, np.ndarray]:
+        import torch
+
+        from stemapp.separation.msst import runner
+
+        if role != ROLE_REFINE:
+            raise ValueError(f"{model_filename} は詳細分割（refine）にだけ使えます。")
+        if device == DEVICE_CUDA and not torch.cuda.is_available():
+            raise RuntimeError("CUDA が使えません（--cpu で CPU 実行できます）。")
+        table = REFINE_OUTPUT_NAME_MAP[model_filename]
+        ckpt, config = self.ensure_msst_files(model_filename)
+        mix = read_audio(wav_path)
+        n = mix.shape[0]
+        loaded = None
+        try:
+            loaded = runner.load_model(ckpt, config, list(table), device)
+            outputs = runner.separate(
+                loaded,
+                mix,
+                chunk_scale=float(options.get(OPT_CHUNK_SCALE, 1.0)),
+                use_fp16=self.use_fp16,
+            )
+            mapped = map_outputs(role, outputs, model_filename)
+            return {k: _fit(v, n) for k, v in mapped.items()}
+        finally:
+            del loaded
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _fit(x: np.ndarray, n: int) -> np.ndarray:

@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from stemapp.audio import read_audio
-from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE
+from stemapp.seed import ASPIRATION, DRUMSEP, MALE_FEMALE, MEGA53
 from stemapp.separation.base import DEVICE_CUDA, OPT_CHUNK_SCALE
 
 # 合計 0.97（1 にならない）
@@ -38,6 +38,11 @@ DEFAULT_REFINE_COEFS: dict[str, dict[str, float]] = {
     },
     MALE_FEMALE: {"male": 0.45, "female": 0.35},
     ASPIRATION: {"breath": 0.08, "no_breath": 0.85},
+    # Mega 53 は曲によって多くの出力がほぼ無音になる。woodwind を無音にして、無音の子を作らない
+    # 処理（stemapp.separation.refine）が画面のテストでも通るようにする
+    MEGA53: {
+        "strings": 0.15, "brass": 0.10, "woodwind": 0.0, "synth": 0.30, "percussion": 0.10,
+    },
 }
 # fake_hpss の係数（持続音・短い音）
 FAKE_HPSS_COEFS: dict[str, float] = {"sustained": 0.5, "transient": 0.2}
