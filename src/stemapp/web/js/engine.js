@@ -12,11 +12,51 @@
 //   曲の時刻の進む速さ speed = rate × bufScale。音声データ上の時刻 = 曲の時刻 ÷ bufScale。
 //   速度を変えるときは、全 stem の playbackRate を同じ AudioContext 時刻に setValueAtTime で変え、
 //   位置の基準（startOffset・startCtxTime）をその時刻に置き直す（段階的に切り替え、ランプは使わない）。
+// - ピッチを保つ・すぐ（T11c）: 全 stem の音量をかけて混ぜた音（bus）を、ブラウザ内の伸縮器
+//   （signalsmith-stretch の AudioWorklet。1 つだけ）に通す。音源は今までどおり playbackRate = r で
+//   鳴らし（同期・シーク・ループは T11 のまま）、伸縮器で音の高さを −12·log2(r) 半音戻す。
+//   伸縮器を通すと音が latency 秒（約 0.12 秒）遅れて聞こえるので、再生位置（position）は
+//   「latency 秒前に音源が鳴らした曲の時刻」にする。stem の ON/OFF も latency 秒遅れて聞こえる。
+//   経路: stem の GainNode → bus → dryDelay → dry ─┐
+//                                  └→ 伸縮器 → wet ─┴→ fade → master
+//   「すぐ」の方式の間（aligned）は、伸縮器に常に音を入れておき、dryDelay を伸縮器と同じ遅れにして
+//   dry と wet の時刻をそろえる。伸縮器を通す・外す（lock）は dry ⇔ wet の 15ms のクロスフェードだけで
+//   切り替える（鳴らし直さないので途切れない）。aligned の間は 1.000 倍でも位置に遅れを入れる。
+//   aligned の入り・切り（方式の切り替え）だけは、遅れが変わるのでシークと同じく鳴らし直す。
+//   位置の基準は音源の時刻で持ち、速度を変えた履歴（_past）を少し残して、聞こえている位置を数える。
 
 export const RAMP_SEC = 0.015;
 export const FADE_SEC = 0.008; // 一時停止・シークの前後のフェード（クリック音を減らす）
 const START_DELAY_SEC = 0.03; // start までの余裕（全 stem の start を同じ時刻に揃えるため）
 const RATE_DELAY_SEC = 0.02; // 速度を変えるまでの余裕（全 stem の playbackRate を同じ時刻に変えるため）
+const HISTORY_SEC = 2; // 位置の基準の履歴を残す長さ（伸縮器の遅れより十分長く）
+export const XFADE_SEC = 0.015; // 伸縮器を通す・外すときのクロスフェード
+// 伸縮器の遅れの補正（秒）。伸縮器が報告する遅れ（latency()）に足す。
+// 0.5〜2.0 倍の実測（OfflineAudioContext・ガウス形バーストの重心）で決めた（tests/test_browser_stretch.py）。
+export const STRETCH_LATENCY_FIX_SEC = 0;
+const STRETCH_URL = "../vendor/signalsmith-stretch/SignalsmithStretch.mjs";
+
+/** 倍率 r で速く鳴らした音を、元の高さに戻す半音数。 */
+export function semitonesFor(rate) {
+  const r = Number(rate);
+  return r > 0 ? -12 * Math.log2(r) : 0;
+}
+
+/**
+ * 位置の基準の履歴 past（{ offset, ctxTime, speed, loop? } を ctxTime の順）と今の基準 current から、
+ * AudioContext の時刻 ctxTime の曲の時刻を数える純粋関数。ctxTime が今の基準より前なら、
+ * その時刻に効いていた基準（ctxTime 以前で最も新しいもの。無ければ最も古いもの）で数える。
+ * 基準が loop を持っていれば（その当時のループ）それを使い、無ければ引数の loop を使う。
+ */
+export function positionFromHistory(past, current, ctxTime, loop, duration) {
+  let seg = current;
+  if (ctxTime < current.ctxTime && past.length) {
+    seg = past[0];
+    for (const s of past) if (s.ctxTime <= ctxTime) seg = s;
+  }
+  const lp = seg.loop !== undefined ? seg.loop : loop;
+  return songPositionAt(seg.offset, ctxTime - seg.ctxTime, seg.speed, lp, duration);
+}
 
 /**
  * 再生位置（秒）を計算する純粋関数。
@@ -62,6 +102,22 @@ export class Engine {
     this.master.connect(this.ctx.destination);
     this.fade = this.ctx.createGain(); // 全 stem 共通のフェード用
     this.fade.connect(this.master);
+    this.bus = this.ctx.createGain(); // 全 stem を混ぜた音（伸縮器の前）
+    this.dry = this.ctx.createGain(); // 伸縮器を通さない経路
+    this.wet = this.ctx.createGain(); // 伸縮器を通した経路
+    this.wet.gain.value = 0;
+    this.dryDelay = this.ctx.createDelay(1); // aligned の間は伸縮器と同じ遅れ
+    this.dryDelay.delayTime.value = 0;
+    this.bus.connect(this.dryDelay);
+    this.dryDelay.connect(this.dry);
+    this.dry.connect(this.fade);
+    this.wet.connect(this.fade);
+    this.stretch = null; // 伸縮器（AudioWorkletNode）。使うときに作る
+    this.stretchLatency = 0; // 伸縮器の遅れ（秒）
+    this.stretchFactory = null; // テスト用: (ctx) => Promise<伸縮器>
+    this._stretchLoading = null;
+    this.aligned = false; // 「すぐ」の方式: 伸縮器に音を入れ、dry も同じだけ遅らせる
+    this.lock = false; // 伸縮器を通した音（wet）を鳴らす（aligned の間だけ）
     this._wantPlay = false;
     this._starting = null;
     this.tracks = new Map(); // code → { buffer, gain, source }
@@ -71,7 +127,7 @@ export class Engine {
     this.pausedAt = 0;
     this.loop = null; // { start, end }（曲の時刻）
     this.duration = 0; // 曲の長さ（秒）
-    this._beforeRate = null; // 速度を変える直前の基準（切り替え時刻まではこちらで数える）
+    this._past = []; // 前の位置の基準 { offset, ctxTime, speed }（切り替え時刻まではこちらで数える）
     this.rate = 1; // 全 stem の playbackRate
     this.bufScale = 1; // 音声データの 1 秒が曲の何秒か
     this.onEnded = null;
@@ -82,11 +138,16 @@ export class Engine {
     return this.rate * this.bufScale;
   }
 
+  /** 音源が鳴らしてから聞こえるまでの遅れ（秒。伸縮器を通すときだけ）。 */
+  get latency() {
+    return this.aligned ? this.stretchLatency : 0;
+  }
+
   /** stem（code）を足す。buffer が null の stem は音を出さない（子に分かれた親など）。 */
   addTrack(code, buffer, gainValue = 0) {
     const gain = this.ctx.createGain();
     gain.gain.value = gainValue;
-    gain.connect(this.fade);
+    gain.connect(this.bus);
     this.tracks.set(code, { buffer, gain, source: null });
     if (buffer) this.duration = Math.max(this.duration, buffer.duration * this.bufScale);
   }
@@ -95,18 +156,26 @@ export class Engine {
     return this.ctx.decodeAudioData(arrayBuffer);
   }
 
+  /** 音源が AudioContext の時刻 ctxTime に鳴らす曲の時刻。 */
   _positionAtCtx(ctxTime) {
     // 速度の切り替え時刻より前は、切り替える前の基準と速さで数える（位置が止まって見えないように）
-    const prev = this._beforeRate;
-    if (prev && ctxTime < this.startCtxTime) {
-      return songPositionAt(prev.offset, ctxTime - prev.ctxTime, prev.speed, this.loop, this.duration);
-    }
-    return songPositionAt(this.startOffset, ctxTime - this.startCtxTime, this.speed, this.loop, this.duration);
+    const current = { offset: this.startOffset, ctxTime: this.startCtxTime, speed: this.speed };
+    return positionFromHistory(this._past, current, ctxTime, this.loop, this.duration);
   }
 
+  /** 今の基準を履歴に残す（loop はその基準の間のループ。古いものは捨てる）。 */
+  _pushHistory(loop = this.loop) {
+    this._past.push({
+      offset: this.startOffset, ctxTime: this.startCtxTime, speed: this.speed, loop,
+    });
+    const old = this.ctx.currentTime - this.latency - HISTORY_SEC;
+    while (this._past.length > 1 && this._past[1].ctxTime < old) this._past.shift();
+  }
+
+  /** 聞こえている曲の時刻（伸縮器を通すときは、その遅れの分だけ前）。 */
   get position() {
     if (!this.playing) return this.pausedAt;
-    return this._positionAtCtx(this.ctx.currentTime);
+    return this._positionAtCtx(this.ctx.currentTime - this.latency);
   }
 
   /** gains: { code: 倍率 }。15ms のランプで変える。 */
@@ -146,9 +215,11 @@ export class Engine {
   }
 
   _startSources(offset, when = this.ctx.currentTime + START_DELAY_SEC) {
+    // 新しい音が聞こえ始める時刻（伸縮器を通すときは遅れの分だけ後）からフェードイン
+    const heard = when + this.latency;
     const g = this.fade.gain;
-    g.setValueAtTime(0, when);
-    g.linearRampToValueAtTime(1, when + FADE_SEC);
+    g.setValueAtTime(0, heard);
+    g.linearRampToValueAtTime(1, heard + FADE_SEC);
     const s = this.bufScale;
     for (const t of this.tracks.values()) {
       if (!t.buffer) continue;
@@ -166,7 +237,7 @@ export class Engine {
     }
     this.startCtxTime = when;
     this.startOffset = offset;
-    this._beforeRate = null;
+    this._past = [];
   }
 
   /** 鳴っている音源を止める。at（AudioContext の時刻）を渡すとその時刻に止める。 */
@@ -247,6 +318,7 @@ export class Engine {
     if (!(r > 0) || r === this.rate) return;
     if (!this.playing) {
       this.rate = r;
+      if (this.aligned) this._scheduleSemitones(r, this.ctx.currentTime);
       return;
     }
     // 音源の開始（startCtxTime）がまだ先なら、その時刻にそろえる（開始前の位置を数え違えない）
@@ -255,7 +327,8 @@ export class Engine {
     for (const t of this.tracks.values()) {
       if (t.source) t.source.playbackRate.setValueAtTime(r, when);
     }
-    this._beforeRate = { offset: this.startOffset, ctxTime: this.startCtxTime, speed: this.speed };
+    if (this.aligned) this._scheduleSemitones(r, when);
+    this._pushHistory();
     this.rate = r;
     this.startOffset = base;
     this.startCtxTime = when;
@@ -275,11 +348,13 @@ export class Engine {
     const when = Math.max(now + START_DELAY_SEC, this.startCtxTime);
     const pos = wasPlaying ? this._positionAtCtx(when) : this.position;
     if (wasPlaying) {
+      // 伸縮器を通すときは、when に鳴らした音が聞こえる時刻（when + 遅れ）でつなぐ
+      const heard = when + this.latency;
       const g = this.fade.gain;
       g.cancelScheduledValues(now);
       g.setValueAtTime(g.value, now);
-      g.setValueAtTime(g.value, Math.max(now, when - FADE_SEC));
-      g.linearRampToValueAtTime(0, when);
+      g.setValueAtTime(g.value, Math.max(now, heard - FADE_SEC));
+      g.linearRampToValueAtTime(0, heard);
       this._stopSources(when);
     }
     for (const [code, t] of this.tracks) {
@@ -291,7 +366,7 @@ export class Engine {
     if (wasPlaying) {
       this._startSources(clampTime(pos, this.duration), when);
       // when までは前の音源が鳴っているので、前の基準で数える（位置が止まって見えないように）
-      this._beforeRate = before;
+      this._past = [before];
     } else {
       this.pausedAt = clampTime(pos, this.duration);
     }
@@ -300,11 +375,13 @@ export class Engine {
   /** ループ区間を設定（null で解除。曲の時刻）。再生中は音を止めずに切り替える。 */
   setLoop(loop) {
     const valid = loop && loop.end > loop.start ? { start: loop.start, end: loop.end } : null;
-    const pos = this.position;
     const now = this.ctx.currentTime;
     // 基準を置き直す時刻: 今。ただし音源の開始・速度の切り替えが予約中ならその時刻
     const at = this.playing ? Math.max(now, this.startCtxTime) : now;
-    const base = this.playing ? this._positionAtCtx(at) : pos;
+    // 区間の内外は、音源が鳴らしている位置で判断する（伸縮器の遅れの分は含めない）
+    const pos = this.playing ? this._positionAtCtx(at) : this.position;
+    const base = pos;
+    const prevLoop = this.loop;
     this.loop = valid;
     if (!this.playing) {
       if (valid && (pos < valid.start || pos >= valid.end)) this.pausedAt = valid.start;
@@ -324,9 +401,106 @@ export class Engine {
         t.source.loopEnd = valid.end / s;
       }
     }
+    this._pushHistory(prevLoop); // 切り替えより前（当時のループで）（聞こえるのが遅れている分も）は、前の基準で数える
     this.startOffset = base;
     this.startCtxTime = at;
-    if (at <= now) this._beforeRate = null; // 予約中の切り替えより前は、前の基準で数える
+  }
+
+  // --- ピッチを保つ・すぐ（ブラウザ内の伸縮器。T11c） ---------------------------------------
+
+  /** 伸縮器を作る（1 回だけ。2 回目からは同じものを返す）。失敗したら次に呼んだとき作り直す。 */
+  ensureStretch() {
+    if (this.stretch) return Promise.resolve(this.stretch);
+    if (!this._stretchLoading) {
+      const loading = (async () => {
+        const create = this.stretchFactory || (await import(STRETCH_URL)).default;
+        const node = await create(this.ctx);
+        const lat = Number(await node.latency()) || 0;
+        node.schedule({ active: false });
+        node.connect(this.wet);
+        this.stretchLatency = Math.max(0, lat + STRETCH_LATENCY_FIX_SEC);
+        this.stretch = node;
+        return node;
+      })();
+      this._stretchLoading = loading;
+      loading.catch(() => { if (this._stretchLoading === loading) this._stretchLoading = null; });
+    }
+    return this._stretchLoading;
+  }
+
+  /** 伸縮器の音の高さを、音源の時刻 when から倍率 rate の分だけ戻す。 */
+  _scheduleSemitones(rate, when) {
+    if (!this.stretch) return;
+    // 伸縮器は「出力の時刻」で予約する。音源の時刻 when に鳴らした音が聞こえる時刻（when + 遅れ）に
+    // 合わせると、playbackRate を変えた音にちょうど新しい半音数がかかる（実測で外れが無い）
+    this.stretch.schedule({ semitones: semitonesFor(rate), output: when + this.stretchLatency });
+  }
+
+  /**
+   * 「すぐ」の方式に入る・出る。入ると伸縮器に音を入れ続け、dry も伸縮器と同じだけ遅らせる
+   * （位置にも遅れを入れる）。出ると伸縮器を外す。伸縮器は ensureStretch() で先に作る（無ければ入らない）。
+   * 遅れが変わるので、再生中はシークと同じく、いったん音を消して聞こえていた位置から鳴らし直す。
+   */
+  setAligned(on) {
+    const want = !!on && !!this.stretch;
+    if (want === this.aligned) return want;
+    const wasPlaying = this.playing;
+    const pos = this.position; // 聞こえている位置
+    const now = this.ctx.currentTime;
+    let at = now;
+    if (wasPlaying) {
+      at = this._fadeOut();
+      this._stopSources(at);
+    }
+    this.dryDelay.delayTime.cancelScheduledValues(now);
+    this.dryDelay.delayTime.setValueAtTime(want ? this.stretchLatency : 0, at);
+    if (want) {
+      this.bus.connect(this.stretch);
+      this.stretch.schedule({ active: true, semitones: semitonesFor(this.rate) });
+    } else {
+      this._setPath(false, at, at);
+      this.lock = false;
+      try { this.bus.disconnect(this.stretch); } catch { /* つないでいない */ }
+      this.stretch.schedule({ active: false, output: at + this.stretchLatency });
+    }
+    this.aligned = want;
+    if (wasPlaying) this._startSources(clampTime(pos, this.duration));
+    else this.pausedAt = clampTime(pos, this.duration);
+    return want;
+  }
+
+  /** dry ⇔ wet を、from から to までのクロスフェードで切り替える（wet = 伸縮器を通した音）。 */
+  _setPath(wet, from, to) {
+    const now = this.ctx.currentTime;
+    for (const [node, value] of [[this.dry, wet ? 0 : 1], [this.wet, wet ? 1 : 0]]) {
+      const g = node.gain;
+      g.cancelScheduledValues(now);
+      g.setValueAtTime(g.value, now);
+      if (to > from) {
+        g.setValueAtTime(g.value, from);
+        g.linearRampToValueAtTime(value, to);
+      } else {
+        g.setValueAtTime(value, from);
+      }
+    }
+  }
+
+  /**
+   * 伸縮器を通した音（wet）を鳴らす / 通さない音（dry）に戻す。「すぐ」の方式（aligned）の間だけ。
+   * dry と wet は時刻がそろっているので、15ms のクロスフェードだけで切り替える（鳴らし直さない）。
+   * 速度の変更が予約されていれば、その音が聞こえる時刻（startCtxTime + 遅れ）を境にする:
+   * 通すときはそこまでに wet へ、外すとき（1.000 倍に戻したとき）はそこから dry へ。
+   */
+  setPitchLock(on) {
+    const want = !!on && this.aligned;
+    if (want === this.lock) return want;
+    const now = this.ctx.currentTime;
+    const edge = this.playing ? Math.max(now, this.startCtxTime + this.latency) : now;
+    if (!this.playing) this._setPath(want, now, now);
+    else if (want) this._setPath(true, Math.max(now, edge - XFADE_SEC), Math.max(now + XFADE_SEC, edge));
+    else this._setPath(false, edge, edge + XFADE_SEC);
+    this.lock = want;
+    return want;
   }
 
   /** 毎フレーム呼ぶ。ループなしで最後まで来たら止める。 */
@@ -343,6 +517,9 @@ export class Engine {
     this._stopSources();
     this.playing = false;
     this.tracks.clear();
+    if (this.stretch) {
+      try { this.stretch.disconnect(); } catch { /* 外し済み */ }
+    }
     try { await this.ctx.close(); } catch { /* 閉じ済み */ }
   }
 }
