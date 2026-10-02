@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -315,6 +316,43 @@ def test_postprocess_rebuild_invalidates_tempo_cache(client: TestClient, tmp_pat
         assert tempo.invalidate_job_tempo(s, settings, job_id) == 0
         assert tempo.invalidate_job_tempo(s, settings, other) == 1
     assert _done_ratios(client, other) == []
+
+
+@pytest.mark.parametrize("files_too", [True, False])
+def test_invalidated_just_before_saving_is_canceled(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files_too: bool
+) -> None:
+    """伸縮が終わって結果を書き込む直前に、別の処理（invalidate_job_tempo）が行を消した。
+
+    外部キーの違反（IntegrityError）で落ちず、作ったファイルを捨てて canceled として終える。
+    """
+    job_id = _done_job(client, tmp_path)
+    r = _request(client, job_id, 1.1)
+    settings = _settings(client)
+    fired = [False]
+
+    def invalidate_unnoticed(_session: Any, _render_id: int) -> bool:
+        # キャンセルの確認の直後に行が消された（確認では気づかない）ことにする
+        if not fired[0]:
+            fired[0] = True
+            with _factory(client)() as other:
+                if files_too:
+                    assert tempo.invalidate_job_tempo(other, settings, job_id) == 1
+                else:
+                    # 行だけ消えた（書き込みは外部キーの違反 IntegrityError になる）
+                    other.execute(sa_delete(TempoRender).where(TempoRender.job_id == job_id))
+                    other.commit()
+        return False
+
+    monkeypatch.setattr(tempo, "_cancel_wanted", invalidate_unnoticed)
+    with _factory(client)() as s:
+        assert tempo.claim_next_render(s) == r["render_id"]
+    outcome = tempo.run_render(settings, _factory(client), r["render_id"], FakeStretcher())
+    assert fired[0] and outcome == tempo.CANCELED
+    with _factory(client)() as s:
+        assert s.get(TempoRender, r["render_id"]) is None
+        assert s.scalars(select(TempoRendition)).all() == []
+    assert not tempo.job_tempo_dir(settings, job_id).exists()  # 作ったファイルは捨てる
 
 
 def test_request_render_stale_state(client: TestClient, tmp_path: Path) -> None:
