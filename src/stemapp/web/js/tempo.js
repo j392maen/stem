@@ -2,8 +2,10 @@
 //
 // - ピッチも変わる方式（pitch）: 全 stem の playbackRate を同じ時刻で r にする（engine.setRate）。すぐ効く。
 // - ピッチを保つ・すぐ（instant。T11c。PC 向け）: 元の音声を playbackRate = r で鳴らし、全 stem を混ぜた音を
-//   ブラウザ内の伸縮器（signalsmith-stretch）で元の高さに戻す（engine.setPitchLock）。スライダーを動かすと
-//   すぐ変わる。r = 1 では伸縮器を通さない（スライダーを動かしている間は 1 を通っても通したまま）。
+//   ブラウザ内の伸縮器（signalsmith-stretch）で元の高さに戻す（engine.setAligned / setPitchLock）。
+//   スライダーを動かすとすぐ変わる。r = 1 では伸縮器を通した音を使わない（15ms のクロスフェードで
+//   切り替え。スライダーを動かしている間は 1 を通っても通したまま）。伸縮器が 5 秒で用意できなければ
+//   使えないものとして、ピッチも変わる方式で鳴らす。
 // - ピッチを保つ・高音質（keep）: サーバーで各 stem を r 倍に伸縮した音声を作ってもらい（POST
 //   /api/jobs/{id}/tempo、進み具合は SSE）、できたら同じ曲の時刻から差し替える（engine.setBuffers）。
 //   作っている間は「元の速度のまま（今の音のまま）」か「ピッチを変えて指定の速度で」鳴らす（設定）。
@@ -34,6 +36,8 @@ const REQUEST_DELAY_MS = 500; // ピッチを保つ方式でスライダーを�
 const LOAD_CONCURRENCY = 3;
 const POLL_MS = 1500;
 const ORIGINAL = "orig";
+// 伸縮器の用意を待つ長さ（これを過ぎたら使えないものとする）。テストで変えられるようオブジェクトにする
+export const STRETCH_TIMEOUT = { ms: 5000 };
 
 /** 倍率を小数3桁に丸めて MIN〜MAX に収める。 */
 export function clampRatio(r) {
@@ -190,6 +194,14 @@ export class TempoPanel {
       ["keep", "ピッチを保つ・高音質",
         "サーバーで音の高さを変えずに伸縮した音声を作ります（数秒〜十数秒かかる。スマホ向け）"],
     ], (v) => this.setMode(v));
+    // スマホ幅では短い名前にする（CSS で切り替え）
+    const short = { pitch: "ピッチ変化", instant: "保つ・すぐ", keep: "保つ・高音質" };
+    for (const b of this.modeSeg.querySelectorAll(".seg-btn")) {
+      const long = b.textContent;
+      b.setAttribute("aria-label", long);
+      b.replaceChildren(el("span", { class: "lbl-long", text: long }),
+        el("span", { class: "lbl-short", text: short[b.dataset.value] }));
+    }
     this.modeSeg.id = "tp-mode";
     this.rangeSeg = seg("スライダーの幅", RANGES.map((n) => [n, `±${n}`, `スライダーの幅を ±${n}% にします`]),
       (v) => this.setRange(v));
@@ -356,10 +368,11 @@ export class TempoPanel {
     const e = this.engine;
     const st = this.stretchState;
     let text;
-    if (st === "failed") text = "このブラウザでは使えません（ピッチも変わる方式で再生中）";
-    else if (e && e.lock) text = `ブラウザ内でピッチを保っています（音の遅れ ${Math.round(e.latency * 1000)}ms）`;
-    else if (st === "loading" && this.ratio !== 1) text = "準備中…";
-    else text = "元の速度です（速度を変えるとすぐ反映）";
+    const lag = e && e.aligned ? `音の遅れ ${Math.round(e.latency * 1000)}ms` : "";
+    if (st === "failed") text = "ブラウザ内の伸縮を使えません（ピッチも変わる方式で再生中）";
+    else if (e && e.lock) text = `ブラウザ内でピッチを保っています（${lag}）`;
+    else if (st === "loading") text = "準備中…";
+    else text = `元の速度です（速度を変えるとすぐ反映${lag ? `。${lag}` : ""}）`;
     this.instStatus.textContent = text;
     this.instStatus.classList.toggle("error-text", st === "failed");
   }
@@ -453,11 +466,18 @@ export class TempoPanel {
     if (!engine || this.stretchState === "loading" || this.stretchState === "failed") return;
     if (engine.stretch) { this.stretchState = "ready"; return; }
     this.stretchState = "loading";
-    engine.ensureStretch().then(() => {
-      if (this.disposed || engine !== this.engine) return;
+    let timer = 0;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${STRETCH_TIMEOUT.ms / 1000} 秒たっても用意できません`)),
+        STRETCH_TIMEOUT.ms);
+    });
+    Promise.race([engine.ensureStretch(), timeout]).then(() => {
+      clearTimeout(timer);
+      if (this.disposed || engine !== this.engine || this.stretchState !== "loading") return;
       this.stretchState = "ready";
       this.apply();
     }, (e) => {
+      clearTimeout(timer);
       if (this.disposed || engine !== this.engine) return;
       this.stretchState = "failed";
       toast(`ブラウザ内の伸縮を使えません: ${e.message || e}`);
@@ -471,12 +491,19 @@ export class TempoPanel {
       && (this.ratio !== 1 || this.dragging) && this.stretchState !== "failed";
   }
 
-  /** 伸縮器のつなぎ方を今の設定に合わせる。まだ作っていなければ作る。 */
+  /**
+   * 伸縮器のつなぎ方を今の設定に合わせる。「すぐ」の方式で元の音声を鳴らしている間は aligned
+   * （伸縮器に音を入れ、遅れをそろえる）にし、速度が 1 以外か動かし中なら伸縮器の音を使う。
+   * まだ作っていなければ作る。
+   */
   syncLock() {
     const engine = this.engine;
-    if (!this.wantLock()) { engine.setPitchLock(false); return; }
-    if (engine.stretch) { engine.setPitchLock(true); return; }
-    this.prepareStretch();
+    const instant = this.mode === "instant" && this.activeKey === ORIGINAL
+      && this.stretchState !== "failed";
+    if (!instant) { engine.setAligned(false); return; }
+    if (!engine.stretch) { this.prepareStretch(); return; }
+    engine.setAligned(true);
+    engine.setPitchLock(this.wantLock());
   }
 
   /** 今の設定で鳴らすべき組 { key, scale, rate, urls }。まだ無い（作成中）なら null。 */
@@ -522,7 +549,7 @@ export class TempoPanel {
       this.refreshStatus();
       return;
     }
-    engine.setPitchLock(false); // 音声の組を差し替える間は伸縮器を通さない
+    engine.setAligned(false); // 音声の組を差し替える間は伸縮器を通さない
     // 目標の組がまだ無い・読み込み中: 今の組で鳴らしておく
     const speedNow = this.mode === "pitch" || this.ratio === 1 || this.pending === "pitch";
     if (speedNow) engine.setRate(this.ratio / engine.bufScale);

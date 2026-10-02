@@ -120,7 +120,14 @@ def test_stretch_pure_functions(page: Any, server: LiveServer) -> None:  # noqa:
                  E.positionFromHistory(past, cur, 6, null, 100),   // 2 倍の区間: 5 + 2
                  E.positionFromHistory(past, cur, 8, null, 100),   // 今の基準: 9 + 0.5
                  E.positionFromHistory([], cur, 6, null, 100),     // 履歴なし: 基準で止まる
-                 E.positionFromHistory(past, cur, -1, null, 100)], // 最も古い基準より前
+                 E.positionFromHistory(past, cur, -1, null, 100), // 最も古い基準より前
+                 // 当時のループを持つ基準はそれで折り返す（今はループ解除: null）
+                 E.positionFromHistory(
+                   [{ offset: 3, ctxTime: 0, speed: 1, loop: { start: 2, end: 4 } }],
+                   cur, 2, null, 100),
+                 // 当時ループが無かった基準は、今のループで折り返さない
+                 E.positionFromHistory([{ offset: 3, ctxTime: 0, speed: 1, loop: null }],
+                                       cur, 2, { start: 2, end: 4 }, 100)],
           semi: [E.semitonesFor(1), E.semitonesFor(2), E.semitonesFor(0.5), E.semitonesFor(0)],
           modes: T.MODES,
           def: [T.defaultMode(true, false), T.defaultMode(true, true), T.defaultMode(false, false)],
@@ -131,7 +138,8 @@ def test_stretch_pure_functions(page: Any, server: LiveServer) -> None:  # noqa:
         };
     }"""
     )
-    assert res["hist"] == [pytest.approx(3), pytest.approx(7), pytest.approx(9.5), 9, 0]
+    assert res["hist"] == [pytest.approx(3), pytest.approx(7), pytest.approx(9.5), 9, 0,
+                           pytest.approx(3), pytest.approx(5)]
     assert res["semi"][0] == 0
     assert res["semi"][1] == pytest.approx(-12) and res["semi"][2] == pytest.approx(12)
     assert res["semi"][3] == 0
@@ -144,7 +152,7 @@ def test_stretch_pure_functions(page: Any, server: LiveServer) -> None:  # noqa:
 # --- 時刻のずれ（OfflineAudioContext で本物の伸縮器を通す） -------------------------------------
 
 OFFLINE_JS = """
-async ({ ratio, actions, nSec, renderSec }) => {
+async ({ ratio, actions, nSec, renderSec, tone }) => {
   const { engine: E } = window.__stemapp.modules;
   const sr = 48000;
   const ctx = new OfflineAudioContext(2, Math.round(renderSec * sr), sr);
@@ -152,7 +160,13 @@ async ({ ratio, actions, nSec, renderSec }) => {
   const n = nSec * sr;
   const buf = ctx.createBuffer(2, n, sr);
   const d0 = buf.getChannelData(0), d1 = buf.getChannelData(1);
-  for (let c = 1; c < nSec; c++) {
+  if (tone) {
+    for (let i = 0; i < n; i++) {
+      const v = 0.3 * Math.sin(2 * Math.PI * 440 * i / sr);
+      d0[i] = v; d1[i] = v;
+    }
+  }
+  for (let c = 1; c < nSec && !tone; c++) {
     for (let i = Math.floor((c - 0.06) * sr); i < Math.min(n, (c + 0.06) * sr); i++) {
       const t = i / sr;
       const v = 0.5 * Math.exp(-0.5 * ((t - c) / 0.01) ** 2) * Math.sin(2 * Math.PI * 440 * t);
@@ -162,7 +176,8 @@ async ({ ratio, actions, nSec, renderSec }) => {
   e.addTrack("a", buf, 1);
   await e.ensureStretch();
   e.setRate(ratio);
-  e.setPitchLock(true);
+  e.setAligned(true);
+  e.setPitchLock(ratio !== 1);
   await e.stretch.latency(); // 予約（schedule）が伸縮器に届くのを待つ
   e._startSources(0, 0);
   e.playing = true;
@@ -177,6 +192,7 @@ async ({ ratio, actions, nSec, renderSec }) => {
         if (a.done || a.at > ctx.currentTime + 1e-9) continue;
         a.done = true;
         if (a.op === "rate") e.setRate(a.v);
+        else if (a.op === "rate+lock") { e.setRate(a.v); e.setPitchLock(a.v !== 1); }
         else if (a.op === "seek") e.seek(a.v);
         else if (a.op === "loop") e.setLoop(a.v);
         applied.push([a.op, ctx.currentTime]);
@@ -192,15 +208,15 @@ async ({ ratio, actions, nSec, renderSec }) => {
   for (let i = 0; i < bytes.length; i += 0x8000) {
     bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   }
-  return { y: btoa(bin), trace, latency: e.latency, applied };
+  return { y: btoa(bin), trace, latency: e.latency, applied, starts: e.startCtxTime };
 }
 """
 
 
 def _render(pg: Any, ratio: float, actions: list[dict[str, Any]], n_sec: int,
-            render_sec: float) -> dict[str, Any]:
+            render_sec: float, tone: bool = False) -> dict[str, Any]:
     res = pg.evaluate(OFFLINE_JS, {
-        "ratio": ratio, "actions": actions, "nSec": n_sec, "renderSec": render_sec,
+        "ratio": ratio, "actions": actions, "nSec": n_sec, "renderSec": render_sec, "tone": tone,
     })
     res["y"] = np.frombuffer(base64.b64decode(res["y"]), dtype=np.float32).astype(np.float64)
     return res
@@ -300,6 +316,47 @@ def test_offline_time_offset_with_changes(page: Any, server: LiveServer) -> None
     assert all(abs(v) < 8.0 for v in values), errs
 
 
+def _semitone_track(y: np.ndarray, center: float, span: float = 0.1) -> list[tuple[float, float]]:
+    """center の前後 span 秒を、21ms 窓（1024 点）・5ms 刻みで 440Hz からのずれ（半音）にする。"""
+    w = 1024
+    hop = SR * 5 // 1000
+    out = []
+    for c in np.arange(center - span, center + span, hop / SR):
+        lo = int(c * SR - w / 2)
+        seg = y[lo:lo + w] * np.hanning(w)
+        sp = np.abs(np.fft.rfft(seg, n=SR * 2))  # 0.5Hz 刻み
+        k = int(np.argmax(sp))
+        a, b, g = sp[k - 1], sp[k], sp[k + 1]
+        k_f = k + 0.5 * (a - g) / (a - 2 * b + g)  # 放物線で山の位置を細かく
+        hz = k_f / 2
+        out.append((float(c - center), float(12 * np.log2(hz / 440))))
+    return out
+
+
+@pytest.mark.parametrize(
+    ("r0", "r1"),
+    [(1.1, 1.25), (0.9, 0.92), (1.0, 1.1), (1.1, 1.0), (1.25, 0.8)],
+)
+def test_offline_pitch_stays_at_rate_change(
+    page: Any, server: LiveServer, r0: float, r1: float  # noqa: F811
+) -> None:
+    """速度を変えた瞬間の前後 100ms も音の高さが外れない（440Hz の音で ±0.3 半音の外れは数窓まで）。
+
+    1.0 ⇔ 1.1 は伸縮器の音（wet）と通さない音（dry）のクロスフェードも含む。
+    """
+    page.goto(server.base_url + "/#/library")
+    page.wait_for_function("() => window.__stemapp && window.__stemapp.modules")
+    res = _render(page, r0, [{"at": 2.0, "op": "rate+lock", "v": r1}], 10, 4.0, tone=True)
+    heard = res["starts"] + res["latency"]  # 速度を変えた音が聞こえる時刻
+    track = _semitone_track(res["y"], heard)
+    off = [(round(t * 1000), round(d, 2)) for t, d in track if abs(d) > 0.3]
+    print(f"{r0}->{r1}: 外れた窓 {len(off)} 個 {off}")
+    assert len(off) <= 3, off
+    # 変える前後の落ち着いた所は 440Hz（±0.1 半音）
+    for t in (heard - 0.5, heard + 0.5):
+        assert all(abs(d) < 0.1 for _, d in _semitone_track(res["y"], t, 0.05))
+
+
 # --- プレイヤーの画面 ------------------------------------------------------------------
 
 
@@ -328,9 +385,35 @@ def test_instant_mode_player(page: Any, server: LiveServer, tmp_path: Path) -> N
     n_sources = _engine(page, "e.activeSources()")
     under0 = _engine(page, "e.ctx.playbackStats ? e.ctx.playbackStats.underrunEvents : -1")
 
-    # +10%: 伸縮器を通し、全 stem の playbackRate = 1.1、音の高さを戻す
+    # 「すぐ」の方式の間は、1.000 でも伸縮器に音を入れて遅れをそろえている（位置にも遅れを入れる）
+    assert _engine(page, "e.aligned") is True
+    assert _engine(page, "e.dryDelay.delayTime.value") == pytest.approx(_engine(page, "e.latency"))
+    # +10%: 伸縮器の音にクロスフェードし、全 stem の playbackRate = 1.1、音の高さを戻す。
+    # 鳴らし直さない（音源はそのまま、位置は止まらず実時間 × 速さで進む）
     before = _engine(page, "e.position")
-    page.evaluate(f"() => {VIEW}.tempo.setRatio(1.1)")
+    srcs = page.evaluate(
+        f"() => {{ window.__srcs = [...{VIEW}.engine.tracks.values()].map((t) => t.source); }}")
+    trace = page.evaluate(
+        """async () => {
+        const v = window.__stemapp.view, e = v.engine;
+        const out = [];
+        for (let i = 0; i < 40; i++) {
+          if (i === 10) v.tempo.setRatio(1.1);
+          out.push([e.ctx.currentTime, e.position]);
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        return out;
+    }"""
+    )
+    del srcs
+    assert page.evaluate(
+        f"() => [...{VIEW}.engine.tracks.values()].every((t, i) => t.source === window.__srcs[i])"
+    ), "鳴らし直している"
+    for (c0, p0), (c1, p1) in zip(trace, trace[1:], strict=False):
+        dt = c1 - c0
+        if dt <= 0:
+            continue
+        assert 0.9 * dt - 0.004 <= p1 - p0 <= 1.2 * dt + 0.004, trace  # 止まらず飛ばない
     _wait_lock(page, True)
     page.wait_for_timeout(100)
     assert _engine(page, "e.playing") is True
@@ -339,7 +422,6 @@ def test_instant_mode_player(page: Any, server: LiveServer, tmp_path: Path) -> N
     assert _engine(page, "e.position") >= before - 0.01
     assert _engine(page, "e.latency") == pytest.approx(_engine(page, "e.stretchLatency"))
     assert 0.05 < _engine(page, "e.latency") < 0.3
-    page.wait_for_timeout(400)  # 伸縮器をつないだ鳴らし直し（約 0.15 秒位置が止まる）を待つ
     assert _speed_over(page) == pytest.approx(1.1, abs=0.05)
     page.wait_for_function(
         "(t) => document.querySelector('#tp-inst-status').textContent.startsWith(t)",
@@ -423,6 +505,40 @@ def test_instant_mode_player(page: Any, server: LiveServer, tmp_path: Path) -> N
     assert page.inner_text("#tp-readout") == "+5.0%"
     _wait_lock(page, True)  # 止まっている間も、開き直したら伸縮器を通す準備をする
     assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_instant_mode_stretch_timeout(
+    browser: Any, server: LiveServer, tmp_path: Path  # noqa: F811
+) -> None:
+    """伸縮器が 5 秒で用意できなければ、使えないものとしてピッチも変わる方式で速度を変える。"""
+    track_id, _ = _done_track(server, tmp_path, seconds=24.0)
+    # Service Worker を通すと route が効かないので止める
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900}, locale="ja-JP",
+                              service_workers="block")
+    pg = ctx.new_page()
+    errors: list[str] = []
+    pg.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        # 伸縮器のファイルに応答しない（読み込みが終わらない）
+        pg.route("**/SignalsmithStretch.mjs", lambda route: None)
+        _open(pg, server, track_id)
+        assert pg.evaluate(f"() => {VIEW}.tempo.mode") == "instant"
+        assert pg.evaluate(f"() => {VIEW}.tempo.stretchState") == "loading"
+        pg.wait_for_function(f"() => {VIEW}.tempo.stretchState === 'failed'", timeout=10_000)
+        assert pg.inner_text("#tp-inst-status") == (
+            "ブラウザ内の伸縮を使えません（ピッチも変わる方式で再生中）")
+        pg.click("#play-btn")
+        pg.wait_for_function(f"() => {VIEW}.engine.playing")
+        pg.evaluate(f"() => {VIEW}.tempo.setRatio(1.1)")
+        pg.wait_for_timeout(100)
+        assert _engine(pg, "e.rate") == pytest.approx(1.1)
+        assert all(r == pytest.approx(1.1) for r in _engine(pg, "e.sourceRates()"))
+        assert _engine(pg, "e.aligned") is False and _engine(pg, "e.lock") is False
+        assert _engine(pg, "e.latency") == 0
+        assert _speed_over(pg) == pytest.approx(1.1, abs=0.05)
+        assert not errors
+    finally:
+        ctx.close()
 
 
 def _wait_status(pg: Any, text: str, timeout_ms: int = 20_000) -> None:

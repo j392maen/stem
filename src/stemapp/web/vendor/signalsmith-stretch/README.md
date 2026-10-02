@@ -22,6 +22,12 @@ npm・CDN は使わず、公式の Web 版の配布ファイルをそのまま�
 - 「ライブ入力」モードで使う: 全 stem を音量をかけて混ぜた音を入力し、`schedule({semitones})` で
   音の高さだけを戻す（音源は playbackRate = r で鳴らす）。詳しくは engine.js の先頭のコメント。
 
+## CSP（Content-Security-Policy）を入れる場合
+
+伸縮器は WASM を埋め込んだ処理を blob: の URL から AudioWorklet に読み込む。CSP を入れるなら、
+`worker-src blob:`（AudioWorklet の読み込み。ブラウザによっては `script-src blob:`）と
+`script-src 'wasm-unsafe-eval'` 相当の許可が必要（今のアプリは CSP を出していない）。
+
 ## 更新するとき
 
 1. 上の取得元のタグを新しいものに替えてファイルを取り直す。
