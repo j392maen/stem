@@ -47,6 +47,7 @@ WEB_DIR: Path = Path(__file__).resolve().parent / "web"
 # PWA の manifest の種類（Windows の既定の対応表に無いことがある）
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("text/javascript", ".mjs")  # 同梱の伸縮器（vendor/signalsmith-stretch）
 
 # Starlette の既定の英語メッセージを日本語にする
 _DEFAULT_DETAILS: dict[int, str] = {
