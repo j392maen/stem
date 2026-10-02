@@ -12,9 +12,11 @@ audio-separator に任せ、推論はロード済みインスタンスの `demix
 from __future__ import annotations
 
 import gc
+import io
 import logging
-from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+import re
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +123,53 @@ def map_outputs(
     return mapped
 
 
+# onnxruntime の preload_dlls() が標準出力に print する、CUDA の版の違いの注意と DLL の読み込み失敗。
+# onnxruntime-gpu（CUDA 13 用）と torch（cu128）の版が違うために出る。stemapp のモデルはすべて
+# torch（.ckpt）で動き、ONNX のモデルは使わないので実害は無い（T14 で確かめた）。
+_ORT_NOISE = (
+    "uses CUDA",
+    "Failed to load ",
+    "Please follow https://onnxruntime.ai",
+    "Skip loading CUDA and cuDNN DLLs",
+)
+ORT_NOTE = (
+    "onnxruntime-gpu（CUDA 13 用）と torch（CUDA 12.8 用）の版が違うため、onnxruntime の "
+    "CUDA の DLL は読み込めません。stemapp のモデルはすべて torch で動くので影響はありません。"
+)
+_ort_noted = False
+
+
+def _is_ort_noise(line: str) -> bool:
+    return any(key in line for key in _ORT_NOISE)
+
+
+@contextmanager
+def quiet_onnxruntime_preload() -> Iterator[None]:
+    """audio-separator の準備（onnxruntime の preload_dlls）が出す注意を1行にまとめる。
+
+    標準出力への print を受け取り、onnxruntime の版の違いによる注意は最初の1回だけ
+    ORT_NOTE をログに出す（2回目からは出さない）。それ以外の出力はそのままログに出す。
+    """
+    global _ort_noted
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            yield
+    finally:
+        noisy = False
+        for raw in buf.getvalue().splitlines():
+            line = re.sub(r"\x1b\[[0-9;]*m", "", raw).strip()
+            if not line:
+                continue
+            if _is_ort_noise(line):
+                noisy = True
+            else:
+                log.info("%s", line)
+        if noisy and not _ort_noted:
+            _ort_noted = True
+            log.info(ORT_NOTE)
+
+
 Demix = Callable[[np.ndarray], dict[str, np.ndarray]]
 
 
@@ -171,13 +220,14 @@ class AudioSeparatorBackend:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         if device == DEVICE_CUDA and not torch.cuda.is_available():
             raise RuntimeError("CUDA が使えません（--cpu で CPU 実行できます）。")
-        sep = AsSeparator(
-            log_level=logging.WARNING,
-            model_file_dir=str(self.models_dir),
-            output_dir=str(self.work_dir),
-            # 推論は demix() を直接呼び、autocast は自分でかける
-            use_autocast=False,
-        )
+        with quiet_onnxruntime_preload():
+            sep = AsSeparator(
+                log_level=logging.WARNING,
+                model_file_dir=str(self.models_dir),
+                output_dir=str(self.work_dir),
+                # 推論は demix() を直接呼び、autocast は自分でかける
+                use_autocast=False,
+            )
         if device == DEVICE_CPU:
             sep.torch_device = sep.torch_device_cpu
         try:
