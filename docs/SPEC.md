@@ -53,7 +53,7 @@ audio-separator のモデル名（確認済み）:
 - karaoke: `mel_band_roformer_karaoke_becruily.ckpt`, `bs_roformer_karaoke_frazer_becruily.ckpt`, `bs_roformer_karaoke_anvuew.ckpt`, `mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt`
   （karaoke は vocals を入力すると "(Vocals)"=lead, "(Instrumental)"=それ以外 を出力）
 - 詳細: `MDX23C-DrumSep-aufr33-jarredou.ckpt`（kick, snare, toms, hh, ride, crash）, `bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt`, `aspiration_mel_band_roformer_sdr_18.9845.ckpt`
-- Mega 53 stems は audio-separator 外（ZFTurbo MSST 形式）。後回し。
+- Mega 53 stems（ZFTurbo MSST 形式、`mvsep_mega_model_bs_roformer_53_stems_v1.ckpt`）は T07b で詳細分割の方法として組み込み済み。other → strings / brass / woodwind / synth / percussion ＋残り（使う5 stem だけを動かし GPU 最大 約1.6GB）。重みのライセンスは明示なし（個人利用の前提）。詳細は `docs/research/R02-mega53.md`。
 
 ## 6. データモデル（ER 図の実体）
 TRACK, INPUT_SOURCE, DEVICE, SEPARATION_PRESET, PRESET_STEP, MODEL, SEPARATION_JOB,
