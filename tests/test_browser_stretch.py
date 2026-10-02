@@ -35,6 +35,9 @@ from test_browser import (  # noqa: F401  fixture を使う
 )
 from test_browser_beats import TEMPO, _done_track
 
+# 速さの測定は T14 で直したもの（測る前に音源の開始・速度の切り替わりを待つ）を使う
+from test_browser_tempo import _speed_over
+
 pytestmark = [
     pytest.mark.browser,
     pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg がありません"),
@@ -65,22 +68,6 @@ def _engine(pg: Any, expr: str) -> Any:
 
 def _hide_toast(pg: Any) -> None:
     pg.evaluate("() => { document.getElementById('toast').hidden = true; }")
-
-
-def _speed_over(pg: Any, ms: int = 600) -> float:
-    """実時間 ms の間に曲の時刻がどれだけ進んだか（曲の秒 / 実時間の秒）。"""
-    return float(pg.evaluate(
-        """async (ms) => {
-        const e = window.__stemapp.view.engine;
-        const c0 = e.ctx.currentTime, p0 = e.position;
-        await new Promise((r) => setTimeout(r, ms));
-        const c1 = e.ctx.currentTime, p1 = e.position;
-        let d = p1 - p0;
-        if (d < 0 && e.loop) d += e.loop.end - e.loop.start;
-        return d / (c1 - c0);
-    }""",
-        ms,
-    ))
 
 
 def _positions(pg: Any, n: int) -> list[float]:
@@ -340,7 +327,7 @@ def _semitone_track(y: np.ndarray, center: float, span: float = 0.1) -> list[tup
 def test_offline_pitch_stays_at_rate_change(
     page: Any, server: LiveServer, r0: float, r1: float  # noqa: F811
 ) -> None:
-    """速度を変えた瞬間の前後 100ms も音の高さが外れない（440Hz の音で ±0.3 半音の外れは数窓まで）。
+    """速度を変えた瞬間の前後 100ms も音の高さが外れない（440Hz の音で ±0.3 半音の外れは 5 窓まで）
 
     1.0 ⇔ 1.1 は伸縮器の音（wet）と通さない音（dry）のクロスフェードも含む。
     """
@@ -351,7 +338,10 @@ def test_offline_pitch_stays_at_rate_change(
     track = _semitone_track(res["y"], heard)
     off = [(round(t * 1000), round(d, 2)) for t, d in track if abs(d) > 0.3]
     print(f"{r0}->{r1}: 外れた窓 {len(off)} 個 {off}")
-    assert len(off) <= 3, off
+    # 5 個（5ms 刻みの 21ms 窓で、外れる時間は約 40ms 以内）まで許す。切り替えの瞬間に窓が
+    # 2 つの速さの音をまたぐと山の位置が少しずれる。1.1→1.25 はちょうど 3 個（T11c 実測）で、
+    # 3 個以下では余裕がなかった。音の高さそのものが変わる誤りは、下の前後 0.5 秒の確認で見つかる
+    assert len(off) <= 5, off
     # 変える前後の落ち着いた所は 440Hz（±0.1 半音）
     for t in (heard - 0.5, heard + 0.5):
         assert all(abs(d) < 0.1 for _, d in _semitone_track(res["y"], t, 0.05))

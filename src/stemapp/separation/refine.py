@@ -470,7 +470,19 @@ def run_refine(
             input=INPUT_STEM,
             role=ROLE_REFINE,
         )
-        report(0.0, f"分離中: {method.display_name}")
+        # 分離器が要るファイル（初回の重みのダウンロード等）を先に用意する。
+        # ダウンロードがあれば、この段階の進み具合の前半（0〜0.5）をそれに使う
+        start = 0.0
+        prepare = getattr(separator, "prepare_model", None)
+        if callable(prepare):
+
+            def on_prepare(p: float, s: str) -> None:
+                nonlocal start
+                start = 0.5 * min(max(p, 0.0), 1.0)
+                report(start, s)
+
+            prepare(method.filename, on_prepare)
+        report(start, f"分離中: {method.display_name}")
         out, res = run_step(separator, step, wav, device, oom_policy or OomPolicy())
         steps.append(res)
         log.info(

@@ -12,13 +12,15 @@ MVSep Mega 53 stems（53 stem）は 1 本の共通部分（Transformer）と ste
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from stemapp.audio import SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +40,30 @@ def load_config(path: Path) -> dict[str, Any]:
     _Loader.add_constructor("tag:yaml.org,2002:python/tuple", _tuple)
     with open(path, encoding="utf-8") as f:
         return yaml.load(f, Loader=_Loader)  # SafeLoader の派生（任意のオブジェクトは作らない）
+
+
+_MASK_PREFIX = "mask_estimators."
+
+
+def select_stems_state(state: Mapping[str, Any], keep: Sequence[int]) -> dict[str, Any]:
+    """state_dict から keep の順のマスク推定器だけを残し、番号を 0, 1, ... に付け直す
+
+    `mask_estimators.<i>.…` のうち i が keep に無いものは捨て、keep[j] のものを
+    `mask_estimators.<j>.…` にする（出力の順 = keep の順）。ほかのキーはそのまま。
+    """
+    new_index = {old: new for new, old in enumerate(keep)}
+    if len(new_index) != len(keep):
+        raise ValueError("同じ stem が 2 回指定されています。")
+    out: dict[str, Any] = {}
+    for key, value in state.items():
+        if key.startswith(_MASK_PREFIX):
+            idx, _, rest = key[len(_MASK_PREFIX) :].partition(".")
+            j = new_index.get(int(idx))
+            if j is None:
+                continue
+            key = f"{_MASK_PREFIX}{j}.{rest}"
+        out[key] = value
+    return out
 
 
 @dataclass
@@ -68,23 +94,33 @@ def load_model(
         raise ValueError(f"モデルに無い stem です: {', '.join(unknown)}")
     if not stems:
         raise ValueError("stem を 1 つ以上指定してください。")
-    model_kw = dict(cfg["model"])
-    model = BSRoformer(**model_kw)
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    sample_rate = int(cfg["audio"].get("sample_rate", 44100))
+    if sample_rate != SAMPLE_RATE:
+        # stemapp の音声はすべて SAMPLE_RATE（read_audio が確かめる）。
+        # 違うモデルは変換しないと使えない
+        raise ValueError(
+            f"モデルのサンプルレート {sample_rate} Hz が stemapp の {SAMPLE_RATE} Hz と違います。"
+        )
+    keep = [instruments.index(s) for s in stems]
+    # 使う stem のマスク推定器だけを持つモデルを組み立て、その分の重みだけを読み込む
+    # （53 個すべてを fp32 で作ってから捨てるより、CPU メモリと時間が少なくて済む）。
+    # mmap: ファイルを丸ごとメモリに読まず、使う重みだけを読む
+    model = BSRoformer(**{**cfg["model"], "num_stems": len(keep)})
+    try:
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError:  # mmap できない古い保存形式
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
-    model.load_state_dict(state)
+    model.load_state_dict(select_stems_state(state, keep))
     del state
-    keep = [instruments.index(s) for s in stems]
-    model.mask_estimators = torch.nn.ModuleList([model.mask_estimators[i] for i in keep])
-    model.num_stems = len(keep)
     model.eval()
     model.to(device)
     inf = cfg.get("inference", {})
     return LoadedModel(
         model=model,
         stems=list(stems),
-        sample_rate=int(cfg["audio"].get("sample_rate", 44100)),
+        sample_rate=sample_rate,
         chunk_size=int(inf.get("chunk_size", cfg["audio"]["chunk_size"])),
         num_overlap=int(inf.get("num_overlap", 2)),
         device=device,

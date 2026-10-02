@@ -29,7 +29,11 @@ DEVICE_CPU = "cpu"
 
 @runtime_checkable
 class Separator(Protocol):
-    """1つのモデルを入力 WAV に適用する分離器。"""
+    """1つのモデルを入力 WAV に適用する分離器。
+
+    任意で `prepare_model(model_filename, progress)` を持てる（詳細分割が分離の前に呼び、
+    初回の重みのダウンロード等の stage・進み具合を受け取る。AudioSeparatorBackend にある）。
+    """
 
     def separate(
         self,
