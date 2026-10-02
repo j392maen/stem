@@ -18,7 +18,7 @@ import pytest
 from browser_helpers import SCREENS_DIR, LiveServer, run_server
 from stemapp.config import Settings
 from stemapp.models import SeparationJob
-from stemapp.seed import DRUMSEP
+from stemapp.seed import DRUMSEP, HPSS, MEGA53
 from test_browser import (  # noqa: F401  fixture を使う
     PHONE,
     _done_track,
@@ -146,6 +146,33 @@ def test_refine_other_and_undo(page: Any, server: LiveServer, tmp_path: Path) ->
     assert page.locator(".stem-cell[data-code='other'] .refine-act.split").count() == 1
     g = _wait_gains(page, {"other": 1.0, "bass": 0.0})
     assert "sustained" not in g
+    assert not page.errors  # type: ignore[attr-defined]
+
+
+def test_refine_other_with_mega53(page: Any, server: LiveServer, tmp_path: Path) -> None:  # noqa: F811
+    """T07b: other の方法に Mega 53 が出る。無音の子（Fake では木管）はボタンにならない。"""
+    track_id, _job_id = _done_track(server, tmp_path)
+    _open_player(page, server, track_id)
+    page.click(".stem-cell[data-code='other'] .refine-act.split")
+    page.wait_for_selector(".refine-modal")
+    models = page.locator(".refine-option").evaluate_all("els => els.map(e => e.dataset.model)")
+    assert sorted(models) == sorted([HPSS, MEGA53])
+    mega = page.locator(f".refine-option[data-model='{MEGA53}']")
+    assert "Mega 53" in mega.inner_text() and "GPU" in mega.inner_text()
+    assert "ストリングス" in mega.inner_text() and "シンセ" in mega.inner_text()
+    _shot(page, "refine_mega53_menu_pc.png")
+    mega.click()
+    page.wait_for_selector(".refine-modal", state="detached")
+    _wait_loaded_with(page, "synth")
+    kids = page.locator(".stem-family[data-family='other'] .stem-cell").evaluate_all(
+        "els => els.map(e => e.dataset.code)"
+    )
+    assert kids == ["other", "brass", "strings", "synth", "percussion", "other_rest"]
+    assert page.locator(".stem-btn[data-code='woodwind']").count() == 0
+    _wait_gains(page, {"synth": 1.0, "other_rest": 1.0, "other": 0.0})
+    page.click(".stem-btn[data-code='synth']", modifiers=["Shift"])
+    _wait_gains(page, {"synth": 1.0, "strings": 0.0, "other_rest": 0.0, "bass": 0.0})
+    _shot(page, "refine_mega53_children_pc.png")
     assert not page.errors  # type: ignore[attr-defined]
 
 
