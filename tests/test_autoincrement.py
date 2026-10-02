@@ -266,6 +266,69 @@ def test_new_fk_problem_rolls_back(
     assert _snapshot(path) == before
 
 
+def test_row_count_change_rolls_back(
+    old_db: tuple[Path, Engine], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """作り直しの前後で、どれかの表の行の数が変わったら元に戻す。"""
+    path, engine = old_db
+    before = _snapshot(path)
+    holder: dict[str, sqlite3.Connection] = {}
+    orig_counts = dbmod._row_counts
+
+    def remember(conn: sqlite3.Connection) -> dict[str, int]:
+        holder["conn"] = conn
+        return orig_counts(conn)
+
+    def lose_row(name: str) -> None:
+        if name == "stem":
+            # 作り直しとは関係の無い表の行が消えた（同じトランザクションの中）
+            holder["conn"].execute("DELETE FROM stem_rendition")
+
+    monkeypatch.setattr(dbmod, "_row_counts", remember)
+    monkeypatch.setattr(dbmod, "after_rebuild_hook", lose_row)
+    with pytest.raises(DbMigrationError, match="行の数が違います"):
+        init_db(engine)
+    assert _snapshot(path) == before
+
+
+def test_stops_when_foreign_keys_cannot_be_disabled(
+    old_db: tuple[Path, Engine], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, engine = old_db
+    before = _snapshot(path)
+    monkeypatch.setattr(dbmod, "_foreign_keys_on", lambda _conn: 1)
+    with pytest.raises(DbMigrationError, match="外部キーの確認を止められなかった"):
+        init_db(engine)
+    assert _snapshot(path) == before
+    with engine.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    # 原因が無くなれば移行できる
+    monkeypatch.undo()
+    init_db(engine)
+    assert "AUTOINCREMENT" in _schema_sql(path, "track").upper()
+
+
+def test_backup_failure_stops_and_removes_partial_file(
+    old_db: tuple[Path, Engine], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, engine = old_db
+    before = _snapshot(path)
+
+    def broken_copy(_conn: sqlite3.Connection, dst: Path) -> None:
+        dst.write_bytes(b"SQLite format 3\0 partial")
+        raise OSError("ディスクがいっぱいです（テスト）")
+
+    monkeypatch.setattr(dbmod, "_copy_db", broken_copy)
+    with pytest.raises(DbMigrationError) as ei:
+        init_db(engine)
+    msg = str(ei.value)
+    assert "空き容量と書き込み権限" in msg and "何もしていません" in msg
+    assert list((path.parent / "backup").glob("*")) == []  # 書きかけは消える
+    assert _snapshot(path) == before
+    for t in TARGETS:
+        assert "AUTOINCREMENT" not in _schema_sql(path, t).upper()
+
+
 def test_extra_old_column_is_kept(tmp_path: Path) -> None:
     path = tmp_path / "x.db"
     engine = make_engine(path)

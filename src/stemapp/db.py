@@ -125,12 +125,46 @@ def _backup(conn: sqlite3.Connection, db_path: Path) -> Path:
     while dst.exists():
         dst = folder / f"stemapp-{stamp}-{n}.db"
         n += 1
+    try:
+        _copy_db(conn, dst)
+    except Exception as e:
+        # 書きかけのバックアップは残さない（不完全なものを正しいバックアップと思わないように）
+        for p in (dst, dst.with_name(dst.name + "-journal")):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise DbMigrationError(
+            "DB の更新の前に作るバックアップを作れなかったため、DB には何もしていません"
+            f"（{dst}）。\n原因: {e}\n"
+            "データフォルダの空き容量と書き込み権限を確かめてから、もう一度起動してください。"
+        ) from e
+    return dst
+
+
+def _copy_db(conn: sqlite3.Connection, dst: Path) -> None:
+    """SQLite の backup API で dst に複製する。"""
     target = sqlite3.connect(dst)
     try:
         conn.backup(target)
     finally:
         target.close()
-    return dst
+
+
+def _foreign_keys_on(conn: sqlite3.Connection) -> int:
+    """今の接続の PRAGMA foreign_keys（0 = 止まっている）。"""
+    return int(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+
+
+def _row_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """全表の行数（作り直しの前後で比べる）。"""
+    names = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    ]
+    return {n: int(conn.execute(f'SELECT count(*) FROM "{n}"').fetchone()[0]) for n in names}
 
 
 def _has_autoincrement(conn: sqlite3.Connection, table: str) -> bool | None:
@@ -162,6 +196,9 @@ def _rebuild_table(conn: sqlite3.Connection, engine: Engine, table: Table) -> No
     トランザクションの中で呼ぶ。SQLite は ALTER で AUTOINCREMENT を付けられないため、公式の手順
     （新しい表を作る → 行を移す → 古い表を消す → 名前を変える → 索引を作り直す）で行う。
     番号はそのまま移すので、外部キーは保たれる。モデルに無い列（古い版の列）も消さずに移す。
+
+    注意: トリガー（TRIGGER）とビュー（VIEW）は作り直さない（DROP TABLE で表のトリガーは
+    消える）。stemapp はどちらも使っていないため。使うようになったら、ここで退避して戻すこと。
     """
     name = table.name
     tmp = f"_new_{name}"
@@ -232,11 +269,21 @@ def migrate_autoincrement(engine: Engine) -> list[str]:
             # 子の行を消す）。PRAGMA foreign_keys はトランザクションの外でしか変えられない
             conn.execute("PRAGMA foreign_keys=OFF")
             try:
+                if _foreign_keys_on(conn) != 0:
+                    # 外部キーが止まらない（トランザクションの中など）と、DROP TABLE が子の行を
+                    # 消してしまう。何もせずに止める
+                    raise DbMigrationError(
+                        "DB の更新（番号の使い回しを防ぐ AUTOINCREMENT への作り直し）の準備で、"
+                        "外部キーの確認を止められなかったため、DB には何もしていません"
+                        f"（バックアップ: {backup}）。\n"
+                        "ほかに stemapp が動いていないかを確かめてから、もう一度起動してください。"
+                    )
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     # 別のプロセスが先に済ませていないか、ロックを取ってから確かめ直す
                     todo = [t for t in todo if _has_autoincrement(conn, t.name) is False]
                     before = _fk_problems(conn)
+                    counts_before = _row_counts(conn)
                     for table in todo:
                         _rebuild_table(conn, engine, table)
                         if after_rebuild_hook is not None:
@@ -244,6 +291,14 @@ def migrate_autoincrement(engine: Engine) -> list[str]:
                     new_problems = _fk_problems(conn) - before
                     if new_problems:
                         raise RuntimeError(f"外部キーの確認で問題が見つかりました: {new_problems}")
+                    counts_after = _row_counts(conn)
+                    if counts_after != counts_before:
+                        diff = {
+                            n: (counts_before.get(n), counts_after.get(n))
+                            for n in set(counts_before) | set(counts_after)
+                            if counts_before.get(n) != counts_after.get(n)
+                        }
+                        raise RuntimeError(f"作り直しの前後で行の数が違います: {diff}")
                     conn.execute("COMMIT")
                 except BaseException as e:
                     conn.execute("ROLLBACK")
