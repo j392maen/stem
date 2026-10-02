@@ -123,7 +123,8 @@ def map_outputs(
     return mapped
 
 
-# onnxruntime の preload_dlls() が標準出力に print する、CUDA の版の違いの注意と DLL の読み込み失敗。
+# onnxruntime の preload_dlls() が標準出力に print する、CUDA の版の違いの注意と
+# DLL の読み込み失敗。
 # onnxruntime-gpu（CUDA 13 用）と torch（cu128）の版が違うために出る。stemapp のモデルはすべて
 # torch（.ckpt）で動き、ONNX のモデルは使わないので実害は無い（T14 で確かめた）。
 _ORT_NOISE = (
