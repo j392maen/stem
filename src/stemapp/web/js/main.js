@@ -132,6 +132,7 @@ const HEALTH_POLL_MS = 15000;
 
 /** ワーカー（分割・速度変更の作成）が止まっていたら、画面の上に出す。 */
 function workerNoticeText(worker) {
+  if (worker && worker.state === "other") return worker.message || "別のワーカーが動いています。";
   if (!worker || worker.state !== "down") return "";
   const base = worker.message || "分割の処理が止まっています。";
   const sec = Number(worker.restart_in_sec);
