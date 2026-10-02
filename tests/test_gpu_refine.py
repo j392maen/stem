@@ -70,3 +70,55 @@ def test_mega53_on_gpu_sums_to_parent(session: Session, backend: object, tmp_pat
     peak = out.peak_memory_mb
     print(f"{MEGA53}: {out.seconds:.1f} 秒, GPU 最大 {peak:.0f} MB, 作らなかった子 {out.dropped}")
     assert peak is not None and 0 < peak < 4096
+
+
+def test_mega53_selected_stems_match_full_model() -> None:
+    """実際の重みで: 使う 5 stem だけを読み込んだモデルの出力が、53 stem すべてを読み込んだ
+    モデルの同じ stem の出力と一致する（state_dict の番号の付け直しで順を取り違えない）。"""
+    import time
+
+    import torch
+
+    from stemapp.separation.audio_separator_backend import (
+        MSST_MODELS,
+        REFINE_OUTPUT_NAME_MAP,
+    )
+    from stemapp.separation.msst import runner
+
+    models = Settings().models_dir
+    files = MSST_MODELS[MEGA53]
+    ckpt, config = models / MEGA53, models / files.config
+    if not (ckpt.is_file() and config.is_file()):
+        pytest.skip("Mega 53 の重みがありません")
+    instruments = list(runner.load_config(config)["training"]["instruments"])
+    stems = list(reversed(REFINE_OUTPUT_NAME_MAP[MEGA53]))  # 元の順と違う順で
+    # CPU で比べる（実測で差 0。GPU は演算の選び方で 1e-4 程度ずれ（実測 8.6e-5）、静かな stem
+    # どうしの差（2e-4 程度）と区別しにくい。重みが要るので -m gpu の側に置く）
+    x = torch.from_numpy(synth_mix(2.0, amp=0.5).T.copy()).unsqueeze(0)
+    t0 = time.perf_counter()
+    sub = runner.load_model(ckpt, config, stems, "cpu")
+    t_sub = time.perf_counter() - t0
+    with torch.inference_mode():
+        y_sub = sub.model(x)[0].float().cpu()
+    del sub
+    t0 = time.perf_counter()
+    full = runner.load_model(ckpt, config, instruments, "cpu")
+    t_full = time.perf_counter() - t0
+    with torch.inference_mode():
+        y_full = full.model(x)[0].float().cpu()
+    del full
+    print(f"読み込み: 5 stem {t_sub:.1f} 秒, 53 stem {t_full:.1f} 秒")
+    assert y_full.shape[0] == 53 and y_sub.shape[0] == len(stems)
+    # 順を取り違えれば別の楽器の音になり差は桁違いに大きいので、それも確かめる
+    scale = float(y_full.abs().max())
+    for j, name in enumerate(stems):
+        i = instruments.index(name)
+        diff = float((y_sub[j] - y_full[i]).abs().max())
+        print(f"{name}: 差 {diff:.2e}（出力の最大 {scale:.2f}）")
+        assert diff <= 1e-5 * max(scale, 1e-3), (name, diff)
+        others = [
+            float((y_sub[j] - y_full[instruments.index(o)]).abs().max())
+            for o in stems
+            if o != name
+        ]
+        assert diff * 20 < min(others), (name, diff, others)

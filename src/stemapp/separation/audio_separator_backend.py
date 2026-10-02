@@ -15,6 +15,7 @@ audio-separator の一覧に無い MSST 形式のモデル（MVSep Mega 53 stems
 from __future__ import annotations
 
 import gc
+import hashlib
 import io
 import logging
 import re
@@ -107,23 +108,69 @@ REFINE_OUTPUT_NAME_MAP: dict[str, dict[str, str]] = {
 
 @dataclass(frozen=True)
 class MsstModelFiles:
-    """audio-separator を通さずに動かす MSST 形式のモデル（重み・設定の入手先）。"""
+    """audio-separator を通さずに動かす MSST 形式のモデル（重み・設定の入手先と検証値）。
+
+    size・sha256 はダウンロードしたファイルの検証に使う（既にあるファイルはサイズだけ見る）。
+    """
 
     config: str
     url: str
     config_url: str
+    size: int
+    sha256: str
+    config_size: int
+    config_sha256: str
+    size_label: str  # 画面に出す大きさ（例 "約1.4GB"）
 
 
 _MSST_RELEASE = (
     "https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.21"
 )
 MSST_MODELS: dict[str, MsstModelFiles] = {
+    # サイズ・SHA-256 は 2026-10-02 に v1.0.21 のリリースから入手したファイルで求めた値（R02）
     MEGA53: MsstModelFiles(
         config="mvsep_mega_model_bs_roformer_53_stems.yaml",
         url=f"{_MSST_RELEASE}/{MEGA53}",
         config_url=f"{_MSST_RELEASE}/mvsep_mega_model_bs_roformer_53_stems.yaml",
+        size=1_368_919_887,
+        sha256="c62820893bbf86d4e734f966bd142d9157cfc8bb8e79e9d8f9ea553f3ff3519f",
+        config_size=4_184,
+        config_sha256="7e198062a251587088adb91215a4f44ab59e67bd62fcc805cf54d6e7dfc51103",
+        size_label="約1.4GB",
     ),
 }
+
+# ダウンロード: (url, 書き込み先, 進み具合（受け取ったバイト数, 全体のバイト数 or None）)
+ByteProgress = Callable[[int, int | None], None]
+Downloader = Callable[[str, Path, ByteProgress], None]
+StageProgress = Callable[[float, str], None]
+
+
+def http_download(url: str, dest: Path, on_bytes: ByteProgress) -> None:
+    """url を dest に書く（1MB ずつ。Content-Length があれば全体の大きさを渡す）"""
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "stemapp"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:  # noqa: S310
+        length = resp.headers.get("Content-Length")
+        total = int(length) if length and length.isdigit() else None
+        done = 0
+        on_bytes(done, total)
+        while True:
+            block = resp.read(1 << 20)
+            if not block:
+                break
+            f.write(block)
+            done += len(block)
+            on_bytes(done, total)
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 MIN_SEGMENT = 32  # チャンクを縮めるときの下限（dim_t）
 
@@ -224,10 +271,17 @@ def tta_combine(demix: Demix, mix: np.ndarray) -> dict[str, np.ndarray]:
 class AudioSeparatorBackend:
     """audio-separator でモデルを1つずつロードし、使い終わったら解放する分離器。"""
 
-    def __init__(self, models_dir: Path, work_dir: Path, use_fp16: bool = True) -> None:
+    def __init__(
+        self,
+        models_dir: Path,
+        work_dir: Path,
+        use_fp16: bool = True,
+        downloader: Downloader = http_download,
+    ) -> None:
         self.models_dir = Path(models_dir)
         self.work_dir = Path(work_dir)
         self.use_fp16 = use_fp16
+        self.downloader = downloader  # テストでは差し替える（ネットワークを使わない）
 
     # --- GPU メモリ計測 -------------------------------------------------------------
 
@@ -347,28 +401,96 @@ class AudioSeparatorBackend:
 
     # --- MSST 形式（audio-separator の一覧に無いもの） -----------------------------------
 
-    def ensure_msst_files(self, model_filename: str) -> tuple[Path, Path]:
-        """重みと設定が無ければダウンロードする（途中は .part に書き、終わったら名前を変える）"""
+    def prepare_model(self, model_filename: str, progress: StageProgress | None = None) -> None:
+        """分離の前に要るファイルを用意する（MSST 形式の重みのダウンロード）。
+
+        詳細分割（run_refine）が分離の前に呼び、ダウンロード中の stage・進み具合を受け取る。
+        audio-separator のモデルは load_model が自分でダウンロードするので何もしない。
+        """
+        if model_filename in MSST_MODELS:
+            self.ensure_msst_files(model_filename, progress)
+
+    def ensure_msst_files(
+        self, model_filename: str, progress: StageProgress | None = None
+    ) -> tuple[Path, Path]:
+        """重みと設定が無ければダウンロードして検証する（途中は .part に書き、検証後に名前を変える）
+
+        既にあるファイルはサイズだけ確かめ、違えば消してダウンロードし直す。
+        ダウンロードしたファイルはサイズと SHA-256 を確かめ、合わなければ消してエラーにする。
+        """
         files = MSST_MODELS[model_filename]
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        stage = f"モデルをダウンロード中（{files.size_label}）"
         out: list[Path] = []
-        for name, url in ((model_filename, files.url), (files.config, files.config_url)):
+        for name, url, size, sha in (
+            (model_filename, files.url, files.size, files.sha256),
+            (files.config, files.config_url, files.config_size, files.config_sha256),
+        ):
             path = self.models_dir / name
-            if not path.is_file():
-                from torch.hub import download_url_to_file
-
-                tmp = path.with_name(path.name + ".part")
-                log.info("モデルをダウンロードします: %s → %s", url, path)
-                try:
-                    download_url_to_file(url, str(tmp), progress=False)
-                    tmp.replace(path)
-                except Exception as e:
-                    tmp.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"モデル {name} をダウンロードできませんでした（{url}）: {e}"
-                    ) from e
+            if path.is_file():
+                actual = path.stat().st_size
+                if actual == size:
+                    out.append(path)
+                    continue
+                log.warning(
+                    "モデル %s のサイズが違います（%d バイト、正しくは %d）。"
+                    "ダウンロードし直します。",
+                    path, actual, size,
+                )
+                path.unlink()
+            self._download_verified(url, path, size, sha, stage, progress)
             out.append(path)
         return out[0], out[1]
+
+    def _download_verified(
+        self,
+        url: str,
+        path: Path,
+        size: int,
+        sha256: str,
+        stage: str,
+        progress: StageProgress | None,
+    ) -> None:
+        tmp = path.with_name(path.name + ".part")
+        tmp.unlink(missing_ok=True)
+        last = -1
+
+        def on_bytes(done: int, total: int | None) -> None:
+            nonlocal last
+            if progress is None:
+                return
+            total = total or size
+            pct = min(100, int(done * 100 / total)) if total > 0 else 0
+            if pct != last:  # 1% ごとに知らせる（ジョブの stage は DB に書くので回数を抑える）
+                last = pct
+                progress(pct / 100, stage)
+
+        log.info("モデルをダウンロードします: %s → %s", url, path)
+        if progress is not None:
+            progress(0.0, stage)
+        try:
+            try:
+                self.downloader(url, tmp, on_bytes)
+            except (OSError, ValueError) as e:  # 通信・書き込みの失敗（URLError も OSError）
+                raise RuntimeError(
+                    f"モデル {path.name} をダウンロードできませんでした（{url}）: {e}"
+                ) from e
+            actual = tmp.stat().st_size if tmp.is_file() else -1
+            if actual != size:
+                raise RuntimeError(
+                    f"ダウンロードしたモデル {path.name} のサイズが違います"
+                    f"（{actual} バイト、正しくは {size} バイト）。"
+                    "消しました。もう一度実行してください。"
+                )
+            if sha256_of(tmp) != sha256:
+                raise RuntimeError(
+                    f"ダウンロードしたモデル {path.name} の SHA-256 が違います（壊れているか、"
+                    "配布元のファイルが変わりました）。消しました。もう一度実行してください。"
+                )
+            tmp.replace(path)
+        finally:
+            # 失敗・キャンセル（ジョブの中断は downloader の中の進み具合から例外で来る）でも残さない
+            tmp.unlink(missing_ok=True)
 
     def _separate_msst(
         self,
