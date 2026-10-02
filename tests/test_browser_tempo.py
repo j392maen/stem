@@ -84,10 +84,20 @@ def _hide_toast(pg: Any) -> None:
 
 
 def _speed_over(pg: Any, ms: int = 600) -> float:
-    """実時間 ms の間に曲の時刻がどれだけ進んだか（曲の秒 / 実時間の秒）。"""
+    """実時間 ms の間に曲の時刻がどれだけ進んだか（曲の秒 / 実時間の秒）。
+
+    測る前に、音源が鳴り始める（play() から開始の予約時刻まで、位置は止まって見える）のを待つ。
+    負荷が高いと読み込み直後の play() から開始まで数十 ms かかり、それを測定に含めると速さが
+    小さく出るため（T14）。
+    """
     return float(pg.evaluate(
         """async (ms) => {
         const e = window.__stemapp.view.engine;
+        const deadline = performance.now() + 5000;
+        while (!(e.playing && e.ctx.currentTime - e.latency > e.startCtxTime + 0.05)) {
+          if (performance.now() > deadline) break;
+          await new Promise((r) => setTimeout(r, 10));
+        }
         const c0 = e.ctx.currentTime, p0 = e.position;
         await new Promise((r) => setTimeout(r, ms));
         const c1 = e.ctx.currentTime, p1 = e.position;
