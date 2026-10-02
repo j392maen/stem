@@ -123,6 +123,7 @@ def serve() -> None:
 
     from stemapp.app import create_app
     from stemapp.db import init_db, make_engine, make_session_factory
+    from stemapp.jobs.supervisor import WorkerSupervisor
     from stemapp.seed import seed
 
     settings = _settings()
@@ -136,16 +137,23 @@ def serve() -> None:
     finally:
         engine.dispose()
     stop_file = worker_stop_file(settings)
-    worker_proc = _start_worker_process(stop_file)
+    # ワーカーが落ちたら起動し直す（短い間に何度も落ちるときは間隔を空ける）
+    supervisor = WorkerSupervisor(
+        lambda: _start_worker_process(stop_file),
+        lambda proc: _stop_worker_process(proc, stop_file),  # type: ignore[arg-type]
+    )
+    supervisor.start()
     try:
+        app_ = create_app(settings)
+        app_.state.worker_supervisor = supervisor
         uvicorn.run(
-            create_app(settings),
+            app_,
             host=settings.host,
             port=settings.port,
             timeout_graceful_shutdown=3,
         )
     finally:
-        _stop_worker_process(worker_proc, stop_file)
+        supervisor.stop()
 
 
 @app.command()
@@ -156,6 +164,7 @@ def worker(
     ] = None,
 ) -> None:
     """分割ワーカーだけを起動する（queued のジョブを1件ずつ実行する）。Ctrl+C で止まる。"""
+    from stemapp.jobs.supervisor import EXIT_WORKER_LOCKED, status_file
     from stemapp.jobs.worker import (
         Worker,
         WorkerLock,
@@ -173,7 +182,8 @@ def worker(
         lock.acquire()
     except WorkerLockError as e:
         typer.echo(str(e))
-        raise typer.Exit(1) from e
+        # 専用の終了コード: serve の見張りはこのとき起動し直さない
+        raise typer.Exit(EXIT_WORKER_LOCKED) from e
     try:
         with _db_engine(settings) as factory:
             w = Worker(
@@ -182,6 +192,7 @@ def worker(
                 subprocess_launcher(settings),
                 stop_file=stop_file,
                 beat_runner=subprocess_beat_runner(settings),
+                heartbeat_file=status_file(settings.data_root),
             )
             try:
                 w.run_forever()
@@ -737,7 +748,14 @@ def migrate_folders_cmd(
 
 
 def main() -> None:
-    app()
+    from stemapp.db import DbMigrationError
+
+    try:
+        app()
+    except DbMigrationError as e:
+        # DB の更新に失敗した（元に戻してある）: 起動を止めて案内する
+        typer.echo(f"stemapp を起動できません。\n{e}", err=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

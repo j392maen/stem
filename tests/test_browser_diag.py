@@ -109,7 +109,13 @@ def test_diag_page_desktop(browser: Any, server: LiveServer) -> None:
         page.wait_for_function(
             "() => document.querySelector('#diag-status').dataset.saved !== " + json.dumps(name)
         )
-        latest = _saved(server)[0]["result"]
+        # 保存した名前で引く（一覧の並びに頼らない）。保存の応答の後に名前が付くので、
+        # ファイルは既にある
+        name2 = page.get_attribute("#diag-status", "data-saved")
+        saved = {r["name"]: r for r in _saved(server)}
+        assert set(saved) == {name, name2}
+        assert _saved(server)[0]["name"] == name2  # 新しいものが先頭
+        latest = saved[name2]["result"]
         assert len(latest["lock_tests"]) == 1
         lock = latest["lock_tests"][0]
         assert lock["mode"] == "webaudio" and lock["answer"] == "continued"
@@ -150,8 +156,34 @@ def test_diag_page_phone_and_pwa(browser: Any, server: LiveServer) -> None:
         # Service Worker があっても API（音声を含む）はそのまま届く
         page.reload()
         page.wait_for_selector("#diag-run")
+        assert page.evaluate("navigator.serviceWorker.controller !== null")
         assert page.evaluate("fetch('/api/health').then((r) => r.status)") == 200
         assert page.evaluate("fetch('/api/diag/samples/wav').then((r) => r.status)") == 200
+        # 音声を <audio> でも読み込む（Range 付きの要求）
+        page.evaluate(
+            """() => new Promise((ok) => {
+                const a = new Audio('/api/diag/samples/m4a');
+                a.addEventListener('loadedmetadata', () => ok(true), { once: true });
+                a.addEventListener('error', () => ok(false), { once: true });
+                a.load();
+            })"""
+        )
+        # Cache Storage の中身: 画面ファイルはあり、/api/ と音声は1つも無い
+        cached = page.evaluate(
+            """async () => {
+                const out = [];
+                for (const key of await caches.keys()) {
+                    const cache = await caches.open(key);
+                    for (const req of await cache.keys()) out.push(req.url);
+                }
+                return out;
+            }"""
+        )
+        paths = [u.removeprefix(server.base_url) for u in cached]
+        assert any(p.startswith("/js/") or p.startswith("js/") for p in paths), paths
+        assert not [p for p in paths if "/api/" in p or p.startswith("api/")], paths
+        audio_ext = (".webm", ".m4a", ".mp3", ".flac", ".wav", ".opus")
+        assert not [p for p in paths if p.split("?")[0].endswith(audio_ext)], paths
         assert page.errors == []  # type: ignore[attr-defined]
     finally:
         page.context.close()
@@ -182,12 +214,43 @@ def test_passcode_notice_via_proxy(browser: Any, server: LiveServer) -> None:
         page.context.close()
 
 
+def test_worker_down_notice(browser: Any, server: LiveServer) -> None:
+    """ワーカーが止まっていると、画面の上に「分割の処理が止まっています」を出す。"""
+    page = _page(browser, PHONE)
+    try:
+        def down(route: Any) -> None:
+            route.fulfill(json={"status": "ok", "worker": {
+                "state": "down", "running": False, "message": "分割の処理が止まっています。",
+                "managed": True, "restart_in_sec": 42.0,
+            }})
+
+        page.route("**/api/health", down)
+        page.goto(server.base_url + "/#/library")
+        box = page.locator("#worker-notice")
+        box.wait_for()
+        text = box.inner_text()
+        assert "分割の処理が止まっています" in text and "42 秒" in text
+        overflow = page.evaluate(
+            "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+        )
+        assert overflow <= 0
+        _shot(page, "worker-down-phone.png")
+    finally:
+        page.context.close()
+
+
 def test_no_notice_on_local(browser: Any, server: LiveServer) -> None:
     page = _page(browser, DESKTOP)
     try:
         page.goto(server.base_url + "/#/library")
         page.wait_for_selector("#tracks")
         assert page.locator("#notice").is_hidden()
+        # ワーカーを起動していない構成（状態は unknown）では止まっている表示は出さない
+        page.wait_for_function(
+            "() => fetch('/api/health').then((r) => r.json()).then((b) => b.worker.state)"
+            " .then((s) => s === 'unknown')"
+        )
+        assert page.locator("#worker-notice").is_hidden()
         # アイコンは赤い丸ではなく波形の棒の画像
         bg = page.eval_on_selector(".brand-mark", "e => getComputedStyle(e).backgroundImage")
         assert "icon.svg" in bg

@@ -581,7 +581,8 @@ export class PlayerView {
       if (!ok || !this.alive) return;
     }
     try {
-      const res = await api(`/api/tracks/${this.trackId}/beats`, { method: "POST" });
+      // 表示中のジョブで解析する（失敗の警告が表示中のジョブに付くように）
+      const res = await api(`/api/tracks/${this.trackId}/beats`, { method: "POST", body: { job_id: this.job.job_id } });
       if (!this.alive) return;
       toast(res.message);
       this.beatJobId = res.job.job_id;

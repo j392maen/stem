@@ -52,7 +52,7 @@ def samples() -> dict[str, Any]:
 
 async def _read_limited(request: Request, limit: int) -> bytes:
     length = request.headers.get("content-length")
-    if length is not None and length.isdigit() and int(length) > limit:
+    if length is not None and length.isascii() and length.isdigit() and int(length) > limit:
         raise HTTPException(status_code=413, detail=MSG_TOO_LARGE)
     chunks: list[bytes] = []
     size = 0

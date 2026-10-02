@@ -10,17 +10,24 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from stemapp.audio import FfmpegRunner
 from stemapp.config import Settings
-from stemapp.exports.naming import export_base_name, mix_label, safe_filename
+from stemapp.exports.naming import (
+    export_base_name,
+    label_from_filename,
+    mix_label,
+    safe_filename,
+)
 from stemapp.exports.render import (
     EXPORT_TYPES,
     FORMATS,
@@ -30,6 +37,7 @@ from stemapp.exports.render import (
     ExportError,
     RenderResult,
     SourceStem,
+    TrackInfo,
     render_mix,
     render_single,
     render_zip,
@@ -322,10 +330,12 @@ def create_export(session: Session, plan: ExportPlan) -> Export:
 # --- 実行 -------------------------------------------------------------------------------
 
 
-def _track_title(session: Session, job_id: int) -> str:
+def _track_info(session: Session, job_id: int) -> TrackInfo:
     job = session.get(SeparationJob, job_id)
     track = session.get(Track, job.track_id) if job is not None else None
-    return track.title if track is not None else ""
+    if track is None:
+        return TrackInfo("")
+    return TrackInfo(track.title or "", track.artist)
 
 
 def _sources(
@@ -368,7 +378,7 @@ def export_dir(settings: Settings, export_id: int) -> Path:
 
 
 def _render(
-    title: str,
+    info: TrackInfo,
     export_type: str,
     fmt: str,
     filename: str,
@@ -379,12 +389,14 @@ def _render(
 ) -> RenderResult:
     prog = progress or (lambda _p, _s: None)
     dst = dst_dir / filename
+    title = info.title
     if export_type == TYPE_SINGLE:
-        return render_single(sources[0], dst, fmt, runner, prog)
+        return render_single(sources[0], dst, fmt, runner, prog, info=info)
     if export_type == TYPE_MIX:
-        return render_mix(sources, dst, fmt, runner, prog)
+        label = label_from_filename(title, filename)
+        return render_mix(sources, dst, fmt, runner, prog, info=info, label=label)
     entries = [(s, safe_filename(export_base_name(title, s.display_name), fmt)) for s in sources]
-    return render_zip(entries, dst, fmt, runner, prog)
+    return render_zip(entries, dst, fmt, runner, prog, info=info)
 
 
 def render_export(
@@ -397,12 +409,14 @@ def render_export(
     progress: Callable[[float, str], None] | None = None,
 ) -> RenderResult:
     """exp（DB の行と EXPORT_ITEM）の内容を dst_dir/<exp.filename> に書き出す（DB は変えない）。"""
-    title = _track_title(session, exp.job_id)
+    info = _track_info(session, exp.job_id)
     items = session.scalars(select(ExportItem).where(ExportItem.export_id == exp.export_id)).all()
     sources = _sources(session, settings, exp.job_id, [(i.stem_id, i.gain_db) for i in items])
-    filename = exp.filename or safe_filename(export_base_name(title, exp.export_type), exp.format)
+    filename = exp.filename or safe_filename(
+        export_base_name(info.title, exp.export_type), exp.format
+    )
     return _render(
-        title, exp.export_type, exp.format, filename, sources, dst_dir, runner, progress
+        info, exp.export_type, exp.format, filename, sources, dst_dir, runner, progress
     )
 
 
@@ -416,12 +430,12 @@ def render_plan(
     progress: Callable[[float, str], None] | None = None,
 ) -> RenderResult:
     """DB に登録せずに書き出す（CLI 用）。dst_dir/<plan.filename> に書く。"""
-    title = _track_title(session, plan.job_id)
+    info = _track_info(session, plan.job_id)
     sources = _sources(
         session, settings, plan.job_id, [(i.stem.stem_id, i.gain_db) for i in plan.items]
     )
     return _render(
-        title, plan.export_type, plan.format, plan.filename, sources, dst_dir, runner, progress
+        info, plan.export_type, plan.format, plan.filename, sources, dst_dir, runner, progress
     )
 
 
@@ -534,8 +548,12 @@ def remove_export_dirs(settings: Settings, export_ids: Iterable[int]) -> None:
 
 def _delete(session: Session, settings: Settings, exps: Sequence[Export]) -> list[int]:
     ids = [e.export_id for e in exps]
-    for e in exps:
-        session.delete(e)  # EXPORT_ITEM は外部キーの CASCADE で消える
+    if ids:
+        # 行の数を確かめない一括の DELETE（曲の削除などで先に消えていても失敗しない）。
+        # EXPORT_ITEM は外部キーの CASCADE で消える
+        session.execute(sa_delete(Export).where(Export.export_id.in_(ids)))
+        for e in exps:
+            session.expunge(e)
     session.commit()
     remove_export_dirs(settings, ids)
     return ids
@@ -555,11 +573,22 @@ def recover_interrupted_exports(session: Session, settings: Settings) -> list[in
     return ids
 
 
+_cleanup_lock = threading.Lock()
+
+
 def cleanup_exports(
     session: Session, settings: Settings, now: datetime | None = None
 ) -> list[int]:
-    """期限切れ・容量超えの書き出しと、DB に無いフォルダを消す。消した export_id を返す。"""
-    now = now or _utcnow()
+    """期限切れ・容量超えの書き出しと、DB に無いフォルダを消す。消した export_id を返す。
+
+    同時に呼ばれても1本ずつ行う（同じ行を2か所で消して StaleDataError にならないように）。
+    """
+    with _cleanup_lock:
+        session.expire_all()  # 待っている間に別の片付けが消した行を読み直す
+        return _cleanup(session, settings, now or _utcnow())
+
+
+def _cleanup(session: Session, settings: Settings, now: datetime) -> list[int]:
     limit = now - timedelta(hours=settings.export_ttl_hours)
     finished = session.scalars(
         select(Export)

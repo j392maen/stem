@@ -31,6 +31,7 @@
 | TEMPO_RENDITION | render_id PK FK, stem_id PK FK, codec(opus), bitrate_kbps, file_path(データフォルダからの相対), bytes |
 
 制約:
+- 番号の使い回しを防ぐ（T14）: TRACK・INPUT_SOURCE・SEPARATION_JOB・STEM・EXPORT・TEMPO_RENDER・BEAT_EDIT の主キーは SQLite の AUTOINCREMENT（消した最大の番号を次に使い直さない。番号はフォルダ名 `stems/<job_id>`・`cache/tempo/<job_id>`・`exports/<export_id>`・`cache/tmp/job-<id>` にも使うため）。既存の DB は起動時（`init_db`）に `data/backup/stemapp-<日時>.db` へ複製してから表を作り直す（失敗したら元に戻して起動を止める）。
 - LISTEN_PRESET_ITEM は stem_type_id と group_id のどちらか一方だけが非NULL（CHECK 制約）。
 - STEM の子（parent_stem_id が同じ）は合計すると親に一致するよう、is_residual=true の stem を1つ含む。
 - 詳細分割（refine）の子 STEM は refine ジョブの行（job_id=refine ジョブ）。残りの STEM_TYPE は親ごとに `<親の code>_rest`（表示名「残り（親の表示名）」）。1つの stem を分けた結果は1組だけ（別の方法で分け直すと置き換え）。1つの分け方（full ジョブ）の木の中で STEM_TYPE の code は重ならない。

@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -317,6 +318,43 @@ def test_postprocess_rebuild_invalidates_tempo_cache(client: TestClient, tmp_pat
     assert _done_ratios(client, other) == []
 
 
+@pytest.mark.parametrize("files_too", [True, False])
+def test_invalidated_just_before_saving_is_canceled(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files_too: bool
+) -> None:
+    """伸縮が終わって結果を書き込む直前に、別の処理（invalidate_job_tempo）が行を消した。
+
+    外部キーの違反（IntegrityError）で落ちず、作ったファイルを捨てて canceled として終える。
+    """
+    job_id = _done_job(client, tmp_path)
+    r = _request(client, job_id, 1.1)
+    settings = _settings(client)
+    fired = [False]
+
+    def invalidate_unnoticed(_session: Any, _render_id: int) -> bool:
+        # キャンセルの確認の直後に行が消された（確認では気づかない）ことにする
+        if not fired[0]:
+            fired[0] = True
+            with _factory(client)() as other:
+                if files_too:
+                    assert tempo.invalidate_job_tempo(other, settings, job_id) == 1
+                else:
+                    # 行だけ消えた（書き込みは外部キーの違反 IntegrityError になる）
+                    other.execute(sa_delete(TempoRender).where(TempoRender.job_id == job_id))
+                    other.commit()
+        return False
+
+    monkeypatch.setattr(tempo, "_cancel_wanted", invalidate_unnoticed)
+    with _factory(client)() as s:
+        assert tempo.claim_next_render(s) == r["render_id"]
+    outcome = tempo.run_render(settings, _factory(client), r["render_id"], FakeStretcher())
+    assert fired[0] and outcome == tempo.CANCELED
+    with _factory(client)() as s:
+        assert s.get(TempoRender, r["render_id"]) is None
+        assert s.scalars(select(TempoRendition)).all() == []
+    assert not tempo.job_tempo_dir(settings, job_id).exists()  # 作ったファイルは捨てる
+
+
 def test_request_render_stale_state(client: TestClient, tmp_path: Path) -> None:
     """読んだ後に別の処理が状態を変えても（片付け・失敗）、500 にせず正しく登録する。"""
     job_id = _done_job(client, tmp_path)
@@ -527,38 +565,98 @@ def test_api_events_until_done(client: TestClient, tmp_path: Path) -> None:
     assert _render(client, r["render_id"])["status"] == "done"
 
 
-def test_worker_order_tempo_after_separation(client: TestClient, tmp_path: Path) -> None:
-    """分割待ちがあるときは分割を先に行う（伸縮は後回し）。"""
+class _HeldChild:
+    """終わるまで動き続ける子プロセスの代わり（分割中の状態を作る）。"""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return 0 if self.release.is_set() or self.killed else None
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def test_tempo_runs_while_separating(client: TestClient, tmp_path: Path) -> None:
+    """伸縮は分割とは別のスレッドで動き、分割中でも待たされない（同時に動かすのは1件）。"""
     job_id = _done_job(client, tmp_path)
-    r = _request(client, job_id, 1.1)
+    r1 = _request(client, job_id, 1.1)
+    r2 = _request(client, job_id, 0.9)
     settings = _settings(client)
     with _factory(client)() as s:
         track_id = make_track(s, settings, tmp_path / "n", name="n", seed_offset=0.4)
     queued = client.post(f"/api/tracks/{track_id}/jobs", json={"preset": "fast"}).json()["job"]
-    order: list[str] = []
-    worker = _worker(client, FakeStretcher())
-    orig_one, orig_tempo = worker.run_one, worker.run_tempo_one
+    child = _HeldChild()
+    started = threading.Event()
 
-    def run_one() -> int | None:
-        res = orig_one()
-        if res is not None:
-            order.append("job")
-        return res
+    def launch(_job_id: int) -> _HeldChild:
+        started.set()
+        return child
 
-    def run_tempo_one() -> int | None:
-        res = orig_tempo()
-        if res is not None:
-            order.append("tempo")
-            worker.stop()
-        return res
+    running: list[int] = []
+    max_parallel = [0]
+    lock = threading.Lock()
 
-    worker.run_one = run_one  # type: ignore[method-assign]
-    worker.run_tempo_one = run_tempo_one  # type: ignore[method-assign]
-    worker.poll_interval = 0.01
-    worker.run_forever()
-    assert order == ["job", "tempo"]
-    assert client.get(f"/api/jobs/{queued['job_id']}").json()["status"] == "done"
-    assert _render(client, r["render_id"])["status"] == "done"
+    class CountingStretcher(FakeStretcher):
+        def __call__(self, *args: Any, **kwargs: Any) -> None:
+            with lock:
+                running.append(1)
+                max_parallel[0] = max(max_parallel[0], len(running))
+            try:
+                super().__call__(*args, **kwargs)
+            finally:
+                with lock:
+                    running.pop()
+
+    settings_1 = settings.model_copy(update={"tempo_workers": 1})
+    worker = Worker(
+        settings_1, _factory(client), launch, poll_interval=0.02, cancel_check_interval=0.02,
+        tempo_stretcher=CountingStretcher(delay_sec=0.05),
+    )
+    t = threading.Thread(target=worker.run_forever)
+    t.start()
+    try:
+        assert started.wait(10)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            states = {_render(client, r["render_id"])["status"] for r in (r1, r2)}
+            if states == {"done"}:
+                break
+            time.sleep(0.05)
+        # 分割はまだ終わっていない（子プロセスが動いている）のに、伸縮は2件とも終わった
+        assert states == {"done"}
+        assert client.get(f"/api/jobs/{queued['job_id']}").json()["status"] == "running"
+        assert worker.current_job_id == queued["job_id"]
+        # 伸縮は1件ずつ（stem の並列は tempo_workers=1 なので、同時に動く伸縮は1つだけ）
+        assert max_parallel[0] == 1
+    finally:
+        child.release.set()
+        worker.stop()
+        t.join(timeout=30)
+    assert not t.is_alive()
+
+
+def test_tempo_thread_stops_with_worker_and_requeues(client: TestClient, tmp_path: Path) -> None:
+    """ワーカーを止めると伸縮のスレッドも止まり、作成中のものは作成待ちに戻る。"""
+    job_id = _done_job(client, tmp_path)
+    r = _request(client, job_id, 1.2)
+    worker = _worker(client, FakeStretcher(delay_sec=5.0))
+    worker.poll_interval = 0.02
+    t = threading.Thread(target=worker.run_forever)
+    t.start()
+    deadline = time.monotonic() + 10
+    while _render(client, r["render_id"])["status"] != "running" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert worker.status_snapshot()["tempo_render_id"] == r["render_id"]
+    worker.stop()
+    t.join(timeout=30)
+    assert not t.is_alive()
+    assert _render(client, r["render_id"])["status"] == "queued"
 
 
 # --- 本物の rubberband（ffmpeg） --------------------------------------------------------------

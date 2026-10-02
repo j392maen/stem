@@ -1,18 +1,20 @@
 """書き出しの API（作成・状態・ダウンロード）。
 
 - POST /api/jobs/{job_id}/exports: 種類・形式・対象を受け取り、書き出しを登録する（202）。
+- GET /api/jobs/{job_id}/exports: そのジョブの書き出しの一覧（期限内のもの、新しい順）。
 - GET /api/exports/{export_id}: 状態・進捗・ファイル名・大きさ。
 - GET /api/exports/{export_id}/download: ファイル（Range 対応、日本語のファイル名は RFC 5987）。
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from stemapp.api.common import SessionDep, iso, not_found, safe_data_file
 from stemapp.config import Settings
@@ -119,6 +121,29 @@ def create_job_export(
     exp = create_export(session, plan)
     manager.submit(exp.export_id)
     return {"export": export_to_dict(exp, settings, plan.track_id)}
+
+
+MAX_LISTED = 50
+
+
+@router.get("/jobs/{job_id}/exports")
+def list_job_exports(job_id: int, request: Request, session: SessionDep) -> dict[str, Any]:
+    """そのジョブの書き出しの一覧（新しい順）。期限の過ぎたものは出さない（片付けで消える）。"""
+    settings: Settings = request.app.state.settings
+    job = session.get(SeparationJob, job_id)
+    if job is None:
+        raise not_found("ジョブ")
+    limit = datetime.now(UTC) - timedelta(hours=settings.export_ttl_hours)
+    rows = session.scalars(
+        select(Export)
+        .where(Export.job_id == job_id)
+        .order_by(Export.created_at.desc(), Export.export_id.desc())
+    ).all()
+    alive = [
+        e for e in rows
+        if (e.created_at if e.created_at.tzinfo else e.created_at.replace(tzinfo=UTC)) >= limit
+    ]
+    return {"exports": [export_to_dict(e, settings, job.track_id) for e in alive[:MAX_LISTED]]}
 
 
 def _get_export(session: SessionDep, export_id: int) -> Export:
