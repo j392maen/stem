@@ -8,14 +8,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from stemapp.config import Settings
-from stemapp.hosts import normalize_host
+from stemapp.hosts import HostCheckMiddleware, normalize_host
 from test_api import _app
 
 TS_NAME = "unagi.tail8b25a2.ts.net"
@@ -51,10 +53,88 @@ def client(settings: Settings) -> Iterator[TestClient]:
         ("[::1", ""),
         ("[::1]x", ""),
         ("host:abc", ""),
+        # 全角数字や上付き数字は isdigit() が True でもポートではない
+        ("127.0.0.1:８０００", ""),
+        ("localhost:²", ""),
+        ("[::1]:８０", ""),
     ],
 )
 def test_normalize_host(value: str, expected: str) -> None:
     assert normalize_host(value) == expected
+
+
+def _run_asgi(scope: dict[str, Any]) -> list[dict[str, Any]]:
+    """HostCheckMiddleware を直接呼ぶ（TestClient は Host を必ず付けるため）。"""
+    sent: list[dict[str, Any]] = []
+    reached: list[str] = []
+
+    async def inner(_scope: Any, _receive: Any, _send: Any) -> None:
+        reached.append(_scope["type"])
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b""}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    mw = HostCheckMiddleware(inner, allowed=frozenset({"127.0.0.1", "localhost", "::1"}))
+    asyncio.run(mw(scope, receive, send))
+    if reached:
+        sent.append({"type": "reached"})
+    return sent
+
+
+def test_missing_host_header_is_400() -> None:
+    sent = _run_asgi({"type": "http", "method": "GET", "path": "/api/health", "headers": []})
+    assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 400
+    body = json.loads(sent[1]["body"].decode("utf-8"))
+    assert "STEMAPP_ALLOWED_HOSTS" in body["detail"]
+
+
+@pytest.mark.parametrize("headers", [[], [(b"host", b"evil.example")]])
+def test_websocket_with_bad_host_is_closed_1008(headers: list[tuple[bytes, bytes]]) -> None:
+    sent = _run_asgi({"type": "websocket", "path": "/ws", "headers": headers})
+    assert sent == [{"type": "websocket.close", "code": 1008}]
+
+
+def test_websocket_with_good_host_passes() -> None:
+    sent = _run_asgi(
+        {"type": "websocket", "path": "/ws", "headers": [(b"host", b"127.0.0.1:8000")]}
+    )
+    assert sent == [{"type": "reached"}]
+
+
+def test_missing_host_via_real_server(settings: Settings) -> None:
+    """本物のサーバー（uvicorn）に Host なしの HTTP/1.0 を送ると 400。"""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from stemapp.app import create_app
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(create_app(settings), host="127.0.0.1", port=port,
+                                           log_level="warning"))
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 20
+        while not server.started:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as c:
+            c.sendall(b"GET /api/health HTTP/1.0\r\n\r\n")
+            data = b""
+            while chunk := c.recv(4096):
+                data += chunk
+        assert data.startswith(b"HTTP/1.1 400"), data[:100]
+    finally:
+        server.should_exit = True
+        t.join(timeout=15)
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost:8000", "[::1]:8000", "127.0.0.1"])
@@ -154,6 +234,11 @@ def test_manifest_is_served(client: TestClient) -> None:
     assert data["background_color"].lower() == "#0b0b0e"
     sizes = {icon["sizes"] for icon in data["icons"]}
     assert {"192x192", "512x512"} <= sizes
+    # purpose は "any" と "maskable" を別の項目に分けて書く（"any maskable" は非推奨）
+    purposes = {(i["sizes"], i.get("purpose", "any")) for i in data["icons"]}
+    for size in ("192x192", "512x512"):
+        assert {(size, "any"), (size, "maskable")} <= purposes
+    assert all(" " not in i.get("purpose", "any") for i in data["icons"])
     for icon in data["icons"]:
         got = client.get("/" + icon["src"].lstrip("/"))
         assert got.status_code == 200, icon

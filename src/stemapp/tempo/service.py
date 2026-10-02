@@ -323,6 +323,10 @@ def output_frames(sources: list[SourceStem], ratio: float) -> int:
     return max(1, min(round(n / ratio) for n in lengths))
 
 
+class _RenderGone(Exception):
+    """書き込もうとした TEMPO_RENDER の行が消えていた。"""
+
+
 class _Stop:
     """ワーカースレッドから見る「止めるか」（メインスレッドが DB を見て立てる）。"""
 
@@ -435,32 +439,57 @@ def run_render(
             return outcome
 
         total = 0
-        session.execute(delete(TempoRendition).where(TempoRendition.render_id == render_id))
-        for i, src in enumerate(sources):
-            dst = futures[i].result()
-            size = dst.stat().st_size
-            total += size
-            session.add(
-                TempoRendition(
-                    render_id=render_id,
-                    stem_id=src.stem_id,
-                    codec=fmt.codec,
-                    bitrate_kbps=fmt.bitrate_kbps,
-                    file_path=data_relative(settings, dst),
-                    bytes=size,
+        try:
+            session.execute(
+                delete(TempoRendition).where(TempoRendition.render_id == render_id)
+            )
+            for i, src in enumerate(sources):
+                dst = futures[i].result()
+                size = dst.stat().st_size
+                total += size
+                session.add(
+                    TempoRendition(
+                        render_id=render_id,
+                        stem_id=src.stem_id,
+                        codec=fmt.codec,
+                        bitrate_kbps=fmt.bitrate_kbps,
+                        file_path=data_relative(settings, dst),
+                        bytes=size,
+                    )
+                )
+            now = _utcnow()
+            res = session.execute(
+                update(TempoRender)
+                .where(TempoRender.render_id == render_id)
+                .values(
+                    status=DONE, progress=1.0, stage="完了", finished_at=now, last_used_at=now,
+                    dir_path=data_relative(settings, out_dir), bytes=total, frames=frames,
+                    error_message=None,
                 )
             )
-        now = _utcnow()
-        session.execute(
-            update(TempoRender)
-            .where(TempoRender.render_id == render_id)
-            .values(
-                status=DONE, progress=1.0, stage="完了", finished_at=now, last_used_at=now,
-                dir_path=data_relative(settings, out_dir), bytes=total, frames=frames,
-                error_message=None,
+            if res.rowcount != 1:  # type: ignore[attr-defined]
+                raise _RenderGone
+            session.commit()
+        except Exception as e:
+            # 書き込む直前に行が消された（配信用データの作り直し・詳細分割・ジョブの削除で
+            # invalidate_job_tempo が呼ばれた）: 作ったファイルは古い音声なので捨てる。
+            # 行と一緒にフォルダも消されるので、ファイルが無い（FileNotFoundError）こともある
+            session.rollback()
+            gone = session.get(TempoRender, render_id) is None
+            shutil.rmtree(out_dir, ignore_errors=True)
+            if not gone and not isinstance(e, (IntegrityError, _RenderGone)):
+                log.exception("速度を変えた音声を保存できませんでした（render %d）", render_id)
+                _finish(session, settings, render_id, FAILED, message=_message(e))
+                return FAILED
+            try:
+                out_dir.parent.rmdir()  # ジョブのフォルダが空なら消す
+            except OSError:
+                pass
+            _finish(session, settings, render_id, CANCELED, stage=STAGE_CANCELED)
+            log.info(
+                "作成中に速度変更のキャッシュが消されたため捨てました（render %d）。", render_id
             )
-        )
-        session.commit()
+            return CANCELED
         log.info(
             "速度を変えた音声を作りました（render %d, %.1f MB）。", render_id, total / 1024 / 1024
         )

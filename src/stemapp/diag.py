@@ -95,7 +95,10 @@ def ensure_sample(settings: Settings, code: str, runner: FfmpegRunner | None = N
 # --- 診断結果の保存 -------------------------------------------------------------------
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9_-]+")
-_NAME_RE = re.compile(r"^\d{8}-\d{6}-[A-Za-z0-9_-]{1,32}(?:-\d+)?\.json$")
+# <年月日>-<時分秒><ミリ秒>-<端末>(-<番号>).json。T14 より前はミリ秒が無い
+_NAME_RE = re.compile(r"^(\d{8}-\d{6})(\d{3})?-[A-Za-z0-9_-]{1,32}(?:-\d+)?\.json$")
+# 残す件数の上限（超えたら古い順に消す）
+MAX_KEEP = 200
 
 
 def diag_dir(settings: Settings) -> Path:
@@ -115,9 +118,14 @@ def save_result(
     settings: Settings, data: dict[str, Any], server_info: dict[str, Any],
     now: datetime | None = None,
 ) -> str:
-    """診断結果を保存し、ファイル名を返す。"""
+    """診断結果を保存し、ファイル名を返す。保存した後、上限（MAX_KEEP 件）を超えた古いものを消す。
+
+    名前にミリ秒まで入れる（同じ秒に続けて保存しても新しい順に並ぶように）。
+    """
     now = now or datetime.now().astimezone()
-    base = f"{now:%Y%m%d-%H%M%S}-{device_slug(data.get('device'))}"
+    base = (
+        f"{now:%Y%m%d-%H%M%S}{now.microsecond // 1000:03d}-{device_slug(data.get('device'))}"
+    )
     record = {"saved_at": now.isoformat(), "server": server_info, "result": data}
     text = json.dumps(record, ensure_ascii=False, indent=1)
     folder = diag_dir(settings)
@@ -126,19 +134,48 @@ def save_result(
         try:
             with open(folder / name, "x", encoding="utf-8", newline="\n") as f:
                 f.write(text)
+            prune_results(settings)
             return name
         except FileExistsError:
             continue
     raise RuntimeError("診断結果のファイル名を決められませんでした。")
 
 
+def _sort_key(path: Path) -> tuple[str, int, str]:
+    """新しい順に並べるための鍵: (名前の日時＋ミリ秒, 書いた時刻, 名前)。
+
+    同じミリ秒（や、ミリ秒の無い古い名前で同じ秒）のときはファイルの書いた時刻で決める。
+    """
+    m = _NAME_RE.match(path.name)
+    stamp = (m.group(1) + (m.group(2) or "000")) if m else ""
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    return stamp, mtime, path.name
+
+
+def _sorted_files(settings: Settings) -> list[Path]:
+    """保存した診断結果のファイル（新しい順）。"""
+    files = [p for p in diag_dir(settings).glob("*.json") if _NAME_RE.match(p.name)]
+    return sorted(files, key=_sort_key, reverse=True)
+
+
+def prune_results(settings: Settings, keep: int = MAX_KEEP) -> list[str]:
+    """上限を超えた古い診断結果を消す。消した名前を返す。"""
+    removed: list[str] = []
+    for path in _sorted_files(settings)[keep:]:
+        try:
+            path.unlink()
+            removed.append(path.name)
+        except OSError:
+            continue
+    return removed
+
+
 def list_results(settings: Settings, limit: int = 20) -> list[dict[str, Any]]:
     """保存した診断結果（新しい順）。読めないファイルは error を付けて返す。"""
-    files: Sequence[Path] = sorted(
-        (p for p in diag_dir(settings).glob("*.json") if _NAME_RE.match(p.name)),
-        key=lambda p: p.name,
-        reverse=True,
-    )
+    files: Sequence[Path] = _sorted_files(settings)
     items: list[dict[str, Any]] = []
     for path in files[: max(0, min(limit, MAX_LIST))]:
         item: dict[str, Any] = {"name": path.name, "size": path.stat().st_size}

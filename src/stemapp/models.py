@@ -31,11 +31,19 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+# 主キーの番号を使い回さない表（SQLite の AUTOINCREMENT）。消した最大の番号を次に使い直すと、
+# 番号を名前に使うフォルダ（旧 stems/<job_id>、cache/tempo/<job_id>、exports/<export_id> など）を
+# 取り違えるおそれがあるため。既存の DB は `stemapp.db.migrate_autoincrement` で作り直す
+AUTOINCREMENT: dict[str, Any] = {"sqlite_autoincrement": True}
+
+
 # --- 曲と入力 ---------------------------------------------------------------
 
 
 class Track(Base):
     __tablename__ = "track"
+    # 番号を使い回さない（番号がフォルダ名にも使われるため。`stemapp.db` の AUTOINCREMENT）
+    __table_args__ = AUTOINCREMENT
 
     track_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(500))
@@ -50,6 +58,8 @@ class Track(Base):
 
 class InputSource(Base):
     __tablename__ = "input_source"
+    # 番号を使い回さない（番号がフォルダ名にも使われるため。`stemapp.db` の AUTOINCREMENT）
+    __table_args__ = AUTOINCREMENT
 
     source_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     track_id: Mapped[int | None] = mapped_column(
@@ -146,6 +156,8 @@ class StemType(Base):
 
 class SeparationJob(Base):
     __tablename__ = "separation_job"
+    # 番号を使い回さない（番号がフォルダ名にも使われるため。`stemapp.db` の AUTOINCREMENT）
+    __table_args__ = AUTOINCREMENT
 
     job_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     track_id: Mapped[int] = mapped_column(ForeignKey("track.track_id", ondelete="CASCADE"))
@@ -198,6 +210,8 @@ class SeparationJob(Base):
 
 class Stem(Base):
     __tablename__ = "stem"
+    # 番号を使い回さない（番号がフォルダ名にも使われるため。`stemapp.db` の AUTOINCREMENT）
+    __table_args__ = AUTOINCREMENT
 
     stem_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(
@@ -365,6 +379,8 @@ class BeatEdit(Base):
     """
 
     __tablename__ = "beat_edit"
+    # 番号を使い回さない（番号がフォルダ名にも使われるため。`stemapp.db` の AUTOINCREMENT）
+    __table_args__ = AUTOINCREMENT
 
     edit_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     track_id: Mapped[int] = mapped_column(
@@ -411,6 +427,8 @@ class OfflineCache(Base):
 
 class Export(Base):
     __tablename__ = "export"
+    # 番号を使い回さない（番号がフォルダ名にも使われるため。`stemapp.db` の AUTOINCREMENT）
+    __table_args__ = AUTOINCREMENT
 
     export_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(
@@ -465,7 +483,10 @@ class TempoRender(Base):
     """
 
     __tablename__ = "tempo_render"
-    __table_args__ = (UniqueConstraint("job_id", "ratio", name="ux_tempo_render_job_ratio"),)
+    __table_args__ = (
+        UniqueConstraint("job_id", "ratio", name="ux_tempo_render_job_ratio"),
+        AUTOINCREMENT,
+    )
 
     render_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(

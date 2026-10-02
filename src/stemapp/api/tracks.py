@@ -329,25 +329,49 @@ BEATS_MESSAGES = {
 }
 
 
+class BeatsRequest(BaseModel):
+    # 表示中のジョブ（分け方）。解析に失敗したときの警告をこのジョブに付ける。省略時は最新の分割
+    job_id: int | None = None
+
+
 @router.post("/tracks/{track_id}/beats")
-def reanalyze_beats(track_id: int, response: Response, session: SessionDep) -> dict[str, Any]:
+def reanalyze_beats(
+    track_id: int, response: Response, session: SessionDep, body: BeatsRequest | None = None
+) -> dict[str, Any]:
     """拍を解析し直す（ワーカーが「作り直し」として処理する）。登録したら 202。
 
     今の結果は消してから登録する（解析が終わるまで拍の無い曲として表示される）。
     作り直しが作成待ち・作成中のときも拍は消す（ワーカーは作り直しの最後に拍の有無を見るので、
     その作り直しの中で解析される）。分割が終わっていない曲は 409。
+    body.job_id を渡すと、そのジョブ（この曲の分割済みの full ジョブ）で解析する
+    （失敗の警告もそこに付く）。
     """
     if session.get(Track, track_id) is None:
         raise not_found("曲")
-    job = session.scalars(
-        select(SeparationJob)
-        .where(
-            SeparationJob.track_id == track_id,
-            SeparationJob.job_kind == "full",
-            SeparationJob.status == DONE,
-        )
-        .order_by(SeparationJob.job_id.desc())
-    ).first()
+    job: SeparationJob | None
+    if body is not None and body.job_id is not None:
+        job = session.get(SeparationJob, body.job_id)
+        if job is None or job.track_id != track_id:
+            raise not_found("この曲のジョブ")
+        if job.job_kind != "full":
+            raise HTTPException(
+                status_code=400, detail="拍の解析には分け方（分割）のジョブを指定してください。"
+            )
+        if job.status != DONE:
+            raise HTTPException(
+                status_code=409,
+                detail="このジョブは分割が終わっていません。分割が終わると拍も解析されます。",
+            )
+    else:
+        job = session.scalars(
+            select(SeparationJob)
+            .where(
+                SeparationJob.track_id == track_id,
+                SeparationJob.job_kind == "full",
+                SeparationJob.status == DONE,
+            )
+            .order_by(SeparationJob.job_id.desc())
+        ).first()
     if job is None:
         raise HTTPException(
             status_code=409, detail="分割が終わっていない曲です。分割が終わると拍も解析されます。"

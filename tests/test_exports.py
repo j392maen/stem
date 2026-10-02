@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import shutil
+import threading
+import time
 import zipfile
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
@@ -16,6 +18,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from typer.testing import CliRunner
@@ -27,7 +30,13 @@ from stemapp.config import Settings
 from stemapp.delivery import fake_encoder
 from stemapp.exports import naming
 from stemapp.exports.naming import content_disposition, safe_filename
-from stemapp.exports.render import SourceStem, mix_stems, render_mix, render_single
+from stemapp.exports.render import (
+    SourceStem,
+    TrackInfo,
+    mix_stems,
+    render_mix,
+    render_single,
+)
 from stemapp.exports.service import (
     DONE,
     FAILED,
@@ -298,7 +307,44 @@ def test_mix_sum_with_gain_and_no_clip(tmp_path: Path) -> None:
     mixed, gain = mix_stems([sa, sb])
     expect = read_audio(sa.path) + read_audio(sb.path).astype(np.float64) * 10 ** (-6 / 20)
     assert gain == 0.0
-    assert np.max(np.abs(mixed - expect)) < 1e-9
+    # 合計は float32（メモリ半分）。誤差は 24bit の 1 段の半分より小さい
+    assert mixed.dtype == np.float32
+    assert np.max(np.abs(mixed - expect)) < LSB24 / 2
+
+
+def test_mix_float32_keeps_24bit_precision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """7 stem を音量つきで足しても、float64 で足した結果との差は 24bit の 1 段以内。
+
+    区間ごとに足す処理の境目と、長さの違う stem（短い方は無音で埋める）も確かめる。
+    """
+    from stemapp.exports import render as render_mod
+
+    monkeypatch.setattr(render_mod, "MIX_BLOCK", 1000)
+    rng = np.random.default_rng(1)
+    n = 44100
+    srcs = [
+        _src(tmp_path, f"s{i}", rng.uniform(-0.3, 0.3, size=(n - (2345 if i == 3 else 0), 2)),
+             gain_db=float(i) - 3.0)
+        for i in range(7)
+    ]
+    mixed, gain = mix_stems(srcs)
+    expect = np.zeros((n, 2))
+    for s in srcs:
+        d = read_audio(s.path).astype(np.float64) * 10 ** (s.gain_db / 20)
+        expect[: d.shape[0]] += d
+    peak = float(np.max(np.abs(expect)))
+    if peak > 1:
+        expect = expect / peak
+        assert gain == pytest.approx(-20 * np.log10(peak), abs=1e-5)
+    assert mixed.dtype == np.float32 and mixed.nbytes == n * 2 * 4
+    assert np.max(np.abs(mixed - expect)) <= LSB24
+    # 24bit で書いたものも、float64 で足して 24bit にしたものと 1 段以内で一致する
+    dst = tmp_path / "m.wav"
+    render_mix(srcs, dst, "wav")
+    back, _sr = sf.read(str(dst), dtype="float64", always_2d=True)
+    assert np.max(np.abs(back - np.clip(expect, -1, 1))) <= 2 * LSB24
 
 
 def test_mix_over_one_is_scaled(tmp_path: Path) -> None:
@@ -326,6 +372,50 @@ def test_single_mp3_uses_ffmpeg_args(tmp_path: Path) -> None:
     res = render_single(src, tmp_path / "out" / "s.mp3", "mp3", runner=fake_mp3)
     assert res.path.is_file() and res.bytes > 0
     assert not list((tmp_path / "out").glob("*.tmp.wav"))  # 一時ファイルは消える
+
+
+def _meta(args: Sequence[str]) -> dict[str, str]:
+    a = list(args)
+    out: dict[str, str] = {}
+    for i, v in enumerate(a):
+        if v == "-metadata":
+            key, _, value = a[i + 1].partition("=")
+            out[key] = value
+    return out
+
+
+def test_mp3_tags_in_ffmpeg_args(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> None:
+        calls.append(list(args))
+        fake_mp3(args)
+
+    src = SourceStem(code="bass", display_name="ベース", path=_src(
+        tmp_path, "b", np.zeros((1000, 2))).path)
+    info = TrackInfo("夜に駆ける", "YOASOBI")
+    render_single(src, tmp_path / "o" / "s.mp3", "mp3", runner=runner, info=info)
+    assert _meta(calls[-1]) == {
+        "title": "夜に駆ける - ベース", "album": "夜に駆ける", "artist": "YOASOBI",
+    }
+    args = calls[-1]
+    assert args[args.index("-id3v2_version") + 1] == "3"
+    # 組み合わせ名・アーティストなし
+    render_mix([src], tmp_path / "o" / "m.mp3", "mp3", runner=runner,
+               info=TrackInfo("曲\n名", None), label="ボーカル＋ドラム")
+    assert _meta(calls[-1]) == {"title": "曲 名 - ボーカル＋ドラム", "album": "曲 名"}
+    # WAV・FLAC にはタグを付けない（ffmpeg を使わない）
+    n = len(calls)
+    render_single(src, tmp_path / "o" / "s.wav", "wav", runner=runner, info=info)
+    assert len(calls) == n
+
+
+def test_label_from_filename() -> None:
+    fn = safe_filename(naming.export_base_name("夜に駆ける", "ボーカル＋ドラム"), "mp3")
+    assert naming.label_from_filename("夜に駆ける", fn) == "ボーカル＋ドラム"
+    fn = safe_filename(naming.export_base_name('A/B: "C"', "全部"), "mp3")
+    assert naming.label_from_filename('A/B: "C"', fn) == "全部"
+    assert naming.label_from_filename("別の曲", "x - y.mp3") == "x - y"
 
 
 # --- API・実行 ---------------------------------------------------------------------------
@@ -521,6 +611,86 @@ def test_cleanup_expired_capacity_orphans(client: TestClient, job_id: int) -> No
         assert (settings.exports_dir / str(c) / "x.wav").is_file()
         assert not orphan.exists()
         assert not (settings.exports_dir / "not-a-number").exists()
+
+
+def test_cleanup_runs_one_at_a_time(
+    client: TestClient, job_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同時に呼ばれた片付けは1本ずつ動き、同じ行を2回消そうとして失敗しない。"""
+    from stemapp.exports import service as svc
+
+    settings = _settings(client)
+    now = datetime.now(UTC)
+    with _factory(client)() as s:
+        old = [_fake_done(s, settings, job_id, now - timedelta(hours=48), 10) for _ in range(5)]
+    inside = [0]
+    overlap = [0]
+    orig = svc._delete
+
+    def slow_delete(*args: Any, **kwargs: Any) -> list[int]:
+        inside[0] += 1
+        overlap[0] = max(overlap[0], inside[0])
+        try:
+            time.sleep(0.05)
+            return orig(*args, **kwargs)
+        finally:
+            inside[0] -= 1
+
+    monkeypatch.setattr(svc, "_delete", slow_delete)
+    results: list[list[int]] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            with _factory(client)() as s:
+                results.append(cleanup_exports(s, settings))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == []
+    assert overlap[0] == 1
+    assert sorted(i for r in results for i in r) == sorted(old)  # どれも1回だけ消した
+    with _factory(client)() as s:
+        assert s.scalars(select(Export).where(Export.export_id.in_(old))).all() == []
+
+
+def test_cleanup_tolerates_rows_deleted_elsewhere(client: TestClient, job_id: int) -> None:
+    """片付けの対象が別の操作（曲の削除など）で先に消えていても失敗しない。"""
+    settings = _settings(client)
+    now = datetime.now(UTC)
+    with _factory(client)() as s:
+        eid = _fake_done(s, settings, job_id, now - timedelta(hours=48), 10)
+    with _factory(client)() as s:
+        stale = s.get(Export, eid)
+        assert stale is not None
+        with _factory(client)() as other:
+            other.execute(sa_delete(Export).where(Export.export_id == eid))
+            other.commit()
+        from stemapp.exports.service import _delete
+
+        assert _delete(s, settings, [stale]) == [eid]
+
+
+def test_api_list_job_exports(client: TestClient, job_id: int) -> None:
+    first = _export(client, job_id, {"export_type": "single", "format": "wav", "stem_code": "bass"})
+    second = _export(client, job_id, {"export_type": "all", "format": "flac"})
+    settings = _settings(client)
+    with _factory(client)() as s:
+        # 期限の過ぎたもの（片付けがまだ）は出さない
+        _fake_done(s, settings, job_id, datetime.now(UTC) - timedelta(hours=48), 10)
+    res = client.get(f"/api/jobs/{job_id}/exports")
+    assert res.status_code == 200
+    items = res.json()["exports"]
+    assert [x["export_id"] for x in items] == [second["export_id"], first["export_id"]]
+    assert items[0]["download_url"] == f"/api/exports/{second['export_id']}/download"
+    assert items[0]["zip"] is True and items[1]["filename"] == "夜に駆ける - ベース.wav"
+    assert client.get(items[1]["download_url"]).status_code == 200
+    assert client.get("/api/jobs/99999/exports").status_code == 404
 
 
 def test_cleanup_keeps_newest_even_if_too_big(client: TestClient, job_id: int) -> None:
@@ -726,6 +896,43 @@ def test_each_type_and_format(
                 assert np.max(np.abs(data - guitar)) <= LSB24
             if export_type == "mix":
                 assert np.max(np.abs(data - expect_mix)) <= 2 * LSB24
+
+
+@pytest.mark.ffmpeg
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg がありません")
+def test_real_mp3_has_tags(ff_client: TestClient, tmp_path: Path) -> None:
+    from stemapp.proc import run_bound
+
+    client = ff_client
+    job_id = _done_job(client, tmp_path)
+    with _factory(client)() as s:
+        job = s.get(SeparationJob, job_id)
+        assert job is not None
+        s.get(Track, job.track_id).artist = "YOASOBI"  # type: ignore[union-attr]
+        s.commit()
+    probe = shutil.which("ffprobe")
+    assert probe is not None
+    cases = [
+        ({"export_type": "single", "format": "mp3", "stem_code": "guitar"}, "ギター"),
+        ({"export_type": "mix", "format": "mp3",
+          "stems": [{"code": "drums", "gain_db": 0}, {"code": "bass", "gain_db": 0}]},
+         "ドラム＋ベース"),
+    ]
+    for body, label in cases:
+        exp = _export(client, job_id, body)
+        path = tmp_path / "tags" / exp["filename"]
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(_download(client, exp))
+        proc = run_bound(
+            [probe, "-v", "error", "-show_entries", "format_tags=title,artist,album",
+             "-of", "json", str(path)],
+            text=True, encoding="utf-8",
+        )
+        assert proc.returncode == 0, proc.stderr
+        tags = {k.lower(): v for k, v in json.loads(proc.stdout)["format"]["tags"].items()}
+        assert tags == {
+            "title": f"夜に駆ける - {label}", "artist": "YOASOBI", "album": "夜に駆ける",
+        }
 
 
 def test_old_db_gets_export_columns(tmp_path: Path) -> None:
