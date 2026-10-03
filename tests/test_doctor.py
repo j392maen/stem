@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -240,3 +241,16 @@ def test_tailscale_serve_status_error(settings: Settings, monkeypatch: pytest.Mo
 
 def test_tailscale_check_is_in_default_checks() -> None:
     assert doctor.check_tailscale in doctor.DEFAULT_CHECKS
+
+
+def test_tailscale_json_reads_utf8_japanese_name() -> None:
+    """T17: tailscale の出力（UTF-8）を、コンソールの文字コード（cp932 など）に関係なく読む。
+
+    表示名に日本語があると、cp932 で読むと閉じの引用符が化けて JSON が壊れていた。
+    本物の子プロセスに UTF-8 のバイト列を書かせて確かめる。
+    """
+    payload = '{"BackendState": "Running", "User": {"1": {"DisplayName": "テスト太郎"}}}'
+    code = f"import sys; sys.stdout.buffer.write({payload.encode('utf-8')!r})"
+    out = doctor._tailscale_json(sys.executable, ["-c", code])
+    assert out["User"]["1"]["DisplayName"] == "テスト太郎"
+    assert out["BackendState"] == "Running"
