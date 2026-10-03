@@ -282,7 +282,8 @@ def _fake_hide(page: Any, ms: int) -> None:
     page.evaluate(
         """(ms) => new Promise((ok) => {
             const set = (v) => {
-                Object.defineProperty(document, 'visibilityState', { get: () => v, configurable: true });
+                Object.defineProperty(
+                    document, 'visibilityState', { get: () => v, configurable: true });
                 document.dispatchEvent(new Event('visibilitychange'));
             };
             set('hidden');
