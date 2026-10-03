@@ -37,6 +37,10 @@ class ModelDef:
     architecture: str
     output_stems: list[str]
     license: str = "unknown"
+    # 詳細分割の方法の並び順（小さいほど先。同じ親の stem で先頭のものが既定）。None は後ろ
+    refine_order: int | None = None
+    # 詳細分割の方法として「実験」扱い（画面に「実験」と出す）
+    experimental: bool = False
 
 
 SW = "BS-Roformer-SW.ckpt"
@@ -86,14 +90,19 @@ MODELS: list[ModelDef] = [
              KARAOKE_OUT),
     ModelDef(KARAOKE_MEL_GABOX_V2, "Mel-RoFormer カラオケ（gabox v2）", "mel_band_roformer",
              KARAOKE_OUT),
+    # 詳細分割の方法（refine_order の小さいものが先頭・既定）。
+    # 「その他」は Mega 53 が既定。HPSS は短い音の側にノイズしか残らないことが多いので実験扱いで
+    # 末尾（ユーザーの確認、2026-10-03。T17）
     ModelDef(DRUMSEP, "MDX23C ドラム分割", "mdx23c",
-             ["kick", "snare", "toms", "hihat", "ride", "crash"]),
-    ModelDef(MALE_FEMALE, "BS-RoFormer 男声/女声", "bs_roformer", ["male", "female"]),
-    ModelDef(ASPIRATION, "Mel-RoFormer 息", "mel_band_roformer", ["breath", "no_breath"]),
+             ["kick", "snare", "toms", "hihat", "ride", "crash"], refine_order=10),
+    ModelDef(MALE_FEMALE, "BS-RoFormer 男声/女声", "bs_roformer", ["male", "female"],
+             refine_order=20),
+    ModelDef(ASPIRATION, "Mel-RoFormer 息", "mel_band_roformer", ["breath", "no_breath"],
+             refine_order=30),
+    ModelDef(MEGA53, "Mega 53（楽器別）", "msst_bs_roformer", MEGA53_CHILDREN,
+             license="不明（明示なし。コードは MIT）", refine_order=40),
     ModelDef(HPSS, "HPSS（持続音／短い音）", "hpss", ["sustained", "transient"],
-             license="ISC（librosa）"),
-    ModelDef(MEGA53, "Mega 53（楽器別・実験）", "msst_bs_roformer", MEGA53_CHILDREN,
-             license="不明（明示なし。コードは MIT）"),
+             license="ISC（librosa）", refine_order=90, experimental=True),
 ]
 
 # --- STEM_TYPE ---------------------------------------------------------------
@@ -322,6 +331,8 @@ def _seed_models(session: Session) -> dict[str, Model]:
         m.architecture = d.architecture
         m.output_stems_json = list(d.output_stems)
         m.license = d.license
+        m.refine_order = d.refine_order
+        m.is_experimental = d.experimental
     session.flush()
     return existing
 

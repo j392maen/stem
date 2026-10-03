@@ -156,9 +156,14 @@ def test_refine_other_with_mega53(page: Any, server: LiveServer, tmp_path: Path)
     page.click(".stem-cell[data-code='other'] .refine-act.split")
     page.wait_for_selector(".refine-modal")
     models = page.locator(".refine-option").evaluate_all("els => els.map(e => e.dataset.model)")
-    assert sorted(models) == sorted([HPSS, MEGA53])
+    # T17: Mega 53 が先頭（既定で選ばれている）、HPSS は「実験」として末尾
+    assert models == [MEGA53, HPSS]
     mega = page.locator(f".refine-option[data-model='{MEGA53}']")
     assert "Mega 53" in mega.inner_text() and "GPU" in mega.inner_text()
+    assert mega.evaluate("e => e === document.activeElement")
+    assert mega.locator(".refine-tag.exp").count() == 0
+    hpss = page.locator(f".refine-option[data-model='{HPSS}']")
+    assert hpss.locator(".refine-tag.exp").inner_text() == "実験"
     assert "ストリングス" in mega.inner_text() and "シンセ" in mega.inner_text()
     _shot(page, "refine_mega53_menu_pc.png")
     mega.click()

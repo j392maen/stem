@@ -104,6 +104,12 @@ class Model(Base):
     checkpoint_sha256: Mapped[str | None] = mapped_column(String(64))
     license: Mapped[str] = mapped_column(String(100), default="unknown")
     source_url: Mapped[str | None] = mapped_column(Text)
+    # 詳細分割（もっと分ける）の方法の並び順。小さいほど先（先頭が既定）。NULL は後ろ
+    refine_order: Mapped[int | None] = mapped_column(Integer)
+    # 詳細分割の方法として「実験」扱い（画面で「実験」と表示し、並びも後ろにする）
+    is_experimental: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0")
+    )
 
 
 class SeparationPreset(Base):
