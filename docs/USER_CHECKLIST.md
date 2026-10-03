@@ -312,7 +312,7 @@ PS C:\mine\stem>
 
 準備（3 章と同じ）:
 1. PC でアプリを起動し直す（新しい版を読み込むため。0 の手順）。
-2. PC の PowerShell で `cd C:\mine\stem; .\scripts	ailscale-serve.ps1 start`。
+2. PC の PowerShell で `cd C:\mine\stem; .\scripts\tailscale-serve.ps1 start`。
 3. iPhone で `https://unagi.tail8b25a2.ts.net/` を開き、ライブラリのいちばん下の「端末の診断」を開く。
 4. 「iPhone 再生の実験（消音モード・ロック中）」の欄までスクロールする。
 
@@ -331,7 +331,7 @@ PS C:\mine\stem>
 | C | Web Audio の音を `<audio>` から出す |
 | D | `<audio>` だけ（比較用。前回は消音でも鳴り、ロック中も続いた） |
 
-結果はサーバーに保存されるので、ここには「やった」と、気づいたことがあれば書いてください。終わったら `.\scripts	ailscale-serve.ps1 stop` で公開をやめられます。
+結果はサーバーに保存されるので、ここには「やった」と、気づいたことがあれば書いてください。終わったら `.\scripts\tailscale-serve.ps1 stop` で公開をやめられます。
 
 ### 結果・感想
 -
