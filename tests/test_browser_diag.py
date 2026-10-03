@@ -256,3 +256,160 @@ def test_no_notice_on_local(browser: Any, server: LiveServer) -> None:
         assert "icon.svg" in bg
     finally:
         page.context.close()
+
+
+# --- iPhone 再生の実験（T06b-0） ------------------------------------------------------
+
+
+def _wait_saved_change(page: Any, before: str | None) -> str:
+    page.wait_for_function(
+        "(b) => { const s = document.querySelector('#diag-status').dataset.saved;"
+        " return !!s && s !== b; }",
+        arg=before,
+    )
+    name = page.get_attribute("#diag-status", "data-saved")
+    assert name
+    return name
+
+
+def _latest_experiments(server: LiveServer, name: str) -> list[dict[str, Any]]:
+    saved = {r["name"]: r for r in _saved(server)}
+    return saved[name]["result"]["ios_experiments"]
+
+
+def _fake_hide(page: Any, ms: int) -> None:
+    """画面が隠れた（ロックした）ことにする。visibilityState を差し替えてイベントを出す。"""
+    page.evaluate(
+        """(ms) => new Promise((ok) => {
+            const set = (v) => {
+                Object.defineProperty(document, 'visibilityState', { get: () => v, configurable: true });
+                document.dispatchEvent(new Event('visibilitychange'));
+            };
+            set('hidden');
+            setTimeout(() => { set('visible'); delete document.visibilityState; ok(); }, ms);
+        })""",
+        ms,
+    )
+
+
+def test_ios_experiments_phone(browser: Any, server: LiveServer) -> None:
+    page = _page(browser, PHONE)
+    try:
+        page.goto(server.base_url + "/#/diag")
+        box = page.locator("#diag-ios")
+        box.wait_for()
+        text = box.inner_text()
+        assert "消音スイッチ" in text and "ロックして 10 秒" in text
+        for exp in "ABCD":
+            assert page.locator(f"#exp-{exp}").is_visible()
+        _shot(page, "ios-exp-phone.png")
+
+        name: str | None = None
+        has_session = page.evaluate("!!navigator.audioSession")
+
+        # A: audioSession が無い端末では「無い」と記録する（Edge には無い）
+        page.click("#exp-A")
+        if not has_session:
+            name = _wait_saved_change(page, name)
+            exps = _latest_experiments(server, name)
+            assert exps[-1]["experiment"] == "A"
+            assert exps[-1]["answer"] == "unavailable"
+            assert exps[-1]["auto"]["audio_session_available"] is False
+            assert "この端末には無い" in page.locator(".ios-exp-history").inner_text()
+        else:  # audioSession がある端末なら鳴らして記録できる
+            page.wait_for_selector("#exp-running[data-exp=A]")
+            page.click("#exp-record")
+            name = _wait_saved_change(page, name)
+
+        # B・C・D: 鳴らして、答えを選んで記録する
+        for exp in "BCD":
+            page.click(f"#exp-{exp}")
+            page.wait_for_selector(f"#exp-running[data-exp={exp}]")
+            title = page.evaluate(
+                "navigator.mediaSession.metadata && navigator.mediaSession.metadata.title"
+            )
+            assert title == f"stemapp 実験 {exp}"
+            page.wait_for_timeout(800)
+            _fake_hide(page, 1200)
+            if exp == "B":
+                _shot(page, "ios-exp-running-phone.png")
+                overflow = page.evaluate(
+                    "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+                )
+                assert overflow <= 0
+            page.click("[data-q=silent_mode][data-v=played]")
+            page.click("[data-q=lock][data-v=continued]")
+            page.click("[data-q=lock_screen][data-v=title_and_controls]")
+            assert page.get_attribute("[data-q=lock][data-v=continued]", "aria-pressed") == "true"
+            page.click("#exp-record")
+            name = _wait_saved_change(page, name)
+            entry = _latest_experiments(server, name)[-1]
+            assert entry["experiment"] == exp
+            assert entry["answers"] == {
+                "silent_mode": "played", "lock": "continued", "lock_screen": "title_and_controls",
+            }
+            assert entry["answer"] == "continued"
+            assert entry["answer_labels"]["lock_screen"] == "曲名と操作が出た"
+            assert entry["hidden_ms"] >= 1000
+            # 音の時計が進んでいる（＝再生が始まっていた）
+            assert entry["clock_advance_hidden_sec"] is not None
+            assert entry["clock_advance_hidden_sec"] > 0.5, entry
+            auto = entry["auto"]
+            assert auto["media_session"]["metadata_set"] is True
+            assert {"play", "pause"} <= set(auto["media_session"]["handlers"])
+            assert auto["element_paused_end"] is False
+            if exp in "BC":
+                assert auto["context_state_after_resume"] == "running"
+                assert auto["context_time_end"] > 1.0
+            if exp == "C":
+                assert auto["media_stream_destination"] is True
+            if exp in "BD":
+                assert auto["element_time_total"] > 1.0
+            types = [e["type"] for e in entry["events"]]
+            assert types[0] == "start" and "visibility" in types and types[-1] == "finish"
+            # 終わったらロック画面の表示を片付ける
+            assert page.evaluate("navigator.mediaSession.metadata") is None
+
+        assert page.locator(".ios-exp-history li").count() == 4
+        # やめると記録しない
+        page.click("#exp-D")
+        page.wait_for_selector("#exp-running")
+        page.click("#exp-cancel")
+        page.wait_for_selector("#exp-D")
+        assert len(_latest_experiments(server, name)) == 4
+
+        # 診断を後から走らせても実験の記録は残る
+        page.click("#diag-run")
+        name = _wait_saved_change(page, name)
+        assert len(_latest_experiments(server, name)) == 4
+        _shot(page, "ios-exp-done-phone.png")
+        assert page.errors == []  # type: ignore[attr-defined]
+    finally:
+        page.context.close()
+
+
+def test_ios_experiment_sound_helpers(browser: Any, server: LiveServer) -> None:
+    """テスト音（メロディと WAV）の作り方。"""
+    page = _page(browser, DESKTOP)
+    try:
+        page.goto(server.base_url + "/#/diag")
+        page.wait_for_selector("#diag-ios")
+        info = page.evaluate(
+            """async () => {
+                const m = await import('/js/iosexp.js');
+                const mel = m.makeMelody(8000);
+                const blob = m.encodeWav(mel, 8000);
+                const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+                let peak = 0;
+                for (const v of mel) peak = Math.max(peak, Math.abs(v));
+                return { len: mel.length, size: blob.size, type: blob.type, peak,
+                         riff: String.fromCharCode(...head.slice(0, 4)),
+                         wave: String.fromCharCode(...head.slice(8, 12)) };
+            }"""
+        )
+        assert info["len"] == 8 * 8000  # 8 秒
+        assert info["size"] == 44 + info["len"] * 2
+        assert info["type"] == "audio/wav" and info["riff"] == "RIFF" and info["wave"] == "WAVE"
+        assert 0.1 < info["peak"] <= 1.0  # 聞こえる大きさで、割れない
+    finally:
+        page.context.close()
