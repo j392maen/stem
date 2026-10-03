@@ -86,17 +86,12 @@ iPhone 向けの再生（T06b）の作り方を決めるために、iPhone の�
 
 結果はサーバーに自動で保存されるので、ここには「やった」とだけ書けば足ります。
 
-### 3 の手順で止まった件（2026-10-03）
-原因: スクリプト `tailscale-serve.ps1` が、PowerShell の文字コード（cp932）のせいで Tailscale の表示名（日本語）を読み違えていました。スクリプトの不具合なので直します（T17）。
-**直るまでの代わりの手順（3 の代わりに実行）:** PowerShell で次の1行を実行してください。公開範囲はスクリプトと同じで、自分の Tailscale の機器だけです（Funnel ＝インターネット公開は使いません）。
+### 3 の手順で止まった件（2026-10-03）→ 直しました
+原因: スクリプト `tailscale-serve.ps1` が、PowerShell の文字コード（cp932）のせいで Tailscale の表示名（日本語）を読み違えていました。T17 で直したので、**上の手順 3 のスクリプトがそのまま使えます**（直す前の版で同じ失敗を再現し、直した後に通ることを確認済み）。
+もしまた失敗したら、スクリプトの代わりに次の1行でも同じことができます（公開範囲は自分の Tailscale の機器だけ）。
 ```
-& "C:\Program Files\Tailscale\tailscale.exe" serve --bg --https=443 http://127.0.0.1:8000
+& "C:\Program Files\Tailscale	ailscale.exe" serve --bg --https=443 http://127.0.0.1:8000
 ```
-公開をやめるとき（8 の代わり）:
-```
-& "C:\Program Files\Tailscale\tailscale.exe" serve --https=443 off
-```
-そのあと 4 以降を続けてください。
 
 ### 結果・感想
 - 3ができなかった。以下が実行結果。
