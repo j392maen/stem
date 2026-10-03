@@ -116,6 +116,7 @@ class RefineMethod:
     architecture: str | None
     parent_code: str  # 子の STEM_TYPE の親
     child_codes: tuple[str, ...]  # 名前の付いた子（表示順）
+    experimental: bool = False  # 「実験」扱い（MODEL.is_experimental）
 
     @property
     def is_hpss(self) -> bool:
@@ -152,13 +153,17 @@ class TypeIndex:
 
 
 def load_methods(session: Session, types: TypeIndex | None = None) -> dict[str, RefineMethod]:
-    """詳細分割の方法（MODEL.filename → 方法）。子の STEM_TYPE から組み立てる。"""
+    """詳細分割の方法（MODEL.filename → 方法）。子の STEM_TYPE から組み立てる。
+
+    並び（dict の順）は画面の一覧の順で、同じ stem に使える方法のうち先頭が既定。
+    MODEL.refine_order の小さい順（NULL は後ろ）、同じなら子の STEM_TYPE の表示順。
+    """
     types = types or TypeIndex.load(session)
     groups: dict[int, list[StemType]] = {}
     for t in types.by_code.values():
         if t.refine_model_id is not None:
             groups.setdefault(t.refine_model_id, []).append(t)
-    out: dict[str, RefineMethod] = {}
+    found: list[tuple[tuple[int, int, int], RefineMethod]] = []
     for model_id, kids in groups.items():
         model = session.get(Model, model_id)
         parents = {k.parent_id for k in kids}
@@ -167,15 +172,19 @@ def load_methods(session: Session, types: TypeIndex | None = None) -> dict[str, 
             continue
         parent = types.by_id[next(iter(parents))]  # type: ignore[index]
         kids.sort(key=lambda k: k.display_order)
-        out[model.filename] = RefineMethod(
+        order = model.refine_order
+        key = (0 if order is not None else 1, order or 0, kids[0].display_order)
+        found.append((key, RefineMethod(
             model_id=model.model_id,
             filename=model.filename,
             display_name=model.display_name,
             architecture=model.architecture,
             parent_code=parent.code,
             child_codes=tuple(k.code for k in kids),
-        )
-    return out
+            experimental=bool(model.is_experimental),
+        )))
+    found.sort(key=lambda kv: kv[0])
+    return {m.filename: m for _, m in found}
 
 
 def method_applies(method: RefineMethod, stem_code: str, types: TypeIndex) -> bool:
@@ -808,6 +817,7 @@ def refine_payload(method: RefineMethod, types: TypeIndex, stem_code: str) -> di
         "model": method.filename,
         "display_name": method.display_name,
         "gpu": method.uses_gpu,
+        "experimental": method.experimental,
         "children": [
             {"code": c, "display_name": types.by_code[c].display_name}
             for c in output_codes(method, stem_code)

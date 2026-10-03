@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
 from stemapp import seed as seed_mod
+from stemapp.db import init_db, make_engine, make_session_factory
 from stemapp.models import (
     ListenPreset,
     ListenPresetItem,
@@ -16,7 +18,8 @@ from stemapp.models import (
     StemGroupMember,
     StemType,
 )
-from stemapp.seed import BASE_STEM_CODES, seed
+from stemapp.seed import BASE_STEM_CODES, HPSS, MEGA53, seed
+from stemapp.separation.refine import load_methods
 
 
 def _snapshot(session: Session) -> dict[str, list[Any]]:
@@ -361,3 +364,31 @@ def test_seed_updates_colors_of_existing_db(session: Session) -> None:
     want_group = next(g.color for g in seed_mod.GROUPS if g.code == "rhythm")
     assert session.get(StemType, drums.stem_type_id).color == want_type  # type: ignore[union-attr]
     assert session.get(StemGroup, rhythm.group_id).color == want_group  # type: ignore[union-attr]
+
+
+def test_old_db_gets_refine_method_order(tmp_path: Path) -> None:
+    """T17: 列の無い古い DB（HPSS が先頭だった頃）も、移行と seed で Mega 53 が先頭・既定になる。"""
+    engine = make_engine(tmp_path / "old.db")
+    try:
+        init_db(engine)
+        with make_session_factory(engine)() as s:
+            seed(s)
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE model DROP COLUMN refine_order")
+            conn.exec_driver_sql("ALTER TABLE model DROP COLUMN is_experimental")
+            conn.exec_driver_sql(
+                "UPDATE model SET display_name = 'Mega 53（楽器別・実験）' "
+                f"WHERE filename = '{MEGA53}'"
+            )
+        assert "refine_order" not in {c["name"] for c in inspect(engine).get_columns("model")}
+
+        init_db(engine)
+        with make_session_factory(engine)() as s:
+            seed(s)
+            methods = load_methods(s)
+            other = [m for m in methods.values() if m.parent_code == "other"]
+            assert [m.filename for m in other] == [MEGA53, HPSS]
+            assert [m.experimental for m in other] == [False, True]
+            assert other[0].display_name == "Mega 53（楽器別）"
+    finally:
+        engine.dispose()
