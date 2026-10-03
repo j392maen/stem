@@ -216,14 +216,17 @@ export class RefineUI {
     document.addEventListener("keydown", this.onKey, true);
     const options = methods.map((m) => {
       const names = m.children.map((c) => c.display_name);
+      // 並び順は API のまま（先頭が既定。実験の方法は後ろに来る）
       return el("button", {
-        class: "refine-option", type: "button", disabled: !m.available, dataset: { model: m.model },
+        class: `refine-option${m.experimental ? " experimental" : ""}`, type: "button",
+        disabled: !m.available, dataset: { model: m.model },
         onclick: () => this.start(s, m),
       },
       el("span", { class: "refine-option-name", text: names.join("・") }),
       el("span", { class: "refine-option-sub" },
         el("span", { text: m.display_name }),
-        el("span", { class: "refine-tag", text: m.gpu ? "GPU" : "CPU" })),
+        el("span", { class: "refine-tag", text: m.gpu ? "GPU" : "CPU" }),
+        m.experimental ? el("span", { class: "refine-tag exp", text: "実験" }) : null),
       m.available ? null : el("span", { class: "refine-option-why", text: m.reason || "今は分けられません。" }));
     });
     const modal = el("div", { class: "modal refine-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "refine-title" },

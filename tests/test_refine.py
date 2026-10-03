@@ -28,6 +28,7 @@ from stemapp.library import resolve_data_path
 from stemapp.models import (
     ListenPreset,
     ListenPresetItem,
+    Model,
     SeparationJob,
     Stem,
     StemRendition,
@@ -572,7 +573,11 @@ def test_api_refine_flow(client: TestClient, api_job: tuple[int, int]) -> None:
     # 分けられる stem と方法
     assert [m["model"] for m in stems["drums"]["refine_methods"]] == [DRUMSEP]
     assert {m["model"] for m in stems["lead_vocal"]["refine_methods"]} == {MALE_FEMALE, ASPIRATION}
-    assert {m["model"] for m in stems["other"]["refine_methods"]} == {HPSS, MEGA53}
+    # 「その他」は Mega 53 が先頭（既定）、HPSS は実験で末尾（T17）
+    other_methods = stems["other"]["refine_methods"]
+    assert [m["model"] for m in other_methods] == [MEGA53, HPSS]
+    assert [m["experimental"] for m in other_methods] == [False, True]
+    assert [m["model"] for m in stems["lead_vocal"]["refine_methods"]] == [MALE_FEMALE, ASPIRATION]
     assert stems["vocals"]["refine_methods"] == [] and stems["bass"]["refine_methods"] == []
     drum_method = stems["drums"]["refine_methods"][0]
     assert drum_method["available"] is True and drum_method["gpu"] is True
@@ -689,3 +694,22 @@ def test_exports_use_refined_children(client: TestClient, api_job: tuple[int, in
         everything = plan_export(s, job_id, ExportRequest("all", "wav"))
         codes = {i.stem.code for i in everything.items}
         assert "kick" in codes and "drums" not in codes
+
+
+def test_method_order_and_experimental_come_from_model_rows(seeded: Session) -> None:
+    """T17: 方法の並びと「実験」は MODEL の行（seed）で決まる。コードには書かない。"""
+    methods = load_methods(seeded)
+    other = [m.filename for m in methods.values() if m.parent_code == "other"]
+    assert other == [MEGA53, HPSS]
+    assert methods[HPSS].experimental and not methods[MEGA53].experimental
+    assert not any(methods[m].experimental for m in (DRUMSEP, MALE_FEMALE, ASPIRATION))
+    vocals = [m.filename for m in methods.values() if m.parent_code == "vocals"]
+    assert vocals == [MALE_FEMALE, ASPIRATION]
+    # 行の値を変えれば並びが変わる（NULL は後ろ）
+    hpss = seeded.scalar(select(Model).where(Model.filename == HPSS))
+    mega = seeded.scalar(select(Model).where(Model.filename == MEGA53))
+    assert hpss is not None and mega is not None
+    hpss.refine_order, mega.refine_order = 1, None
+    seeded.flush()
+    other = [m.filename for m in load_methods(seeded).values() if m.parent_code == "other"]
+    assert other == [HPSS, MEGA53]

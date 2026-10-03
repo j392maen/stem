@@ -90,6 +90,9 @@
   font-size: 10px; letter-spacing: 0.08em; padding: 0 5px; border-radius: 3px;
   border: 1px solid var(--line); color: var(--muted);
 }
+/* 実験の方法（結果が使えないことが多い）は控えめに出す */
+.refine-tag.exp { border-style: dashed; }
+.refine-option.experimental:not([disabled]) .refine-option-name { color: var(--muted); }
 .refine-option-why { font-size: 11px; color: #ff8a95; }
 
 @media (max-width: 600px) {
