@@ -3,6 +3,8 @@
 個人用の楽曲 stem 分割・再生アプリ。楽曲を stem（ボーカル・ドラム・ベースなどのパート）に分け、
 組み合わせを切り替えながら聴く。仕様は `docs/SPEC.md`、データモデルは `docs/ER.md`。
 
+**開発側からの確認のお願い（聴き比べ・iPhone の診断など）は [docs/USER_CHECKLIST.md](docs/USER_CHECKLIST.md) にまとめています。**
+
 ## 動作環境
 
 - Windows 11（NVIDIA GPU 推奨。無くても CPU で動く）
