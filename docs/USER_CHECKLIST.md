@@ -15,7 +15,7 @@
 
 ---
 
-## 1. 分け方の聴き比べ（曲「イガク - 重音テト」）　【未】
+## 1. 分け方の聴き比べ（曲「イガク - 重音テト」）　【済】
 
 同じ曲を 7 通りの分け方で分割してあります。どれが良いかを聴いて決めてください。選ばれたものを「標準」にします。
 
@@ -43,12 +43,13 @@
 各フォルダの中の `lead_vocal.flac`（メイン）、`backing_vocal.flac`（サブ）、`other.flac`（その他）などを聴き比べてください。
 
 ### 結果・感想
-- 一番良かった分け方:
-- 気になった点:
+- 一番良かった分け方:　4,8 が良かった。他はインストが残ってた。
+- 監督役の受け取り（2026-10-03）: 「4」「8」はアプリの分け方の欄の #4（標準 `standard`）と #8（カラオケ2種 `exp_kara_anvuew`）と解釈。メインとサブの分け方が一番正確な **標準（#4）をそのまま既定にする**。#8 は楽器の残りは少ないがボーカルがほぼ全部サブに入るので採用しない。解釈が違えば教えてください。
+- 気になった点:メインとサブは4が一番間違えていなかったけど、最後の方と途中はメインが全部サブに入ってることがあった。まあこれは私が手元で編集するかたちで許容してもいいかな。8はほぼ全てがサブに入っていた。
 
 ---
 
-## 2. 詳細分割（「もっと分ける」）を聴く　【未】
+## 2. 詳細分割（「もっと分ける」）を聴く　【済】
 
 1. 好きな曲をプレイヤーで開く。
 2. stem ボタンの右下にある小さな「分ける」アイコンを押し、方法を選ぶ。
@@ -61,7 +62,8 @@
 聴いてほしい点: パッドとオーケストラヒットがどこに入るか、「残り」に何が入っているか、キック・スネアの分かれ方。
 
 ### 結果・感想
--
+-　キックスネアは割といい。その他の分割Mega 53では、オケヒは残り（その他）に入った。パッドはシンセに入った。持続音で分ける手法では短い音の方にはノイズのようなものだけが残った。あまり使えないかも。
+- 監督役の対応（2026-10-03）: 「その他」を分ける方法は Mega 53 を既定・先頭にし、HPSS（持続音／短い音）は「実験」として目立たない位置に下げる（T17）。
 
 ---
 
@@ -84,8 +86,214 @@ iPhone 向けの再生（T06b）の作り方を決めるために、iPhone の�
 
 結果はサーバーに自動で保存されるので、ここには「やった」とだけ書けば足ります。
 
+### 3 の手順で止まった件（2026-10-03）
+原因: スクリプト `tailscale-serve.ps1` が、PowerShell の文字コード（cp932）のせいで Tailscale の表示名（日本語）を読み違えていました。スクリプトの不具合なので直します（T17）。
+**直るまでの代わりの手順（3 の代わりに実行）:** PowerShell で次の1行を実行してください。公開範囲はスクリプトと同じで、自分の Tailscale の機器だけです（Funnel ＝インターネット公開は使いません）。
+```
+& "C:\Program Files\Tailscale\tailscale.exe" serve --bg --https=443 http://127.0.0.1:8000
+```
+公開をやめるとき（8 の代わり）:
+```
+& "C:\Program Files\Tailscale\tailscale.exe" serve --https=443 off
+```
+そのあと 4 以降を続けてください。
+
 ### 結果・感想
--
+- 3ができなかった。以下が実行結果。
+PS C:\Users\maeba> cd C:\mine\stem; .\scripts\tailscale-serve.ps1 start
+[NG]   ':' または '}' ではなく無効なオブジェクトが渡されました。 (5556): {
+  "Version": "1.102.4-t3caf7d9e7-g084ee3b64",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": [
+    "100.100.95.89",
+    "fd7a:115c:a1e0::a028:5f5a"
+  ],
+  "Self": {
+    "ID": "njJAcjmaw521CNTRL",
+    "NodeID": 8060427840269600,
+    "PublicKey": "nodekey:738bedf4b59c925d967821d958246eb3e2480b1feaf09b6a6d26f443a0a45f59",
+    "HostName": "unagi",
+    "DNSName": "unagi.tail8b25a2.ts.net.",
+    "OS": "windows",
+    "UserID": 7475193010315373,
+    "TailscaleIPs": [
+      "100.100.95.89",
+      "fd7a:115c:a1e0::a028:5f5a"
+    ],
+    "AllowedIPs": [
+      "100.100.95.89/32",
+      "fd7a:115c:a1e0::a028:5f5a/128"
+    ],
+    "Addrs": [
+      "123.226.19.113:41641",
+      "123.226.19.113:11043",
+      "172.16.30.208:41641"
+    ],
+    "CurAddr": "",
+    "Relay": "tok",
+    "PeerRelay": "",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "2026-09-25T00:18:00.031552001Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "Active": false,
+    "PeerAPIURL": [
+      "http://100.100.95.89:37413",
+      "http://[fd7a:115c:a1e0::a028:5f5a]:46907"
+    ],
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "Capabilities": [
+      "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+      "default-auto-update",
+      "https",
+      "https://tailscale.com/cap/file-sharing",
+      "https://tailscale.com/cap/is-admin",
+      "https://tailscale.com/cap/is-owner",
+      "https://tailscale.com/cap/ssh",
+      "https://tailscale.com/cap/tailnet-lock",
+      "probe-udp-lifetime",
+      "ssh-behavior-v1",
+      "ssh-env-vars",
+      "store-appc-routes",
+      "tailnet-display-name"
+    ],
+    "CapMap": {
+      "default-auto-update": [
+        true
+      ],
+      "https": null,
+      "https://tailscale.com/cap/file-sharing": null,
+      "https://tailscale.com/cap/is-admin": null,
+      "https://tailscale.com/cap/is-owner": null,
+      "https://tailscale.com/cap/ssh": null,
+      "https://tailscale.com/cap/tailnet-lock": null,
+      "probe-udp-lifetime": null,
+      "ssh-behavior-v1": null,
+      "ssh-env-vars": null,
+      "store-appc-routes": null,
+      "tailnet-display-name": [
+        "maebashoten.jp@gmail.com"
+      ]
+    },
+    "InNetworkMap": true,
+    "InMagicSock": false,
+    "InEngine": false
+  },
+  "Health": [],
+  "MagicDNSSuffix": "tail8b25a2.ts.net",
+  "CurrentTailnet": {
+    "Name": "maebashoten.jp@gmail.com",
+    "MagicDNSSuffix": "tail8b25a2.ts.net",
+    "MagicDNSEnabled": true
+  },
+  "CertDomains": [
+    "unagi.tail8b25a2.ts.net"
+  ],
+  "ExtraRecords": null,
+  "Peer": {
+    "nodekey:af8d461ac5509559950932cd9058d990185ab8526a5374fc7da443f616ce8d4c": {
+      "ID": "nsLdsemMmK11CNTRL",
+      "NodeID": 2403077456433456,
+      "PublicKey": "nodekey:af8d461ac5509559950932cd9058d990185ab8526a5374fc7da443f616ce8d4c",
+      "HostName": "localhost",
+      "DNSName": "ipad157.tail8b25a2.ts.net.",
+      "OS": "iOS",
+      "UserID": 7475193010315373,
+      "TailscaleIPs": [
+        "100.78.141.76",
+        "fd7a:115c:a1e0::1628:8d4d"
+      ],
+      "AllowedIPs": [
+        "100.78.141.76/32",
+        "fd7a:115c:a1e0::1628:8d4d/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "tok",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-09-29T04:07:50.42535893Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.78.141.76:37477",
+        "http://[fd7a:115c:a1e0::1628:8d4d]:38241"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2027-03-28T04:07:50Z"
+    },
+    "nodekey:f9387c3490a870bceca7aae077c36ec3f3a22605e412e2bd655c89f983b81b31": {
+      "ID": "nc8sekGy8C21CNTRL",
+      "NodeID": 8853950713847065,
+      "PublicKey": "nodekey:f9387c3490a870bceca7aae077c36ec3f3a22605e412e2bd655c89f983b81b31",
+      "HostName": "localhost",
+      "DNSName": "iphone-13.tail8b25a2.ts.net.",
+      "OS": "iOS",
+      "UserID": 7475193010315373,
+      "TailscaleIPs": [
+        "100.120.27.49",
+        "fd7a:115c:a1e0::8328:1b32"
+      ],
+      "AllowedIPs": [
+        "100.120.27.49/32",
+        "fd7a:115c:a1e0::8328:1b32/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "172.16.31.147:41641",
+      "Relay": "tok",
+      "PeerRelay": "",
+      "RxBytes": 1012,
+      "TxBytes": 180,
+      "Created": "2026-09-25T00:20:33.983513221Z",
+      "LastWrite": "2026-10-03T11:19:28.1204059+09:00",
+      "LastSeen": "2026-10-03T01:40:00.1Z",
+      "LastHandshake": "2026-10-03T11:19:07.1754464+09:00",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.120.27.49:43866",
+        "http://[fd7a:115c:a1e0::8328:1b32]:54352"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2027-03-24T00:20:33Z"
+    }
+  },
+  "User": {
+    "7475193010315373": {
+      "ID": 7475193010315373,
+      "LoginName": "maebashoten.jp@gmail.com",
+      "DisplayName": "蜑肴ｭｯ蝠・ｺ・,
+      "ProfilePicURL": "https://lh3.googleusercontent.com/a/ACg8ocLhpnCrju2Ic9hLWlh-SWgFOjKJodzqAz7UIdMlBp1Zb4-Pjvc=s96-c"
+    }
+  },
+  "ClientVersion": null
+}
+PS C:\mine\stem>
 
 ---
 
