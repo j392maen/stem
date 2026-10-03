@@ -747,9 +747,33 @@ def migrate_folders_cmd(
         raise typer.Exit(1)
 
 
+def make_stream_safe(stream: object) -> None:
+    """表せない文字で落ちないよう、出力先の errors を "replace" にする。
+
+    文字コードはそのまま（cp932 のコンソールやパイプでは日本語はそのまま出る）。
+    cp932 で表せない文字（⧸ や絵文字など）だけが「?」になる。
+    UTF-8 の出力先（Windows Terminal など）は何も変わらない。
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    if reconfigure is None or encoding == "utf8":
+        return
+    try:
+        reconfigure(errors="replace")
+    except (ValueError, OSError):  # 閉じている・差し替えられている出力先は触らない
+        pass
+
+
+def configure_stdio() -> None:
+    """CLI の起動時に標準出力・標準エラーを落ちない設定にする（T16）。"""
+    make_stream_safe(sys.stdout)
+    make_stream_safe(sys.stderr)
+
+
 def main() -> None:
     from stemapp.db import DbMigrationError
 
+    configure_stdio()
     try:
         app()
     except DbMigrationError as e:
