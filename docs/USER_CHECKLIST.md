@@ -90,7 +90,7 @@ iPhone 向けの再生（T06b）の作り方を決めるために、iPhone の�
 原因: スクリプト `tailscale-serve.ps1` が、PowerShell の文字コード（cp932）のせいで Tailscale の表示名（日本語）を読み違えていました。T17 で直したので、**上の手順 3 のスクリプトがそのまま使えます**（直す前の版で同じ失敗を再現し、直した後に通ることを確認済み）。
 もしまた失敗したら、スクリプトの代わりに次の1行でも同じことができます（公開範囲は自分の Tailscale の機器だけ）。
 ```
-& "C:\Program Files\Tailscale	ailscale.exe" serve --bg --https=443 http://127.0.0.1:8000
+& "C:\Program Files\Tailscale\tailscale.exe" serve --bg --https=443 http://127.0.0.1:8000
 ```
 
 ### 結果・感想
