@@ -64,4 +64,4 @@
 - 仕上げ（T07b レビューより）: Mega 53 の重みの自動ダウンロードでサイズ（1,368,919,887 B）かハッシュを確かめる。初回ダウンロード中は stage を「モデルをダウンロード中」にする。msst/__init__.py に lucidrains（BS-RoFormer、MIT）由来の一言。runner でサンプルレートの assert。使う stem だけの state_dict で組み立てて読み込みを速く（GPU テストで 72 秒）。STEM_TYPE は refine_model を1つしか持てないので strings/brass/woodwind/synth/percussion は Mega 53 専用の子になる（設計上の制約）。
 | T15 | 仕上げ2（Mega 53 の重みの検証と読み込みの高速化、不安定なテスト） | 完了（2026-10-03） |
 - 任意（T15 レビューより）: diag の端末名が「-数字」で終わると連番と読み違える（同時刻の重複時の並びだけ）。Mega 53 のダウンロードで http.client.HTTPException も日本語メッセージに包む。
-| T16 | CLI が cp932 で表示できない文字（⧸ 等）で落ちる不具合 | 実装中 |
+| T16 | CLI が cp932 で表示できない文字（⧸ 等）で落ちる不具合 | 完了（2026-10-03） |
