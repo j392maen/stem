@@ -22,6 +22,26 @@
 .diag-lock .row { margin: 6px 0; }
 .diag-lock-list { margin: 10px 0 0; padding-left: 1.2em; line-height: 1.7; color: var(--muted); }
 
+/* iPhone 再生の実験（T06b-0） */
+.ios-exp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+.ios-exp {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px;
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--accent-deep);
+  border-radius: var(--radius);
+}
+.ios-exp p { margin: 0; flex: 1; }
+.ios-exp .btn { align-self: flex-start; }
+.ios-exp-title { font-weight: 700; overflow-wrap: anywhere; }
+.ios-exp-running {
+  display: grid; gap: 10px; padding: 12px;
+  background: var(--accent-soft); border: 1px solid var(--accent-deep); border-radius: var(--radius);
+}
+.ios-exp-running .ios-exp-title { color: var(--accent); }
+.ios-exp-running p { margin: 0; }
+.ios-exp-q { display: grid; gap: 4px; }
+.ios-exp-q .row { flex-wrap: wrap; gap: 6px; }
+.ios-exp-qlabel { font-size: 12px; color: var(--muted); }
+
 @media (max-width: 640px) {
   .diag-table th { width: 44%; }
   .diag-table th, .diag-table td { padding: 6px 4px; }

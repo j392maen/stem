@@ -3,6 +3,7 @@
 
 import { api, fetchBinary } from "./api.js";
 import { el, toast } from "./ui.js";
+import { IosExperiments } from "./iosexp.js";
 
 const DIAG_VERSION = 1;
 const DEVICE_KEY = "stemapp.diagDevice";
@@ -235,6 +236,7 @@ export class DiagView {
     this.status = el("p", { class: "muted", id: "diag-status", text: "ボタンを押すと調べて、結果をサーバーに保存します。" });
     this.output = el("div", { class: "diag-output", id: "diag-output" });
     this.lockBox = el("div", { class: "diag-lock", id: "diag-lock" });
+    this.iosBox = el("div", { class: "ios-exp-box", id: "diag-ios" });
 
     this.root.replaceChildren(el("div", { class: "diag" },
       section("端末の診断",
@@ -243,10 +245,15 @@ export class DiagView {
           el("label", { class: "muted", for: "diag-device", text: "端末の名前" }), this.deviceInput, this.runBtn),
         this.status),
       this.output,
+      section("iPhone 再生の実験（消音モード・ロック中）", this.iosBox),
       section("画面ロック中の再生（任意）", this.lockBox),
       el("p", { class: "library-foot" }, el("a", { href: "#/library", text: "ライブラリへ戻る" })),
     ));
     this.renderLock();
+    this.ios = new IosExperiments(this.iosBox, {
+      onRecord: (entry) => this.addExperiment(entry),
+      history: () => (this.result && this.result.ios_experiments) || [],
+    });
     document.addEventListener("visibilitychange", this.onVisibility);
   }
 
@@ -254,6 +261,7 @@ export class DiagView {
     this.alive = false;
     document.removeEventListener("visibilitychange", this.onVisibility);
     this.stopLock();
+    if (this.ios) this.ios.destroy();
     if (this.ctx) this.ctx.close().catch(() => {});
     this.ctx = null;
   }
@@ -294,6 +302,7 @@ export class DiagView {
     }
     if (!this.alive) return;
     result.lock_tests = this.result ? this.result.lock_tests : [];
+    result.ios_experiments = (this.result && this.result.ios_experiments) || [];
     this.result = result;
     this.renderResult();
     await this.send();
@@ -508,14 +517,28 @@ export class DiagView {
       events: lock.events,
     };
     this.stopLock();
+    this.ensureResult().lock_tests.push(entry);
+    this.renderLock();
+    await this.send();
+  }
+
+  /** 診断をまだしていなくても、試験の記録だけを送れるようにする。 */
+  ensureResult() {
     if (!this.result) {
       this.result = {
         diag_version: DIAG_VERSION, device: this.deviceName(),
-        collected_at: new Date().toISOString(), ...collectBasics(), lock_only: true, lock_tests: [],
+        collected_at: new Date().toISOString(), ...collectBasics(), lock_only: true,
       };
     }
-    this.result.lock_tests.push(entry);
-    this.renderLock();
+    if (!this.result.lock_tests) this.result.lock_tests = [];
+    if (!this.result.ios_experiments) this.result.ios_experiments = [];
+    return this.result;
+  }
+
+  /** iPhone 再生の実験の記録 1 件を足して送る（lock_tests と同じく、結果全体を送り直す）。 */
+  async addExperiment(entry) {
+    if (!this.alive) return;
+    this.ensureResult().ios_experiments.push(entry);
     await this.send();
   }
 }
