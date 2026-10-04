@@ -78,13 +78,18 @@ class InputSource(Base):
 
 
 class Device(Base):
+    """再生する端末（ブラウザ）。端末ごとの ID（device_key）はブラウザの localStorage に持つ（T06b）。"""
+
     __tablename__ = "device"
+    __table_args__ = (Index("ux_device_key", "device_key", unique=True),)
 
     device_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     kind: Mapped[str] = mapped_column(String(10), default="other")  # pc/iphone/ipad/other
     push_subscription_json: Mapped[Any | None] = mapped_column(JSON)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # ブラウザが作るランダムな ID（localStorage）。T06b より前の行は NULL
+    device_key: Mapped[str | None] = mapped_column(String(64))
 
 
 # --- 分離の設定 ---------------------------------------------------------------
@@ -331,11 +336,19 @@ class PlaybackState(Base):
     listen_preset_id: Mapped[int | None] = mapped_column(
         ForeignKey("listen_preset.listen_preset_id", ondelete="SET NULL")
     )
+    # stem（code）ごとの音量 dB（組み合わせプリセットの gain_db。0 dB のものは入れない）
     channel_gains_json: Mapped[Any | None] = mapped_column(JSON)
     position_sec: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+    # 以下 T06b: 分け方（ジョブ）、選択中の葉 stem の code の配列、速度の倍率と方式
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("separation_job.job_id", ondelete="SET NULL")
+    )
+    selected_json: Mapped[Any | None] = mapped_column(JSON)
+    tempo_ratio: Mapped[float | None] = mapped_column(Float)
+    tempo_mode: Mapped[str | None] = mapped_column(String(10))  # pitch / instant / keep
 
 
 class CuePoint(Base):
