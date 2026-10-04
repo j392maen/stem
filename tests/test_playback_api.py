@@ -142,8 +142,9 @@ def test_playback_validation(client: TestClient, track: tuple[int, int], tmp_pat
     # 無い組み合わせは覚えない（エラーにしない）
     res = client.put(url, json={"position_sec": 1, "listen_preset_id": 99999})
     assert res.status_code == 200 and res.json()["listen_preset_id"] is None
-    assert client.put(f"/api/tracks/{track_id}/playback/999", json={"position_sec": 0}).status_code == 404
-    assert client.put(f"/api/tracks/999/playback/{pc['device_id']}", json={"position_sec": 0}).status_code == 404
+    zero = {"position_sec": 0}
+    assert client.put(f"/api/tracks/{track_id}/playback/999", json=zero).status_code == 404
+    assert client.put(f"/api/tracks/999/playback/{pc['device_id']}", json=zero).status_code == 404
     assert client.get("/api/tracks/999/playback").status_code == 404
 
 

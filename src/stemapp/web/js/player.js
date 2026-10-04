@@ -1,15 +1,24 @@
 // プレイヤー画面: 波形、再生・シーク、stem の ON/OFF、グループ、組み合わせプリセット、キュー・ループ、
 // 拍・小節線と再生位置の BPM、拍の補正（T10c）、小節単位のループ、キューの拍へのスナップ、
-// 速度の変更（T11。ピッチも変わる方式・ピッチを保つ方式）。
+// 速度の変更（T11。ピッチも変わる方式・ピッチを保つ方式）、
+// iPhone 向けの再生（T06b。音声セッション、ロック画面の表示と操作、選択中の stem だけ読み込む、
+// 続きから再生）。
 
 import { api, fetchBinary } from "./api.js";
+import {
+  AudioRoute, ROUTE_SHORT, loadRouteChoice, routeForThisDevice, saveRouteChoice,
+} from "./audioroute.js";
 import { BeatEditPanel } from "./beatedit.js";
 import { BeatGrid, barLoop, formatBpm } from "./beats.js";
+import { renameDevice } from "./device.js";
 import { Engine, clampTime } from "./engine.js";
 import { Exporter } from "./export.js";
+import { MediaSessionControl } from "./mediasession.js";
 import { parsePeaks } from "./peaks.js";
 import { RefineUI } from "./refine.js";
+import { PlaybackSync, describeOther, restoreFromState } from "./resume.js";
 import * as S from "./selection.js";
+import { formatMB, loadLazySetting, pickEvictions, saveLazySetting } from "./stemload.js";
 import { COARSE_STEP, FINE_STEP, TempoPanel } from "./tempo.js";
 import { confirmDialog, el, formatTime, icon, ICONS, promptDialog, toast } from "./ui.js";
 import { WaveformView, ZOOM_STEPS } from "./waveform.js";
@@ -17,6 +26,7 @@ import { WaveformView, ZOOM_STEPS } from "./waveform.js";
 const SEEK_STEP_SEC = 5;
 const LOAD_CONCURRENCY = 3;
 const POSTPROCESS_POLL_MS = 1500;
+const HOUSEKEEP_MS = 5000; // 使わない stem の音声を捨てる確認の間隔（スマホ）
 const VOLUME_KEY = "stemapp.volume";
 // 曲ごとに最後に選んだ分け方（ジョブ）。無い・消えたときは新しい完了済みジョブ
 const JOB_KEY_PREFIX = "stemapp.job.";
@@ -105,6 +115,19 @@ export class PlayerView {
     this.loopBars = 4; // B キーで作る小節ループの長さ（最後に選んだもの）
     this.snap = loadSnap();
     this.onKey = (e) => this.handleKey(e);
+    // --- T06b: iPhone 向けの再生 ---
+    this.lazy = loadLazySetting(); // 選択中の stem だけ読み込む（スマホの既定）
+    this.stemLoads = new Map(); // 読み込み中の stem: code → { key, abort }
+    this.stemFailed = new Set(); // 読み込めなかった「組:code」（押し直すまで読み直さない）
+    this.offSince = new Map(); // OFF にした時刻（ms）: code → 時刻
+    this.route = null; // 音の出し方（AudioRoute）
+    this.media = null; // ロック画面の表示と操作（MediaSessionControl）
+    this.sync = null; // 続きから再生の保存（PlaybackSync）
+    this.device = null; // この端末（DEVICE）
+    this.otherState = null; // ほかの端末で最後に聴いていた状態
+    this.resumed = false; // 開いたときの「続きから」を済ませた（読み直しでは使わない）
+    this.resumeTempo = null; // 続きから戻す速度と方式（TempoPanel が使う）
+    this.memKey = "";
   }
 
   later(fn, ms) {
@@ -119,17 +142,34 @@ export class PlayerView {
     const signal = this.abort.signal;
     const live = () => this.alive && !signal.aborted;
     this.root.replaceChildren(el("p", { class: "empty", text: "読み込み中…" }));
+    // 端末の登録と、この曲の再生の状態（続きから再生）。失敗しても再生はできる
+    this.sync = new PlaybackSync(this);
+    const syncLoad = this.sync.load();
     try {
       this.track = await api(`/api/tracks/${this.trackId}`);
     } catch (e) {
       if (live()) this.showMessage(e.status === 404 ? "曲が見つかりません。" : e.message);
       return;
     }
+    const { device, mine, other } = await syncLoad;
     if (!live()) return;
+    this.device = device;
+    this.otherState = other;
+    // 開いたときだけ、自分の端末の状態に戻す（分け方の切り替えなどの読み直しでは、今の状態を保つ）
+    let resumeJob = null;
+    if (!this.resumed) {
+      this.resumed = true;
+      if (mine && !this.restore) {
+        this.restore = restoreFromState(mine);
+        resumeJob = mine.job_id;
+        if (mine.tempo_ratio) this.resumeTempo = { ratio: mine.tempo_ratio, mode: mine.tempo_mode };
+      }
+    }
     this.doneJobs = (this.track.jobs || []).filter((j) => j.job_kind === "full" && j.status === "done");
     const isDone = (id) => this.doneJobs.some((j) => j.job_id === id);
     const saved = loadJobChoice(this.trackId);
-    const jobId = [this.jobId, saved].find((id) => id && isDone(id)) || this.track.playable_job_id;
+    const jobId = [this.jobId, resumeJob, saved].find((id) => id && isDone(id))
+      || this.track.playable_job_id;
     this.jobId = jobId;
     if (!jobId) {
       this.showMessage("この曲はまだ分割されていません。ライブラリで分割してください。");
@@ -166,6 +206,12 @@ export class PlayerView {
     }
     this.tree = S.buildTree(this.job.stems);
     this.sel = S.allOn(this.tree);
+    if (this.restore) {
+      // 戻す選択を先に決めておく（スマホでは選択中の stem だけ読み込むため）
+      const leaves = new Set(this.tree.leaves);
+      const sel = new Set([...this.restore.sel].filter((c) => leaves.has(c)));
+      if (sel.size) this.sel = sel;
+    }
     this.refine = new RefineUI(this); // 「もっと分ける」（web/js/refine.js）
     this.loading = true;
     this.render();
@@ -253,7 +299,9 @@ export class PlayerView {
     const cover = this.root.querySelector("#loading");
     const label = cover.querySelector(".label");
     const bar = cover.querySelector(".progress > span");
-    const total = leaves.length * 2;
+    // スマホ: 音声は選択中の stem だけ（波形は全部）
+    const wanted = this.lazy ? new Set(leaves.filter((s) => this.sel.has(s.code)).map((s) => s.code)) : null;
+    const total = leaves.length + (wanted ? wanted.size : leaves.length);
     let done = 0;
     const step = () => {
       done++;
@@ -268,6 +316,8 @@ export class PlayerView {
     mountSignal.addEventListener("abort", onLeave);
     try {
       this.engine = new Engine();
+      this.route = new AudioRoute(this.engine, routeForThisDevice(this.engine.ctx));
+      this.engine.setRoute(this.route);
       const signal = loading.signal;
       const loaded = await mapLimit(leaves, LOAD_CONCURRENCY, async (stem) => {
         const stream = stem.renditions.find((r) => r.purpose === "stream");
@@ -275,6 +325,7 @@ export class PlayerView {
         const peakBufs = await Promise.all(stem.peaks.map((p) => fetchBinary(p.url, signal)));
         stem.peaks.forEach((p, i) => peaks.set(p.samples_per_px, parsePeaks(peakBufs[i])));
         step();
+        if (wanted && !wanted.has(stem.code)) return { stem, buffer: null, peaks };
         const audio = await fetchBinary(stream.url, signal);
         if (signal.aborted) throw new DOMException("中断しました", "AbortError");
         const buffer = await this.engine.decode(audio);
@@ -290,6 +341,8 @@ export class PlayerView {
         this.engine.addTrack(code, item ? item.buffer : null, 0);
       }
       this.engine.duration = Math.max(this.engine.duration, 0);
+      // 読み込んでいない stem があるときは曲の長さを使う（どれも読み込んでいなくても位置が進む）
+      if (wanted) this.engine.duration = Math.max(this.engine.duration, this.track.duration_sec || 0);
       this.engine.onEnded = () => this.updateTransport();
       this.engine.setVolume(loadVolume());
       const first = loaded[0].peaks.values().next().value;
@@ -318,8 +371,13 @@ export class PlayerView {
       this.tempo.start(Object.fromEntries(loaded.map((x) => [
         x.stem.code, x.stem.renditions.find((r) => r.purpose === "stream").url,
       ])));
+      this.setupMediaSession();
+      this.renderPlayInfo();
       this.frame();
       await this.applyRestore();
+      this.ensureStemAudio();
+      if (this.sync) this.sync.start();
+      this.later(() => this.housekeeping(), HOUSEKEEP_MS);
     } catch (e) {
       if (!live()) return;
       if (e.name === "AbortError") return;
@@ -414,6 +472,7 @@ export class PlayerView {
     this.renderBarLoop();
     if (r.zoom && this.wave) this.wave.setZoom(r.zoom);
     this.engine.seek(clampTime(r.position, this.engine.duration));
+    if (r.fromServer && r.position >= 1) toast(`前回の続き（${formatTime(r.position)}）から再生します。`);
     if (r.playing) await this.engine.play();
     this.updateTransport();
   }
@@ -476,8 +535,15 @@ export class PlayerView {
   }
 
   unmount() {
+    // 続きから再生: 最後の状態を保存する（エンジンを閉じる前に）
+    if (this.sync) this.sync.dispose();
+    this.sync = null;
+    if (this.media) this.media.dispose();
+    this.media = null;
     this.alive = false;
     this.abort.abort();
+    this.stemLoads.clear();
+    this.offSince.clear();
     document.removeEventListener("keydown", this.onKey);
     cancelAnimationFrame(this.raf);
     if (this.beatEdit) this.beatEdit.dispose();
@@ -486,6 +552,7 @@ export class PlayerView {
     this.timers.clear();
     if (this.engine) this.engine.close();
     this.engine = null;
+    this.route = null;
     this.ready = false;
     this.loading = false;
     // 書き出しメニューは表示中のジョブに結びつくので、分け方の切り替え（remount）でも作り直す
@@ -505,6 +572,10 @@ export class PlayerView {
     const t = this.root.querySelector("#time-now");
     if (t) t.textContent = formatTime(pos, true);
     this.updateTempo(pos);
+    this.renderMemory();
+    if (this.media && this.engine.playing) {
+      this.media.setPosition(this.engine.duration, this.engine.position, this.engine.speed);
+    }
     this.raf = requestAnimationFrame(() => this.frame());
   }
 
@@ -631,8 +702,12 @@ export class PlayerView {
     if (!this.ready) return;
     // 省メモリの読み込み中に押した: 読み込みの後に勝手に鳴らさない（押した結果を優先する）
     if (this.tempo) this.tempo.resumeAfterLoad = false;
-    if (this.engine.playing) this.engine.pause();
-    else await this.engine.play();
+    if (this.engine.playing) {
+      this.engine.pause();
+      if (this.sync) this.sync.save();
+    } else {
+      await this.engine.play();
+    }
     this.updateTransport();
   }
 
@@ -649,6 +724,7 @@ export class PlayerView {
       this.updateTransport();
     }
     this.engine.seek(target);
+    if (this.media) this.media.setPosition(this.engine.duration, target, this.engine.speed, true);
   }
 
   updateTransport() {
@@ -664,6 +740,7 @@ export class PlayerView {
       loopBtn.classList.toggle("on", this.loopOn);
       loopBtn.setAttribute("aria-pressed", String(this.loopOn));
     }
+    this.updateMediaSession();
   }
 
   // --- 選択 -------------------------------------------------------------------
@@ -672,6 +749,8 @@ export class PlayerView {
     if (this.engine) {
       this.engine.setGains(S.targetGains(this.tree, this.sel, this.gainsDb), ramp);
     }
+    this.trackOffTimes();
+    this.ensureStemAudio();
     this.renderSelectionState();
   }
 
@@ -687,6 +766,10 @@ export class PlayerView {
     this.sel = sel;
     if (gainsDb) this.gainsDb = gainsDb;
     this.activePresetId = presetId;
+    // ON にし直した stem は、前に読み込めなかったものも読み直す
+    for (const k of [...this.stemFailed]) {
+      if (sel.has(k.slice(k.indexOf(":") + 1))) this.stemFailed.delete(k);
+    }
     this.applySelection();
     this.renderPresets();
   }
@@ -1118,7 +1201,8 @@ export class PlayerView {
       el("button", { class: "btn", type: "button", text: `−${SEEK_STEP_SEC}秒`, onclick: () => this.ready && this.seek(this.engine.position - SEEK_STEP_SEC) }),
       el("button", { class: "btn", type: "button", text: `+${SEEK_STEP_SEC}秒`, onclick: () => this.ready && this.seek(this.engine.position + SEEK_STEP_SEC) }),
       el("button", { class: "btn", id: "loop-btn", type: "button", text: "ループ", "aria-pressed": "false", onclick: () => this.toggleLoop() }),
-      el("label", { class: "volume" }, el("span", { class: "muted", text: "音量" }), volume));
+      el("label", { class: "volume" }, el("span", { class: "muted", text: "音量" }), volume),
+      this.playInfoEl());
 
     const stems = el("section", { class: "panel" },
       el("h2", { text: "STEM" }),
@@ -1233,6 +1317,10 @@ export class PlayerView {
 
   renderSelectionState() {
     for (const b of this.root.querySelectorAll(".stem-btn")) {
+      const loadingNow = S.leavesOf(this.tree, b.dataset.code).some((c) => this.stemLoads.has(c));
+      b.classList.toggle("loading", loadingNow);
+      if (loadingNow) b.setAttribute("aria-busy", "true");
+      else b.removeAttribute("aria-busy");
       const state = S.stateOf(this.tree, this.sel, b.dataset.code);
       b.classList.toggle("on", state === "on");
       b.classList.toggle("partial", state === "partial");
@@ -1255,6 +1343,7 @@ export class PlayerView {
   }
 
   renderPresets() {
+    this.updateMediaSession();
     const box = this.root.querySelector("#presets");
     if (!box) return;
     if (!this.presets.length) {
@@ -1305,5 +1394,241 @@ export class PlayerView {
         el("button", { class: "btn small icon", type: "button", title: "名前を変える", "aria-label": "名前を変える", onclick: () => this.renameCue(c) }, icon("edit")),
         el("button", { class: "btn small icon danger", type: "button", title: "削除", "aria-label": "削除", onclick: () => this.deleteCue(c) }, icon("close")));
     }));
+  }
+
+  // --- iPhone 向けの再生（T06b） ----------------------------------------------------------
+
+  /** 続きから再生で保存する今の状態（読み込みが終わる前は null）。 */
+  playbackSnapshot() {
+    if (!this.ready || !this.engine) return null;
+    const gains = {};
+    for (const [code, db] of this.gainsDb) {
+      const v = Number(db);
+      if (Number.isFinite(v) && v !== 0) gains[code] = Math.max(-60, Math.min(24, v));
+    }
+    return {
+      position_sec: Math.round(Math.max(0, this.engine.position) * 1000) / 1000,
+      job_id: this.jobId,
+      selected: [...this.sel],
+      gains_db: gains,
+      listen_preset_id: this.activePresetId,
+      tempo_ratio: this.tempo ? this.tempo.ratio : null,
+      tempo_mode: this.tempo ? this.tempo.mode : null,
+    };
+  }
+
+  /** ロック画面の曲名と操作。 */
+  setupMediaSession() {
+    if (this.media) this.media.dispose();
+    this.media = new MediaSessionControl({
+      play: () => { if (this.engine && !this.engine.playing) this.togglePlay(); },
+      pause: () => { if (this.engine && this.engine.playing) this.togglePlay(); },
+      seekBy: (d) => { if (this.ready) this.seek(this.engine.position + d); },
+      seekTo: (t) => { if (this.ready) this.seek(t); },
+    });
+    this.updateMediaSession();
+  }
+
+  /** 曲名・アーティスト・組み合わせの名前（アルバム欄）と、再生中か・位置を伝える。 */
+  updateMediaSession() {
+    const m = this.media;
+    if (!m || !this.track) return;
+    const preset = (this.presets || []).find((p) => p.listen_preset_id === this.activePresetId);
+    m.setMetadata({ title: this.track.title, artist: this.track.artist || "", album: preset ? preset.name : "" });
+    const e = this.engine;
+    if (!e) return;
+    m.setPlaying(e.playing);
+    m.setPosition(e.duration, e.position, e.speed, true);
+  }
+
+  /** OFF にした時刻を覚える（スマホで、しばらくたった stem の音声を捨てるため）。 */
+  trackOffTimes() {
+    if (!this.lazy || !this.tree) return;
+    const now = Date.now();
+    for (const c of this.tree.leaves) {
+      if (this.sel.has(c)) this.offSince.delete(c);
+      else if (!this.offSince.has(c)) this.offSince.set(c, now);
+    }
+  }
+
+  /** 今鳴らしている音声の組 { key, urls }（速度の変更で作った音声のことがある）。無ければ null。 */
+  audioSet() {
+    return this.tempo ? this.tempo.audioSet() : null;
+  }
+
+  /** スマホ: 選択中で未読み込みの stem を読み込む。 */
+  ensureStemAudio() {
+    if (!this.lazy || !this.ready || !this.engine || !this.alive) return;
+    const set = this.audioSet();
+    if (!set || !set.urls) return;
+    for (const code of this.sel) {
+      const t = this.engine.tracks.get(code);
+      if (!t || t.buffer || this.stemLoads.has(code) || !set.urls[code]) continue;
+      if (this.stemFailed.has(`${set.key}:${code}`)) continue;
+      this.loadStem(code, set);
+    }
+  }
+
+  /** 読み込み中の stem をやめる（音声の組を切り替えるとき）。 */
+  abortStemLoads() {
+    for (const entry of this.stemLoads.values()) entry.abort.abort();
+    this.stemLoads.clear();
+    this.renderSelectionState();
+  }
+
+  /** 1 つの stem の音声を読み込み、鳴っているほかの stem と同じ曲の時刻から鳴らし始める。 */
+  async loadStem(code, set) {
+    const engine = this.engine;
+    const abort = new AbortController();
+    const onLeave = () => abort.abort();
+    this.abort.signal.addEventListener("abort", onLeave);
+    const entry = { key: set.key, abort };
+    this.stemLoads.set(code, entry);
+    this.renderSelectionState();
+    try {
+      const buf = await fetchBinary(set.urls[code], abort.signal);
+      if (abort.signal.aborted) return;
+      const decoded = await engine.decode(buf);
+      const now = this.audioSet();
+      if (abort.signal.aborted || !this.alive || engine !== this.engine || !now || now.key !== set.key) return;
+      engine.addBuffer(code, decoded);
+    } catch (e) {
+      if (e.name !== "AbortError" && this.alive && !abort.signal.aborted) {
+        this.stemFailed.add(`${set.key}:${code}`);
+        const s = this.tree && this.tree.byCode.get(code);
+        toast(`${s ? s.display_name : code} の音声を読み込めませんでした: ${e.message}`);
+      }
+    } finally {
+      this.abort.signal.removeEventListener("abort", onLeave);
+      if (this.stemLoads.get(code) === entry) this.stemLoads.delete(code);
+      if (this.alive) {
+        this.renderSelectionState();
+        this.ensureStemAudio(); // 読み込む間に選択や音声の組が変わっていたら合わせる
+      }
+    }
+  }
+
+  /** スマホ: OFF にしてしばらくたった stem（合計が上限を超えたら古いものから）の音声を捨てる。 */
+  housekeeping() {
+    if (!this.alive) return;
+    if (this.lazy && this.engine && this.ready) {
+      const now = Date.now();
+      const entries = [];
+      for (const [code, t] of this.engine.tracks) {
+        if (!t.buffer) continue;
+        const off = this.sel.has(code) ? null : (this.offSince.get(code) ?? now);
+        entries.push({ code, bytes: t.buffer.length * t.buffer.numberOfChannels * 4, offSince: off });
+      }
+      for (const code of pickEvictions(entries, now)) this.engine.dropBuffer(code);
+    }
+    this.later(() => this.housekeeping(), HOUSEKEEP_MS);
+  }
+
+  /** 鳴らし方・メモリ・端末・ほかの端末の続き（トランスポートの下の小さな行）。 */
+  playInfoEl() {
+    const routeSel = el("select", {
+      class: "select small", id: "route-select", "aria-label": "音の出し方",
+      onchange: (e) => { e.target.blur(); saveRouteChoice(e.target.value); this.reloadKeepingState(); },
+    },
+    el("option", { value: "auto", text: "出し方: 自動" }),
+    el("option", { value: "direct", text: "出し方: 通常（Web Audio）" }),
+    el("option", { value: "stream", text: "出し方: <audio> 経由" }));
+    routeSel.value = loadRouteChoice();
+    const lazy = el("input", {
+      type: "checkbox", id: "lazy-toggle", checked: this.lazy,
+      onchange: (e) => {
+        e.target.blur();
+        saveLazySetting(e.target.checked);
+        this.lazy = e.target.checked;
+        this.reloadKeepingState();
+      },
+    });
+    return el("div", { class: "play-info", id: "play-info" },
+      el("span", { class: "pi-item pi-route", id: "route-info" }),
+      el("span", { class: "pi-item", id: "mem-info", title: "デコードした音声の大きさ（読み込んだ stem の数 / 全部）" }),
+      el("button", {
+        class: "pi-item pi-btn", type: "button", id: "device-btn", title: "この端末の名前（押すと変えられます）",
+        onclick: () => this.renameThisDevice(),
+      }),
+      el("button", {
+        class: "pi-item pi-btn pi-resume", type: "button", id: "resume-other", hidden: true,
+        onclick: () => this.resumeFromOther(),
+      }),
+      el("details", { class: "pi-more" },
+        el("summary", { text: "再生の設定" }),
+        el("div", { class: "pi-opts" },
+          routeSel,
+          el("label", {
+            class: "snap-toggle",
+            title: "選んでいる stem の音声だけを読み込みます（スマホの既定）。メモリを節約できます",
+          }, lazy, el("span", { text: "選択中の stem だけ読み込む" })))));
+  }
+
+  renderPlayInfo() {
+    const r = this.root.querySelector("#route-info");
+    if (r && this.route) {
+      r.textContent = `出力 ${ROUTE_SHORT[this.route.mode] || this.route.mode}`;
+      r.title = this.route.label + (this.route.error ? `（${this.route.error}）` : "");
+      r.dataset.route = this.route.mode;
+    }
+    const d = this.root.querySelector("#device-btn");
+    if (d) {
+      d.textContent = this.device ? `端末: ${this.device.name}` : "端末: 未登録";
+      d.disabled = !this.device;
+    }
+    const o = this.root.querySelector("#resume-other");
+    if (o) {
+      o.hidden = !this.otherState;
+      if (this.otherState) {
+        o.textContent = `${describeOther(this.otherState)} ▸ そこから`;
+        o.title = "その位置へ移ります";
+      }
+    }
+    this.memKey = "";
+    this.renderMemory();
+  }
+
+  /** デコードした音声の大きさ（変わったときだけ書き換える）。 */
+  renderMemory() {
+    const m = this.root.querySelector("#mem-info");
+    if (!m || !this.engine || !this.tree) return;
+    const bytes = this.engine.memoryBytes();
+    let n = 0;
+    for (const c of this.tree.leaves) {
+      const t = this.engine.tracks.get(c);
+      if (t && t.buffer) n++;
+    }
+    const key = `${bytes}|${n}|${this.lazy}`;
+    if (key === this.memKey) return;
+    this.memKey = key;
+    m.textContent = `音声 ${formatMB(bytes)}（${n}/${this.tree.leaves.length}${this.lazy ? "・選択中だけ" : ""}）`;
+    m.dataset.bytes = String(bytes);
+  }
+
+  async renameThisDevice() {
+    if (!this.device) return;
+    const name = await promptDialog(
+      "この端末の名前（ほかの端末で「〇〇 で 1:23 まで聴いた」と出ます）", this.device.name, { ok: "変更" });
+    if (!name || name === this.device.name) return;
+    try {
+      this.device = await renameDevice(name);
+      if (this.sync) this.sync.device = this.device;
+      this.renderPlayInfo();
+    } catch (e) { toast(e.message); }
+  }
+
+  /** ほかの端末で最後に聴いていた位置へ移る。 */
+  resumeFromOther() {
+    const st = this.otherState;
+    if (!st || !this.ready) return;
+    this.seek(st.position_sec);
+    toast(`${st.device_name} で聴いていた位置（${formatTime(st.position_sec)}）へ移りました。`);
+  }
+
+  /** 設定を変えたとき: 再生位置・選択を保って読み直す（エンジンを作り直す）。 */
+  reloadKeepingState() {
+    if (this.loading) return;
+    if (!this.restore) this.restore = this.captureState();
+    this.remount();
   }
 }
