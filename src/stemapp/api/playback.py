@@ -52,6 +52,8 @@ class DeviceUpdate(BaseModel):
 
 
 class PlaybackSave(BaseModel):
+    # 送ってきた端末の ID（device_id の端末と照合する。違えば 403）
+    device_key: DeviceKey
     position_sec: float = Field(ge=0.0, le=24 * 60 * 60)
     job_id: int | None = None
     selected: list[Code] | None = Field(default=None, max_length=MAX_STEMS)
@@ -165,9 +167,14 @@ def save_playback(
     """この端末の、この曲の再生の状態を上書き保存する。"""
     track = _get_track(session, track_id)
     device = _get_device(session, device_id)
-    if body.job_id is not None:
-        job = session.get(SeparationJob, body.job_id)
-        if job is None or job.track_id != track_id:
+    if device.device_key is None or device.device_key != body.device_key:
+        raise HTTPException(status_code=403, detail="この端末の再生の状態ではありません。")
+    job_id = body.job_id
+    if job_id is not None:
+        job = session.get(SeparationJob, job_id)
+        if job is None:
+            job_id = None  # 消えた分け方は覚えない（エラーにしない）
+        elif job.track_id != track_id:
             raise HTTPException(status_code=400, detail="この曲の分け方ではありません。")
     preset_id = body.listen_preset_id
     if preset_id is not None and session.get(ListenPreset, preset_id) is None:
@@ -180,7 +187,7 @@ def save_playback(
         st = PlaybackState(device_id=device_id, track_id=track_id)
         session.add(st)
     st.position_sec = position
-    st.job_id = body.job_id
+    st.job_id = job_id
     st.selected_json = list(body.selected) if body.selected is not None else None
     gains = {k: v for k, v in (body.gains_db or {}).items() if v != 0}
     st.channel_gains_json = gains or None

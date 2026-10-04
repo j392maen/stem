@@ -6,7 +6,7 @@
 
 import { api, fetchBinary } from "./api.js";
 import {
-  AudioRoute, ROUTE_SHORT, loadRouteChoice, routeForThisDevice, saveRouteChoice,
+  AudioRoute, ROUTE_SHORT, isCoarsePointer, loadRouteChoice, routeForThisDevice, saveRouteChoice,
 } from "./audioroute.js";
 import { BeatEditPanel } from "./beatedit.js";
 import { BeatGrid, barLoop, formatBpm } from "./beats.js";
@@ -16,7 +16,7 @@ import { Exporter } from "./export.js";
 import { MediaSessionControl } from "./mediasession.js";
 import { parsePeaks } from "./peaks.js";
 import { RefineUI } from "./refine.js";
-import { PlaybackSync, describeOther, restoreFromState } from "./resume.js";
+import { PlaybackSync, describeOther, restoreFromState, resumePosition } from "./resume.js";
 import * as S from "./selection.js";
 import { formatMB, loadLazySetting, pickEvictions, saveLazySetting } from "./stemload.js";
 import { COARSE_STEP, FINE_STEP, TempoPanel } from "./tempo.js";
@@ -288,6 +288,14 @@ export class PlayerView {
   }
 
   remount() {
+    // スマホ（iPhone の音声セッション・<audio> の経路）では、読み直した後の再生がユーザーの操作の外に
+    // なって鳴らないことがあるので、止めてから読み直し、▶ を押してもらう（PC は今までどおり続ける）
+    const r = this.restore;
+    if (r && r.playing && this.needsGestureToPlay()) {
+      if (this.engine) this.engine.pause();
+      r.playing = false;
+      r.askPlay = true;
+    }
     this.unmount();
     this.alive = true;
     this.abort = new AbortController();
@@ -471,8 +479,11 @@ export class PlayerView {
     this.renderCues();
     this.renderBarLoop();
     if (r.zoom && this.wave) this.wave.setZoom(r.zoom);
-    this.engine.seek(clampTime(r.position, this.engine.duration));
-    if (r.fromServer && r.position >= 1) toast(`前回の続き（${formatTime(r.position)}）から再生します。`);
+    // 続きから: 曲の終わり近く（5 秒より後）で止めていたら最初から
+    const pos = r.fromServer ? resumePosition(r.position, this.engine.duration) : r.position;
+    this.engine.seek(clampTime(pos, this.engine.duration));
+    if (r.fromServer && pos >= 1) toast(`前回の続き（${formatTime(pos)}）から再生します。`);
+    if (r.askPlay) toast("▶ を押して再生してください。");
     if (r.playing) await this.engine.play();
     this.updateTransport();
   }
@@ -1190,6 +1201,10 @@ export class PlayerView {
       el("div", { class: "time" },
         el("span", { id: "time-now", text: formatTime(0, true) }),
         el("span", { class: "muted", text: ` / ${formatTime(duration, true)}` })),
+      el("button", {
+        class: "btn small restart-btn", id: "restart-btn", type: "button", text: "最初から",
+        title: "再生位置を曲の最初に戻します", onclick: (e) => { e.currentTarget.blur(); this.seek(0); },
+      }),
       el("div", { class: `tempo${this.beatGrid ? "" : " none"}`, id: "tempo", title: this.tempoTitle() },
         el("span", { class: "bpm", id: "bpm-value", text: "—" }),
         el("span", { class: "unit", text: "BPM" }),
@@ -1623,6 +1638,11 @@ export class PlayerView {
     if (!st || !this.ready) return;
     this.seek(st.position_sec);
     toast(`${st.device_name} で聴いていた位置（${formatTime(st.position_sec)}）へ移りました。`);
+  }
+
+  /** 読み直した後の再生にユーザーの操作が要る端末か（スマホ、または iPhone 用の経路）。 */
+  needsGestureToPlay() {
+    return this.lazy || isCoarsePointer() || !!(this.route && this.route.mode !== "direct");
   }
 
   /** 設定を変えたとき: 再生位置・選択を保って読み直す（エンジンを作り直す）。 */

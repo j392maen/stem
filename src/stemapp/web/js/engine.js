@@ -173,6 +173,7 @@ export class Engine {
     gain.gain.value = gainValue;
     gain.connect(this.bus);
     // target: 選択で決めた音量（ランプの行き先）。startInfo: 最後に鳴らし始めた時刻と音声データ上の位置
+    // （テスト・確認用。再生の処理では使わない）
     this.tracks.set(code, { buffer, gain, source: null, target: gainValue, startInfo: null });
     if (buffer) this.duration = Math.max(this.duration, buffer.duration * this.bufScale);
   }
@@ -362,6 +363,8 @@ export class Engine {
   }
 
   /** 出力の遅延（秒）。再生位置の音が実際に聞こえるまでの時間（タップの補正に使う）。 */
+  // <audio> の経路の遅れ（routeLatency）は position に入れてあるので、ここには足さない
+  // （タップの補正は position − outputLatency × 速さ。足すと二重に引くことになる）。
   outputLatency() {
     const c = this.ctx;
     return Math.max(0, (Number(c.outputLatency) || 0) + (Number(c.baseLatency) || 0));

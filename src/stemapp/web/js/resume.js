@@ -10,11 +10,12 @@
 //   サーバーの値が一つ前のことがあるため（自分の端末の行は自分しか書かないので、写しが常に最新）。
 
 import { api } from "./api.js";
-import { ensureDevice } from "./device.js";
+import { deviceKey, ensureDevice } from "./device.js";
 import { formatTime } from "./ui.js";
 
 export const SAVE_MS = 5000;
 const MIN_OTHER_SEC = 1; // これより前ならほかの端末の位置は出さない
+export const NEAR_END_SEC = 5; // 曲の終わりからこれより後で止めていたら、次は最初から
 const LOCAL_PREFIX = "stemapp.resume.";
 
 function readLocal(trackId) {
@@ -35,6 +36,13 @@ export function pickStates(states, myDeviceId) {
   const other = list.find((s) => s.device_id !== myDeviceId && s.position_sec >= MIN_OTHER_SEC)
     || null;
   return { mine, other };
+}
+
+/** 続きから再生する位置（曲の終わり NEAR_END_SEC 秒より後なら最初から）。 */
+export function resumePosition(position, duration) {
+  const p = Math.max(0, Number(position) || 0);
+  const d = Number(duration) || 0;
+  return d > 0 && p > d - NEAR_END_SEC ? 0 : p;
 }
 
 /** 「PC で 1:23 まで聴いた」。 */
@@ -116,7 +124,8 @@ export class PlaybackSync {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify(snap),
+      // 端末の ID を添える（サーバーが device_id の端末と照合する）
+      body: JSON.stringify({ ...snap, device_key: deviceKey() }),
       keepalive,
     }).then((res) => {
       if (!res.ok) this.lastKey = ""; // 次の機会にもう一度送る

@@ -165,6 +165,10 @@ def test_iphone_pure_functions(page: Any, server: LiveServer) -> None:  # noqa: 
             { device_id: 3, position_sec: 83 },
           ], 1),
           other: P.describeOther({ device_name: 'PC', position_sec: 83.4 }),
+          // 曲の終わり 5 秒より後で止めていたら最初から
+          resumePos: [P.resumePosition(83, 240), P.resumePosition(236, 240),
+                      P.resumePosition(234.9, 240), P.resumePosition(-1, 240),
+                      P.resumePosition(3, 0)],
           restore: (() => {
             const r = P.restoreFromState({
               position_sec: 12.5, selected: ['drums'], gains_db: { bass: -3 }, listen_preset_id: 4,
@@ -194,6 +198,7 @@ def test_iphone_pure_functions(page: Any, server: LiveServer) -> None:  # noqa: 
     assert res["picked"]["mine"]["device_id"] == 1
     assert res["picked"]["other"]["device_id"] == 3  # 位置が 1 秒未満の端末は出さない
     assert res["other"] == "PC で 1:23 まで聴いた"
+    assert res["resumePos"] == [83, 0, 234.9, 0, 3]
     assert res["restore"] == [12.5, ["drums"], [["bass", -3]], 4, False, True]
     assert res["kinds"] == ["iphone", "ipad", "pc", "other"]
     assert res["key"] == [True, True]
@@ -467,6 +472,20 @@ def test_phone_keep_mode_loads_selected_only(
         assert len([u for u in audio if "/api/files/tempo/" in u]) == 2
         dur = _engine(pg, "e.tracks.get('bass').buffer.duration")
         assert dur == pytest.approx(12.0 / 1.1, abs=0.01)
+
+        # 再生中に「選択中の stem だけ読み込む」を切り替えて読み直すと、自動では鳴らし直さない
+        # （iPhone では操作の外の再生が無音になるため）。▶ を押すよう知らせる
+        assert pg.evaluate(f"() => {VIEW}.engine.playing") is True
+        pos = _engine(pg, "e.position")
+        pg.click(".pi-more summary")
+        pg.uncheck("#lazy-toggle")
+        pg.wait_for_function(f"() => {VIEW}.ready && {VIEW}.lazy === false", timeout=30_000)
+        pg.wait_for_function(
+            "() => document.getElementById('toast').textContent.includes('▶ を押して再生')")
+        assert pg.evaluate(f"() => {VIEW}.engine.playing") is False
+        assert _engine(pg, "e.position") == pytest.approx(pos, abs=0.5)
+        pg.click("#play-btn")
+        pg.wait_for_function(f"() => {VIEW}.engine.playing")
         assert not pg.errors  # type: ignore[attr-defined]
     finally:
         ctx.close()
@@ -535,6 +554,22 @@ def test_resume_per_device(
     assert first not in page.evaluate(f"() => [...{VIEW}.sel]")
     assert page.evaluate(f"() => [{VIEW}.tempo.ratio, {VIEW}.tempo.mode]") == [1.05, "pitch"]
     assert _engine(page, "e.rate") == pytest.approx(1.05)
+    # 「最初から」で位置を 0 に
+    page.click("#restart-btn")
+    assert _engine(page, "e.position") == 0
+    page.evaluate(f"() => {VIEW}.seek(2.5)")
+    # PC は、再生中に設定を変えて読み直しても、そのまま再生を続ける（今までどおり）
+    page.click("#play-btn")
+    page.wait_for_function(f"() => {VIEW}.engine.playing")
+    page.click(".pi-more summary")
+    page.select_option("#route-select", "direct")
+    page.wait_for_function(f"() => {VIEW}.ready && {VIEW}.engine && {VIEW}.engine.playing",
+                           timeout=30_000)
+    page.click("#play-btn")
+    page.wait_for_function(f"() => !{VIEW}.engine.playing")
+    page.evaluate(f"() => {VIEW}.seek(2.5)")
+    # 2.5 秒が保存されるのを待つ（再生中に 5 秒ごとの保存で別の位置が入っていることがある）
+    _wait_state(server, track_id, lambda s: bool(s) and abs(s[0]["position_sec"] - 2.5) < 0.05)
     # 端末の名前を変える
     page.click("#device-btn")
     page.fill(".modal-back input", "居間の PC")
@@ -557,4 +592,10 @@ def test_resume_per_device(
         assert not pg.errors  # type: ignore[attr-defined]
     finally:
         ctx.close()
+    # 曲の終わり近く（12 秒の曲の 10 秒）で離れると、次は最初から
+    page.evaluate(f"() => {VIEW}.seek(10.0)")
+    _leave(page)
+    _wait_state(server, track_id, lambda s: any(abs(x["position_sec"] - 10.0) < 0.05 for x in s))
+    _open(page, server, track_id)
+    assert _engine(page, "e.position") == 0
     assert not page.errors  # type: ignore[attr-defined]
