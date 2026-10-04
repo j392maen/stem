@@ -16,6 +16,10 @@
 //   読み込み中に別の組に変えたら、前の読み込みは止める（AbortController）。
 //   省メモリ（スマホ幅・長い曲では既定で ON。画面で切り替えられる）: 前の組を捨ててから読み込む
 //   （読み込む間は止めて、終わったら同じ位置から続ける）。
+// - スマホで選択中の stem だけ読み込むとき（T06b。view.lazy）: 組を読み込むときも選択中の stem だけを
+//   読み、ほかは音声なし（null）にする。あとで ON にした stem は、プレイヤーが今の組（audioSet()）の
+//   URL から読み込んで足す。
+// - 続きから再生（T06b）: view.resumeTempo（サーバーに保存した速度と方式）があれば、最初にそれを使う。
 
 import { api, fetchBinary } from "./api.js";
 import { formatBpm } from "./beats.js";
@@ -157,11 +161,21 @@ export class TempoPanel {
     this.ratio = saved.ratio;
     this.mode = saved.mode;
     this.range = saved.range;
+    const resume = view.resumeTempo;
+    if (resume) {
+      // 続きから再生: この端末で最後に使った速度と方式（サーバーに保存したもの）
+      view.resumeTempo = null;
+      this.ratio = clampRatio(resume.ratio ?? this.ratio);
+      if (MODES.includes(resume.mode)) this.mode = resume.mode;
+      this.range = rangeFor(this.ratio, this.range);
+      this.save();
+    }
     this.pending = loadPending();
     this.lowMemory = loadLowMemory(view.track ? view.track.duration_sec : 0);
     this.loadAbort = null; // 読み込み中の組の AbortController
     this.resumeAfterLoad = false; // 省メモリで止めた: 読み込み終わったら再生を続ける
     this.activeKey = ORIGINAL; // 今鳴らしている音声の組（元の音声 or 倍率）
+    this.activeUrls = null; // 今鳴らしている組の URL（元の音声なら urls と同じ）
     this.loadingKey = null; // 読み込み中の組
     this.failedKeys = new Set(); // 読み込みに失敗した組（速度・方式を変えるまで読み直さない）
     this.render = null; // 今の目標の倍率の作成（サーバーの TEMPO_RENDER）
@@ -455,6 +469,7 @@ export class TempoPanel {
   start(urls) {
     this.urls = urls;
     this.activeKey = ORIGINAL;
+    this.activeUrls = urls;
     if (this.mode === "instant") this.prepareStretch(); // 速度を変えたらすぐ効くよう先に作る
     this.refresh();
     this.apply();
@@ -557,6 +572,12 @@ export class TempoPanel {
     this.refreshStatus();
   }
 
+  /** 今鳴らしている音声の組 { key, urls }（T06b。あとから stem を読み込むとき使う）。無ければ null。 */
+  audioSet() {
+    if (this.activeKey === null || !this.activeUrls) return null;
+    return { key: this.activeKey, urls: this.activeUrls };
+  }
+
   abortLoad() {
     if (this.loadAbort) this.loadAbort.abort();
     this.loadAbort = null;
@@ -573,6 +594,8 @@ export class TempoPanel {
       return;
     }
     this.abortLoad();
+    // スマホ（選択中の stem だけ読み込む）: 前の組のために読み込み中の stem はやめる
+    if (this.view.lazy && this.view.abortStemLoads) this.view.abortStemLoads();
     const abort = new AbortController();
     const onLeave = () => abort.abort();
     this.view.abort.signal.addEventListener("abort", onLeave);
@@ -587,9 +610,14 @@ export class TempoPanel {
       engine.pause();
       engine.setBuffers(Object.fromEntries(codes.map((c) => [c, null])), engine.bufScale);
       this.activeKey = null;
+      this.activeUrls = null;
     }
+    // スマホ: 選択中の stem だけ読む（ほかは null にして、ON にしたときプレイヤーが読み込む）
+    const lazy = !!this.view.lazy;
+    const sel = this.view.sel;
+    const loadCodes = lazy && sel ? codes.filter((c) => sel.has(c)) : codes;
     try {
-      const list = await mapLimit(codes, LOAD_CONCURRENCY, async (code) => {
+      const list = await mapLimit(loadCodes, LOAD_CONCURRENCY, async (code) => {
         if (abort.signal.aborted) throw new DOMException("中断しました", "AbortError");
         const buf = await fetchBinary(d.urls[code], abort.signal);
         const decoded = await engine.decode(buf);
@@ -599,8 +627,13 @@ export class TempoPanel {
       if (this.disposed || engine !== this.engine || abort.signal.aborted) return;
       const now = this.desired();
       if (!now || now.key !== d.key) return; // 読み込む間に設定が変わった
-      engine.setBuffers(Object.fromEntries(list), d.scale, now.rate);
+      const buffers = lazy ? Object.fromEntries(codes.map((c) => [c, null])) : {};
+      Object.assign(buffers, Object.fromEntries(list));
+      engine.setBuffers(buffers, d.scale, now.rate);
       this.activeKey = d.key;
+      this.activeUrls = d.urls;
+      // 読み込む間に ON にした stem を足す
+      if (lazy && this.view.ensureStemAudio) this.view.ensureStemAudio();
       if (this.resumeAfterLoad) {
         this.resumeAfterLoad = false;
         await engine.play();
