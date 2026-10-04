@@ -1,0 +1,56 @@
+/* iPhone 向けの再生（T06b）: トランスポートの下の小さな行（音の出し方・メモリ・端末・ほかの端末の続き）、
+   stem の読み込み中の表示。差し色は app.css の赤（--accent / --accent-deep）だけを使う。 */
+
+.play-info {
+  flex-basis: 100%;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding-top: 8px; margin-top: 2px; border-top: 1px solid var(--line);
+  font-size: 11px; color: var(--muted);
+}
+.pi-item {
+  display: inline-flex; align-items: center; gap: 5px; min-height: 24px; padding: 0 8px;
+  border: 1px solid var(--line); border-radius: 4px; background: #111115;
+  font-variant-numeric: tabular-nums; white-space: nowrap; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis;
+}
+/* 鳴らし方: 小さな点で今の経路を示す（通常は灰色、iPhone 用の経路は赤） */
+.pi-route::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex: none;
+}
+.pi-route[data-route="session"]::before, .pi-route[data-route="stream"]::before {
+  background: var(--accent); box-shadow: 0 0 6px rgba(255, 59, 78, 0.6);
+}
+.pi-btn { cursor: pointer; color: var(--muted); font-size: 11px; }
+.pi-btn:hover:not(:disabled) { color: var(--text); border-color: #3a3a46; }
+.pi-btn:disabled { cursor: default; opacity: 0.6; }
+.pi-resume { color: var(--text); border-color: var(--accent-deep); background: rgba(158, 27, 44, 0.18); }
+.pi-resume:hover { border-color: var(--accent); }
+.pi-more { margin-left: auto; }
+.pi-more summary {
+  cursor: pointer; list-style: none; min-height: 24px; display: inline-flex; align-items: center;
+  padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; user-select: none;
+}
+.pi-more summary::-webkit-details-marker { display: none; }
+.pi-more summary::after { content: " ▾"; color: var(--faint); }
+.pi-more[open] summary { color: var(--text); }
+.pi-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 6px; }
+
+/* 「最初から」: 時刻表示の横に控えめに */
+.restart-btn { min-height: 26px; padding: 0 8px; font-size: 11px; color: var(--muted); }
+.restart-btn:hover { color: var(--text); }
+
+/* stem を読み込み中（スマホで、ON にしてから音声を読み込む間）: 右上に回る印 */
+.stem-btn.loading::after {
+  content: ""; position: absolute; right: 7px; top: 7px; width: 10px; height: 10px;
+  border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.18); border-top-color: var(--accent);
+  animation: pi-spin 0.8s linear infinite;
+}
+@keyframes pi-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .stem-btn.loading::after { animation: none; border-color: var(--accent); }
+}
+
+@media (max-width: 640px) {
+  .pi-more { margin-left: 0; }
+  .pi-more[open] { flex-basis: 100%; }
+}

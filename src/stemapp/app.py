@@ -30,6 +30,7 @@ from stemapp.api import (
     folders,
     imports,
     master,
+    playback,
     tempo,
     tracks,
 )
@@ -159,7 +160,9 @@ def create_app(
         )
         return {"status": "ok", "version": __version__, "worker": worker}
 
-    for module in (auth, imports, tracks, cues, files, folders, master, exports, diag, tempo):
+    for module in (
+        auth, imports, tracks, cues, files, folders, master, exports, diag, tempo, playback,
+    ):
         app.include_router(module.router)
     # 画面。API のルートより後に登録する（/api/* はここまで来ない）
     app.mount("/", WebFiles(directory=WEB_DIR, html=True), name="web")
