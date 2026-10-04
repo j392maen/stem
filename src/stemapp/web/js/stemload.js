@@ -5,7 +5,7 @@
 // - 選択中の葉 stem の音声だけを読み込む（波形の peaks は小さいので全部読む）。
 // - ON にした stem が未読み込みなら、読み込んでから同じ曲の時刻で鳴らし始める（Engine.addBuffer）。
 // - OFF にした stem の音声はしばらく（KEEP_MS）残してから捨てる。合計が上限（LIMIT_BYTES）を超えたら、
-//   OFF にしてから長いものから先に捨てる（選択中のものは捨てない）。
+//   OFF にした時刻の古い順に、上限を下回るまで捨てる（選択中のものは捨てない）。
 // ここには DOM・音声に触れない純粋な処理と設定だけを置く（読み込みは player.js）。
 
 import { isPhoneScreen } from "./audioroute.js";

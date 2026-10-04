@@ -18,6 +18,7 @@ from test_api import _app
 
 KEY_PC = "pc-0123456789abcdef"
 KEY_PHONE = "ph-0123456789abcdef"
+PC_KEY = {"device_key": KEY_PC}  # PC の端末として保存する本文に添える
 
 
 @pytest.fixture
@@ -83,7 +84,7 @@ def test_save_and_read_playback_per_device(client: TestClient, track: tuple[int,
     res = client.put(
         f"/api/tracks/{track_id}/playback/{pc['device_id']}",
         json={
-            "position_sec": 1.25, "job_id": job_id, "selected": ["drums", "bass"],
+            **PC_KEY, "position_sec": 1.25, "job_id": job_id, "selected": ["drums", "bass"],
             "gains_db": {"bass": -3, "drums": 0}, "listen_preset_id": preset["listen_preset_id"],
             "tempo_ratio": 1.05, "tempo_mode": "instant",
         },
@@ -101,7 +102,7 @@ def test_save_and_read_playback_per_device(client: TestClient, track: tuple[int,
     # iPhone は別の行（PC の状態は変わらない）。曲の長さを超える位置は長さに収める
     res = client.put(
         f"/api/tracks/{track_id}/playback/{phone['device_id']}",
-        json={"position_sec": 999, "selected": ["vocals"]},
+        json={"device_key": KEY_PHONE, "position_sec": 999, "selected": ["vocals"]},
     )
     assert res.status_code == 200
     assert res.json()["position_sec"] == pytest.approx(2.0, abs=0.05)
@@ -113,7 +114,7 @@ def test_save_and_read_playback_per_device(client: TestClient, track: tuple[int,
     # 上書き（同じ端末・同じ曲は1行）
     client.put(
         f"/api/tracks/{track_id}/playback/{pc['device_id']}",
-        json={"position_sec": 0.5, "job_id": job_id},
+        json={**PC_KEY, "position_sec": 0.5, "job_id": job_id},
     )
     with _factory(client)() as s:
         rows = s.scalars(select(PlaybackState).where(PlaybackState.track_id == track_id)).all()
@@ -127,22 +128,34 @@ def test_playback_validation(client: TestClient, track: tuple[int, int], tmp_pat
     track_id, job_id = track
     pc = _register(client, KEY_PC, "pc")
     url = f"/api/tracks/{track_id}/playback/{pc['device_id']}"
-    assert client.put(url, json={"position_sec": -1}).status_code == 422
-    assert client.put(url, json={"position_sec": 1, "tempo_ratio": 3}).status_code == 422
-    assert client.put(url, json={"position_sec": 1, "tempo_mode": "fast"}).status_code == 422
-    assert client.put(url, json={"position_sec": 1, "selected": ["a b"]}).status_code == 422
-    assert client.put(url, json={"position_sec": 1, "job_id": 9999}).status_code == 400
+    assert client.put(url, json={**PC_KEY, "position_sec": -1}).status_code == 422
+    assert client.put(url, json={**PC_KEY, "position_sec": 1, "tempo_ratio": 3}).status_code == 422
+    for bad in ({"tempo_mode": "fast"}, {"selected": ["a b"]}):
+        assert client.put(url, json={**PC_KEY, "position_sec": 1, **bad}).status_code == 422
+    # 消えた（無い）分け方はエラーにせず、覚えない
+    res = client.put(url, json={**PC_KEY, "position_sec": 1, "job_id": 9999})
+    assert res.status_code == 200 and res.json()["job_id"] is None
+    # 端末の ID が違う・無い本文は保存できない
+    phone = _register(client, KEY_PHONE, "iphone")
+    res = client.put(url, json={"device_key": KEY_PHONE, "position_sec": 1})
+    assert res.status_code == 403
+    res = client.put(f"/api/tracks/{track_id}/playback/{phone['device_id']}",
+                     json={**PC_KEY, "position_sec": 1})
+    assert res.status_code == 403
+    assert client.put(url, json={"position_sec": 1}).status_code == 422
+    assert [s["device_name"] for s in client.get(f"/api/tracks/{track_id}/playback")
+            .json()["states"]] == ["PC"]
     # 別の曲のジョブは使えない
     settings = client.app.state.settings  # type: ignore[attr-defined]
     with _factory(client)() as s:
         other = make_track(s, settings, tmp_path, name="other", seed_offset=0.3)
     res = client.put(f"/api/tracks/{other}/playback/{pc['device_id']}",
-                     json={"position_sec": 0, "job_id": job_id})
+                     json={**PC_KEY, "position_sec": 0, "job_id": job_id})
     assert res.status_code == 400
     # 無い組み合わせは覚えない（エラーにしない）
-    res = client.put(url, json={"position_sec": 1, "listen_preset_id": 99999})
+    res = client.put(url, json={**PC_KEY, "position_sec": 1, "listen_preset_id": 99999})
     assert res.status_code == 200 and res.json()["listen_preset_id"] is None
-    zero = {"position_sec": 0}
+    zero = {"device_key": KEY_PC, "position_sec": 0}
     assert client.put(f"/api/tracks/{track_id}/playback/999", json=zero).status_code == 404
     assert client.put(f"/api/tracks/999/playback/{pc['device_id']}", json=zero).status_code == 404
     assert client.get("/api/tracks/999/playback").status_code == 404
@@ -152,7 +165,7 @@ def test_playback_follows_deletes(client: TestClient, track: tuple[int, int]) ->
     track_id, job_id = track
     pc = _register(client, KEY_PC, "pc")
     url = f"/api/tracks/{track_id}/playback/{pc['device_id']}"
-    assert client.put(url, json={"position_sec": 1, "job_id": job_id}).status_code == 200
+    assert client.put(url, json={**PC_KEY, "position_sec": 1, "job_id": job_id}).status_code == 200
     # ジョブを消すと job_id は null（行は残る）
     with _factory(client)() as s:
         s.delete(s.get(SeparationJob, job_id))

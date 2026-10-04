@@ -35,6 +35,10 @@
 .pi-more[open] summary { color: var(--text); }
 .pi-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 6px; }
 
+/* 「最初から」: 時刻表示の横に控えめに */
+.restart-btn { min-height: 26px; padding: 0 8px; font-size: 11px; color: var(--muted); }
+.restart-btn:hover { color: var(--text); }
+
 /* stem を読み込み中（スマホで、ON にしてから音声を読み込む間）: 右上に回る印 */
 .stem-btn.loading::after {
   content: ""; position: absolute; right: 7px; top: 7px; width: 10px; height: 10px;
