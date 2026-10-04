@@ -300,7 +300,8 @@ def test_stream_route_delay(page: Any, server: LiveServer) -> None:  # noqa: F81
     print("MediaStream を通した音の遅れ（秒）:", res)
     assert all(d is not None for d in res["delays"]), res
     # MediaStream は 10ms ごとに音を渡すので、PC の負荷で 10ms 単位で増えることがある。
-    # いちばん小さい値（負荷の少ないとき。普段は 20.7ms）と位置の計算に入れている値の差が 10ms 程度以内
+    # いちばん小さい値（負荷の少ないとき。普段は 20.7ms）と、位置の計算に入れている値の差が
+    # 10ms 程度以内
     assert all(0 < d < 0.1 for d in res["delays"]), res
     assert abs(min(res["delays"]) - res["fix"]) <= 0.011, res
 
