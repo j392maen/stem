@@ -78,7 +78,10 @@ class InputSource(Base):
 
 
 class Device(Base):
-    """再生する端末（ブラウザ）。端末ごとの ID（device_key）はブラウザの localStorage に持つ（T06b）。"""
+    """再生する端末（ブラウザ）。
+
+    端末ごとの ID（device_key）はブラウザの localStorage に持つ（T06b）。
+    """
 
     __tablename__ = "device"
     __table_args__ = (Index("ux_device_key", "device_key", unique=True),)

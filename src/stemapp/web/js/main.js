@@ -1,14 +1,18 @@
 // 画面の入口: ログインの確認と、ハッシュでの画面切り替え（#/library, #/track/<id>, #/diag）。
 
 import { api, onUnauthorized } from "./api.js";
+import * as audioRouteMod from "./audioroute.js";
 import * as beatEditMod from "./beatedit.js";
 import * as beatsMod from "./beats.js";
 import { DiagView } from "./diag.js";
 import * as engineMod from "./engine.js";
 import { LibraryView } from "./library.js";
+import * as mediaSessionMod from "./mediasession.js";
 import * as peaksMod from "./peaks.js";
 import { PlayerView } from "./player.js";
+import * as resumeMod from "./resume.js";
 import * as selectionMod from "./selection.js";
+import * as stemLoadMod from "./stemload.js";
 import * as tempoMod from "./tempo.js";
 import { el, toast } from "./ui.js";
 
@@ -22,7 +26,8 @@ window.__stemapp = {
   get view() { return current; },
   modules: {
     peaks: peaksMod, selection: selectionMod, engine: engineMod, beats: beatsMod,
-    tempo: tempoMod, beatedit: beatEditMod,
+    tempo: tempoMod, beatedit: beatEditMod, audioroute: audioRouteMod, mediasession: mediaSessionMod,
+    stemload: stemLoadMod, resume: resumeMod,
   },
 };
 
