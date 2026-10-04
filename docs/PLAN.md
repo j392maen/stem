@@ -57,7 +57,7 @@
 - 不安定なテスト: test_browser_diag.py::test_diag_page_desktop が別担当の GPU 使用中に1回失敗（単独では成功）。
 | T11c | PC で速度がすぐ変わる方式（signalsmith-stretch、AudioWorklet） | 完了（2026-10-02） |
 | T14 | 仕上げ（AUTOINCREMENT、ワーカーの状態、伸縮の並行、書き出し・診断の仕上げ、ログ） | 完了（2026-10-02）。次の serve 起動で実データの AUTOINCREMENT 移行が自動で1回走る |
-| T06b | iPhone 向けの再生（選択中の stem だけ読み込む、ロック画面、オフライン、通知） | 実装中 |
+| T06b | iPhone 向けの再生（選択中の stem だけ読み込む、ロック画面、オフライン、通知） | 完了（2026-10-05）。iPhone 実機の確認待ち。通知（Web Push）とオフライン保存は未着手 |
 | T07b | Mega 53 を 8GB で試す | 完了（2026-10-02）。詳細分割の方法として組み込み |
 - 不安定なテスト（T11c レビューより）: test_browser_tempo.py::test_swap_continuity_range_blur_lowmem が高負荷時に失敗（play 直後 30ms の開始待ちを測定に含むため。_speed_over の前に待ちを入れる）。test_offline_pitch_stays_at_rate_change の基準（3窓）は余裕がないので Edge 更新時に注意。vendor/signalsmith-stretch/README.md の改行が CRLF に（軽微）。
 - T11c の既定（PC は「ピッチを保つ・すぐ」）では 1.000 倍でも stem の ON/OFF・シーク・再生の出だしが約 0.12〜0.15 秒遅れる。ユーザーの感想しだいで既定を見直す。
