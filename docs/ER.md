@@ -6,7 +6,7 @@
 | --- | --- |
 | TRACK | track_id PK, title, artist, duration_sec, audio_hash UK, normalized_path, detected_instruments_json, created_at |
 | INPUT_SOURCE | source_id PK, track_id FK, source_type(file/url), original_name, url, fetch_status, error_code, error_detail, fetched_at |
-| DEVICE | device_id PK, name, kind(pc/iphone/ipad/other), push_subscription_json, last_seen_at |
+| DEVICE | device_id PK, name（「iPhone」「PC」など。自動で付け、変更可）, kind(pc/iphone/ipad/other), push_subscription_json, last_seen_at, device_key UK(T06b。ブラウザが作るランダムな ID。localStorage に保存。T06b より前の行は NULL) |
 | SEPARATION_PRESET | preset_id PK, code UK(fast/standard/best、実験は exp_*), display_name, is_default, is_experimental(bool、聴き比べ用の実験), options_json(パイプライン全体の選択肢。例 {"residual_to": "other/vocals/split"}) |
 | PRESET_STEP | preset_id PK FK, step_order PK, model_id FK, input(mixture/vocals。karaoke のみ vocals も可、1プリセット内で同じ), role(multistem/vocals/karaoke), ensemble_weight, options_json |
 | MODEL | model_id PK, filename UK, display_name, architecture, output_stems_json, min_vram_mb, checkpoint_sha256, license, source_url, refine_order(詳細分割の方法の並び。小さいほど先で、同じ stem に使える方法の先頭が既定。NULL は後ろ), is_experimental(詳細分割の方法として「実験」扱い。画面に「実験」と出す) |
@@ -19,7 +19,7 @@
 | STEM_GROUP_MEMBER | group_id PK FK, stem_type_id PK FK |
 | LISTEN_PRESET | listen_preset_id PK, name, sort_order, seed_code UK(組み込みの識別子、ユーザー作成は NULL), hidden(bool、組み込みを削除したとき) |
 | LISTEN_PRESET_ITEM | item_id PK, listen_preset_id FK, stem_type_id FK（どちらか一方）, group_id FK（どちらか一方）, gain_db |
-| PLAYBACK_STATE | device_id PK FK, track_id PK FK, listen_preset_id FK, channel_gains_json, position_sec, updated_at |
+| PLAYBACK_STATE | device_id PK FK, track_id PK FK, listen_preset_id FK(SET NULL), channel_gains_json(stem の code → 音量 dB。0 dB は入れない), position_sec(元の曲の時刻), updated_at, job_id FK→SEPARATION_JOB(SET NULL。T06b。分け方), selected_json(T06b。選択中の葉 stem の code の配列), tempo_ratio(T06b。速度の倍率), tempo_mode(T06b。pitch/instant/keep) |
 | CUE_POINT | cue_id PK, track_id FK, position_sec, loop_end_sec(null可), label, color |
 | BEAT_GRID | track_id PK FK, analyzer(解析器の名前と版。例 beat_this 1.1.0 final0), beats_json(拍の時刻・秒の配列), downbeats_json(小節の頭の時刻・秒の配列), time_signature(推定の拍子。1小節の拍数), created_at, edited_beats_json(null可。ユーザーが直した拍), edited_downbeats_json(null可), edited_time_signature(null可) |
 | BEAT_EDIT | edit_id PK, track_id FK, op(downbeat/double/half/meter/shift/tap/cues/reset/reanalyze), params_json(操作の引数), before_json(操作の前の直した結果 {beats, downbeats, time_signature}。null=自動の結果のままだった), created_at |
@@ -39,3 +39,4 @@
 - BEAT_GRID の beats_json など（自動の結果）は解析だけが書き、補正では書き換えない。ユーザーが直した結果は edited_*（3つとも NULL か、3つとも値あり）。画面と API は「有効な拍」（edited_* があればそれ、無ければ自動の結果）を使う。区間ごとの BPM は保存せず、有効な拍から毎回計算する（`stemapp.beats.tempo`）。拍の時刻はすべて元の曲の時刻（速度変更の影響を受けない）。
 - TEMPO_RENDER / TEMPO_RENDITION（T11）は「ピッチを保つ速度変更」のためにサーバーで伸縮した配信用の音声（stream と同じ Opus 128kbps / WebM）のキャッシュ。STEM_RENDITION には入れない（stem の保存フォルダとは別の `data/cache/tempo/` に置き、作成の状態・最後に使った時刻を持つため専用の表にした）。伸縮するのは子に分かれていない stem（画面で鳴らす stem）だけ。全 stem の長さは同じ（master の長さ ÷ 倍率）。上限（1曲あたりの倍率の数、全体の容量。設定で変更可）を超えたら last_used_at の古いものから行とフォルダを消す。ジョブ・曲を消すと行は CASCADE で消え、フォルダも消す。ピッチも変わる方式（playbackRate）はブラウザの中だけで完結し、DB には何も持たない。
 - BEAT_EDIT は補正の履歴（元に戻す用。新しいものから取り消す。曲ごとに最大 100 件、古いものから消す）。「自動に戻す」も履歴に残し、元に戻せる。再解析すると新しい自動の結果を使い、それまでの直した結果は op=reanalyze の履歴に移す（解析の後に「元に戻す」で戻せる）。
+- PLAYBACK_STATE（T06b、続きから再生）は端末ごと・曲ごとに1行。画面が一定間隔（5 秒）・一時停止・画面を離れるときに上書き保存し、開いたときに自分の端末の行で戻す。ほかの端末の行は「PC で 1:23 まで聴いた」の表示に使う。ジョブ・組み合わせが消えたら null として扱う（T06b より前の DB に列を足した場合は外部キーが付かないため、API で確かめる）。
