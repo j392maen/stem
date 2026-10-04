@@ -5,6 +5,9 @@
 //   アプリを隠すとき）。画面を離れるときは fetch の keepalive で送る（ページが閉じても届くように）。
 // - 開いたときに自分の端末の状態に戻す（位置・選択・組み合わせ・分け方・速度。再生は始めない）。
 // - ほかの端末で最後に聴いていた位置は「PC で 1:23 まで聴いた」と出し、押すとその位置へ移る。
+// - 自分の端末の状態は、送るたびにブラウザ（localStorage）にも写しを残し、開いたときは写しを優先する。
+//   画面を閉じる間際の保存（keepalive）が、開き直したときの読み出しより後にサーバーに届くことがあり、
+//   サーバーの値が一つ前のことがあるため（自分の端末の行は自分しか書かないので、写しが常に最新）。
 
 import { api } from "./api.js";
 import { ensureDevice } from "./device.js";
@@ -12,6 +15,18 @@ import { formatTime } from "./ui.js";
 
 export const SAVE_MS = 5000;
 const MIN_OTHER_SEC = 1; // これより前ならほかの端末の位置は出さない
+const LOCAL_PREFIX = "stemapp.resume.";
+
+function readLocal(trackId) {
+  try {
+    const v = JSON.parse(localStorage.getItem(LOCAL_PREFIX + trackId) || "null");
+    return v && typeof v === "object" && Number.isFinite(v.position_sec) ? v : null;
+  } catch { return null; }
+}
+
+function writeLocal(trackId, snap) {
+  try { localStorage.setItem(LOCAL_PREFIX + trackId, JSON.stringify(snap)); } catch { /* 無くても動く */ }
+}
 
 /** 自分の端末の状態と、ほかの端末の最新の状態（位置が MIN_OTHER_SEC 以上）を選ぶ純粋関数。 */
 export function pickStates(states, myDeviceId) {
@@ -74,6 +89,8 @@ export class PlaybackSync {
       states = (await api(`/api/tracks/${this.view.trackId}/playback`)).states;
     } catch { /* 読めなくても再生はできる */ }
     const picked = pickStates(states, this.device.device_id);
+    const local = readLocal(this.view.trackId);
+    if (local) picked.mine = { ...(picked.mine || {}), ...local, device_id: this.device.device_id };
     return { device: this.device, ...picked };
   }
 
@@ -93,6 +110,7 @@ export class PlaybackSync {
     const key = JSON.stringify({ ...snap, position_sec: Math.round(snap.position_sec * 10) / 10 });
     if (key === this.lastKey && !force) return null;
     this.lastKey = key;
+    writeLocal(this.view.trackId, snap);
     const url = `/api/tracks/${this.view.trackId}/playback/${this.device.device_id}`;
     return fetch(url, {
       method: "PUT",

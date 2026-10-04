@@ -227,6 +227,9 @@ def test_beats_survive_job_switch(
     page.reload()
     page.wait_for_selector("#play-btn:not([disabled])", timeout=60_000)
     assert page.evaluate(f"() => {view}.jobId") == exp_job
+    # 開き直すと続きから（T06b。9 秒）になるので、以下は先頭（120 BPM の区間）で確かめる
+    assert page.evaluate(f"() => {view}.engine.position") == pytest.approx(9.0, abs=0.05)
+    page.evaluate(f"() => {view}.seek(0)")
     assert "まだ解析されていません" in (page.get_attribute("#tempo", "title") or "")
     page.select_option("#job-select", str(fast_job))
     page.wait_for_function(f"() => {view}.jobId === {fast_job} && {view}.ready", timeout=60_000)
