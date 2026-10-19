@@ -42,7 +42,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 | `STEMAPP_HOST` | `127.0.0.1` | 待ち受けアドレス（外部公開しない） |
 | `STEMAPP_PORT` | `8000` | ポート |
 | `STEMAPP_PASSCODE` | なし | 簡易パスコード。設定するとログインが必要になる（外から使うなら設定を推奨） |
-| `STEMAPP_ALLOWED_HOSTS` | なし | 127.0.0.1・localhost・[::1] 以外に受け付ける名前（カンマ区切り）。Tailscale で開くなら `mypc.example.ts.net` |
+| `STEMAPP_ALLOWED_HOSTS` | なし | 127.0.0.1・localhost・[::1] 以外に受け付ける名前（カンマ区切り）。Tailscale で開くなら `<PC名>.<tailnet名>.ts.net` |
 | `STEMAPP_TEMPO_CACHE_MAX_MB` | `2048` | 速度変更（ピッチを保つ）の音声のキャッシュ全体の上限（MB） |
 | `STEMAPP_TEMPO_CACHE_PER_TRACK` | `3` | 1曲あたりに残す速度（倍率）の数 |
 | `STEMAPP_TEMPO_WORKERS` | `0` | 伸縮を同時に何 stem 行うか（0 = CPU の論理コア数の半分、最大 8） |
@@ -66,7 +66,7 @@ tailnet の中だけに HTTPS で公開する。インターネット全体に�
    `uv run stemapp doctor` の「Tailscale」の行にも、この PC の名前が案内される。
 
    ```
-   STEMAPP_ALLOWED_HOSTS=mypc.example.ts.net
+   STEMAPP_ALLOWED_HOSTS=<PC名>.<tailnet名>.ts.net
    STEMAPP_PASSCODE=（好きなパスコード）
    ```
 
@@ -75,12 +75,12 @@ tailnet の中だけに HTTPS で公開する。インターネット全体に�
 3. 公開を始める（PC の設定を変える。止めるまで続く。PC を再起動しても残る）。
 
    ```powershell
-   .\scripts\tailscale-serve.ps1 start    # https://mypc.example.ts.net/ → http://127.0.0.1:8000
+   .\scripts\tailscale-serve.ps1 start    # https://<PC名>.<tailnet名>.ts.net/ → http://127.0.0.1:8000
    .\scripts\tailscale-serve.ps1 status   # 状態の確認（Funnel を使っていないことも表示）
    .\scripts\tailscale-serve.ps1 stop     # 公開をやめる
    ```
 
-4. iPhone の Safari で <https://mypc.example.ts.net/> を開く（iPhone でも Tailscale を接続しておく）。
+4. iPhone の Safari で `https://<PC名>.<tailnet名>.ts.net/` を開く（iPhone でも Tailscale を接続しておく）。
 5. ホーム画面に追加する: Safari の共有ボタン →「ホーム画面に追加」。以後はアイコンから全画面で開ける。
 
 注意:
